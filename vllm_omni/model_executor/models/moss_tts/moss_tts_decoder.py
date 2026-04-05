@@ -105,7 +105,7 @@ class CATCodecWorker:
             sampling_rate = 24000, downsample_rate = 1920
         """
         codes = codes.to(self.device)
-        out = self.codec.decode(codes)          # MossAudioTokenizerDecoderOutput
+        out = self.codec.decode(codes, chunk_duration=8)  # MossAudioTokenizerDecoderOutput
         wav = out.audio[0, 0]                   # [T_audio]  float32
         return wav.float().cpu()
 
@@ -209,8 +209,8 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         cfg = vllm_config.model_config.hf_config
         self.config = cfg
 
-        self.n_vq: int       = cfg.n_vq           # 32
-        self.sample_rate: int = cfg.sampling_rate  # 24000
+        self.n_vq: int        = cfg.n_vq           # 32
+        self.sample_rate: int = getattr(cfg, "sampling_rate", 24_000)
 
         device_str = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device_str)
