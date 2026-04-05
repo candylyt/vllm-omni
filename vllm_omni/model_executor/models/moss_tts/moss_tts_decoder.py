@@ -15,14 +15,19 @@
 #        ↓  cat_codec.decode()
 #   waveform    [samples]  (float32, 24 kHz)
 #
-# The CAT codec is loaded from the MOSS-Audio-Tokenizer HuggingFace repo:
-#   OpenMOSS/MOSS-Audio-Tokenizer
-# or the combined checkpoint:
-#   OpenMOSS-Team/MOSS-TTS-Local-Transformer
+# The CAT codec is a SEPARATE model from the main MOSS-TTS checkpoint.
+# It must be downloaded independently:
+#
+#   Main model : OpenMOSS-Team/MOSS-TTS-Local-Transformer  (~6.1 GB on disk)
+#   CAT codec  : OpenMOSS-Team/MOSS-Audio-Tokenizer        (separate download)
+#
+# Verified from processing_moss_tts.py — default codec path is:
+#   "OpenMOSS-Team/MOSS-Audio-Tokenizer"
 #
 # Environment variable:
-#   MOSS_AUDIO_TOKENIZER_PATH  — path to the CAT codec checkpoint directory.
-#                                Falls back to the main model path if unset.
+#   MOSS_AUDIO_TOKENIZER_PATH  — local path or HF repo ID for the CAT codec.
+#                                Defaults to "OpenMOSS-Team/MOSS-Audio-Tokenizer"
+#                                if unset (will auto-download from HuggingFace).
 
 import logging
 import os
@@ -68,21 +73,18 @@ class CATCodecWorker:
             codec_path = os.path.realpath(codec_path)
         logger.info("[MossTTS Decoder] Loading CAT codec from %s on %s", codec_path, device_str)
 
-        #       Typical pattern:
-        #         from moss_audio_tokenizer import MossAudioTokenizer
-        #         self.codec = MossAudioTokenizer.from_pretrained(codec_path)
-        #
-        # Fallback using AutoModel (works if the repo registers itself):
         from transformers import AutoModel
+        # Do NOT pass torch_dtype here — the CAT codec has mixed-precision layers
+        # that break when forced to bfloat16.  It outputs float32 natively.
         self.codec = AutoModel.from_pretrained(
             codec_path,
             trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
         )
         self.codec = self.codec.to(self.device).eval()
 
         self.sample_rate: int = getattr(self.codec.config, "sampling_rate", 24_000)
-        self.n_vq: int        = getattr(self.codec.config, "n_vq", 32)
+        # Config exposes num_quantizers as a @property backed by quantizer_kwargs
+        self.n_vq: int        = getattr(self.codec.config, "num_quantizers", 32)
 
         logger.info(
             "[MossTTS Decoder] CAT codec loaded: sample_rate=%d, n_vq=%d",
@@ -95,15 +97,17 @@ class CATCodecWorker:
         """
         codes : [n_vq, T]  long  (on any device)
         Returns: [samples]  float32  CPU
+
+        Verified API (from MOSS-Audio-Tokenizer):
+            out = codec.decode(codes)          # codes: [n_vq, T] long
+            out.audio          shape [1, 1, T_audio]  float32
+            out.audio_lengths  shape [1]               int64
+            sampling_rate = 24000, downsample_rate = 1920
         """
         codes = codes.to(self.device)
-        # The CAT codec decode API — verify the exact method name from the repo.
-        # Common patterns:
-        #   self.codec.decode(codes)
-        #   self.codec.decoder(codes)
-        #   self.codec.detokenize(codes)
-        wav = self.codec.decode(codes)   # TODO: confirm API
-        return wav.float().reshape(-1).cpu()
+        out = self.codec.decode(codes)          # MossAudioTokenizerDecoderOutput
+        wav = out.audio[0, 0]                   # [T_audio]  float32
+        return wav.float().cpu()
 
 
 # Module-level cache: (device_type, codec_path) → CATCodecWorker
@@ -212,16 +216,15 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         self.device = torch.device(device_str)
 
         # Resolve CAT codec checkpoint path
+        # Resolution order (mirrors processing_moss_tts.py logic):
+        #   1. model_config.audio_tokenizer_path  (set in YAML engine_args)
+        #   2. MOSS_AUDIO_TOKENIZER_PATH env var   (local path or HF repo ID)
+        #   3. Hard-coded HF default               (auto-downloads on first use)
         codec_path = (
             getattr(vllm_config.model_config, "audio_tokenizer_path", None)
             or os.environ.get("MOSS_AUDIO_TOKENIZER_PATH")
-            or cfg.name_or_path  # fall back to main model path if codec is co-located
+            or "OpenMOSS-Team/MOSS-Audio-Tokenizer"  # verified default from processing_moss_tts.py
         )
-        if not codec_path:
-            raise ValueError(
-                "[MossTTS Decoder] CAT codec path not found. "
-                "Set MOSS_AUDIO_TOKENIZER_PATH or model_config.audio_tokenizer_path."
-            )
 
         self._codec: CATCodecWorker = _get_codec_worker(self.device, codec_path)
 
