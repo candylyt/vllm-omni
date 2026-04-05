@@ -62,11 +62,12 @@ class CATCodecWorker:
 
     def __init__(self, device_str: str, codec_path: str):
         self.device = torch.device(device_str)
+        # Resolve to absolute path so transformers doesn't reject relative paths
+        # (transformers ≥ 4.40 validates that local paths are absolute)
+        if os.path.exists(codec_path):
+            codec_path = os.path.realpath(codec_path)
         logger.info("[MossTTS Decoder] Loading CAT codec from %s on %s", codec_path, device_str)
 
-        # The CAT codec is distributed with the MOSS-Audio-Tokenizer package.
-        # It can be loaded via the HF AutoModel interface with trust_remote_code.
-        # TODO: replace with the correct class name once you verify the repo API.
         #       Typical pattern:
         #         from moss_audio_tokenizer import MossAudioTokenizer
         #         self.codec = MossAudioTokenizer.from_pretrained(codec_path)
