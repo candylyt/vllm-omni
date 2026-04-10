@@ -73,6 +73,14 @@ class CATCodecWorker:
             codec_path = os.path.realpath(codec_path)
         logger.info("[MossTTS Decoder] Loading CAT codec from %s on %s", codec_path, device_str)
 
+        # Patch stale cached HF module: older transformers exported PreTrainedConfig
+        # from configuration_utils; newer versions moved it.  The cached
+        # configuration_moss_audio_tokenizer.py may still use the old import path.
+        import transformers.configuration_utils as _cfg_utils
+        if not hasattr(_cfg_utils, "PreTrainedConfig"):
+            from transformers import PreTrainedConfig as _PTC
+            _cfg_utils.PreTrainedConfig = _PTC
+
         from transformers import AutoModel
         # Do NOT pass torch_dtype here — the CAT codec has mixed-precision layers
         # that break when forced to bfloat16.  It outputs float32 natively.

@@ -93,10 +93,23 @@ class MossTTSLocalTransformerWrapper(nn.Module):
     input_embeds of shape (B, t, local_hidden_size).
     """
 
-    def __init__(self, local_qwen3_config):
+    def __init__(self, local_qwen3_config, model_path: str | None = None):
         super().__init__()
         # Trust-remote-code must be enabled; the HF repo provides the class.
-        from moss_tts_local.modeling_moss_tts import MossTTSLocalTransformer
+        # Try direct import first (works if moss_tts_local is pip-installed).
+        # Fall back to transformers' dynamic module loader, which loads the
+        # modeling file from the checkpoint directory (trust_remote_code path).
+        try:
+            from moss_tts_local.modeling_moss_tts import MossTTSLocalTransformer
+        except ModuleNotFoundError:
+            if model_path is None:
+                raise
+            from transformers.dynamic_module_utils import get_class_from_dynamic_module
+            MossTTSLocalTransformer = get_class_from_dynamic_module(
+                "modeling_moss_tts.MossTTSLocalTransformer",
+                model_path,
+                code_revision=None,
+            )
         self.transformer = MossTTSLocalTransformer(local_qwen3_config)
 
     def forward(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
@@ -209,7 +222,9 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         local_cfg.intermediate_size = cfg.local_ffn_hidden_size  # 8960
         # num_attention_heads = 16 (inherited from lang_cfg — do NOT override)
         # num_key_value_heads inherited as-is from lang_cfg (respects GQA if any)
-        self.local_transformer = MossTTSLocalTransformerWrapper(local_cfg)
+        self.local_transformer = MossTTSLocalTransformerWrapper(
+            local_cfg, model_path=vllm_config.model_config.model
+        )
 
         # ── Projection: global hidden → local hidden ─────────────────────
         # Used BOTH to project global backbone output and to re-project audio
