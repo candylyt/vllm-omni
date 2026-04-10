@@ -424,8 +424,6 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         hidden_states = self.backbone(
             input_ids=None,
             positions=positions,
-            kv_caches=kv_caches,
-            attn_metadata=attn_metadata,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
         )  # [L, D_global]
