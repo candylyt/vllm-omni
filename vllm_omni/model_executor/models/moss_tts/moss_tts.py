@@ -128,4 +128,8 @@ class MossTTSForConditionalGeneration(nn.Module, SupportsPP):
         weights: Iterable[tuple[str, torch.Tensor]],
         **kwargs,
     ) -> set[str]:
-        return self._model.load_weights(weights, **kwargs)
+        # self._model is stored as self._model, so vLLM names its params with
+        # the "_model." prefix.  We translate the module-relative names returned
+        # by the stage sub-model into the full names vLLM expects.
+        loaded_relative = self._model.load_weights(weights, **kwargs)
+        return {f"_model.{name}" for name in loaded_relative}

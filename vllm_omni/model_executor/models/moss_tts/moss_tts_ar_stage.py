@@ -502,6 +502,10 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         """
         Load from a MOSS-TTS-Local HuggingFace checkpoint.
 
+        Returns a set of THIS MODULE's parameter names (as in self.named_parameters())
+        that were successfully initialised.  The caller (MossTTSForConditionalGeneration)
+        prepends "_model." so that vLLM's default_loader can verify coverage.
+
         Checkpoint key → this module's parameter name:
             model.language_model.*           → backbone.*
             model.embedding_list.{i}.weight  → embedding_list.{i}.weight
@@ -510,57 +514,88 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
             local_to_speech_embedding_mlps.* → local_to_speech_embedding_mlps.*
             layer_norm_before_lm_heads.*     → layer_norm_before_lm_heads.*
             lm_heads.*                       → lm_heads.*
-        """
-        params       = dict(self.named_parameters())
-        loaded: set[str] = set()
 
-        # Prefix remapping rules  (checkpoint prefix → this module prefix)
-        REMAP = [
-            ("model.language_model.", "backbone."),
-            ("model.embedding_list.", "embedding_list."),
-            # local_transformer weights live under transformer.* in the wrapper
-            ("local_transformer.",    "local_transformer.transformer."),
+        For the Qwen3 backbone, vLLM merges Q/K/V into qkv_proj and
+        gate/up into gate_up_proj.  We use each param's weight_loader
+        (registered by MergedColumnParallelLinear / QKVParallelLinear)
+        to handle the merging correctly.
+        """
+        from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+        params: dict[str, torch.nn.Parameter] = dict(self.named_parameters())
+        loaded_module_names: set[str] = set()
+
+        # Qwen3 backbone: checkpoint has separate q/k/v and gate/up projections;
+        # vLLM merges them.  Map (checkpoint suffix → model suffix, shard_id).
+        BACKBONE_STACKED = [
+            ("self_attn.q_proj", "self_attn.qkv_proj", "q"),
+            ("self_attn.k_proj", "self_attn.qkv_proj", "k"),
+            ("self_attn.v_proj", "self_attn.qkv_proj", "v"),
+            ("mlp.gate_proj",    "mlp.gate_up_proj",   0),
+            ("mlp.up_proj",      "mlp.gate_up_proj",   1),
         ]
 
         for ckpt_name, tensor in weights:
-            mapped = ckpt_name
-            for ckpt_pfx, mod_pfx in REMAP:
-                if ckpt_name.startswith(ckpt_pfx):
-                    mapped = mod_pfx + ckpt_name[len(ckpt_pfx):]
-                    break
+            mapped: str | None = None
+            shard_id = None
 
-            if mapped in params:
-                param = params[mapped]
-                if param.shape == tensor.shape:
-                    param.data.copy_(tensor)
-                    loaded.add(ckpt_name)
-                else:
-                    logger.warning(
-                        "[MossTTS AR] Shape mismatch for %s: "
-                        "checkpoint %s vs model %s — skipping.",
-                        ckpt_name,
-                        tuple(tensor.shape),
-                        tuple(param.shape),
-                    )
+            if ckpt_name.startswith("model.language_model."):
+                relative = ckpt_name[len("model.language_model."):]
+                # Check stacked (merged) params first
+                for ckpt_sfx, mod_sfx, s_id in BACKBONE_STACKED:
+                    if ckpt_sfx in relative:
+                        mapped = "backbone." + relative.replace(ckpt_sfx, mod_sfx)
+                        shard_id = s_id
+                        break
+                if mapped is None:
+                    mapped = "backbone." + relative
+
+            elif ckpt_name.startswith("model.embedding_list."):
+                mapped = "embedding_list." + ckpt_name[len("model.embedding_list."):]
+
+            elif ckpt_name.startswith("local_transformer."):
+                mapped = "local_transformer.transformer." + ckpt_name[len("local_transformer."):]
+
             else:
+                # speech_embedding_to_local_mlp.*, local_to_speech_embedding_mlps.*,
+                # layer_norm_before_lm_heads.*, lm_heads.*  — no prefix change
+                mapped = ckpt_name
+
+            if mapped not in params:
                 logger.debug(
                     "[MossTTS AR] Unused checkpoint key %s (mapped to %s)",
-                    ckpt_name,
-                    mapped,
+                    ckpt_name, mapped,
                 )
+                continue
 
-        missing = set(params.keys()) - {
-            mapped
-            for ckpt_name, _ in weights
-            for mapped in [
-                next(
-                    (mp + ckpt_name[len(cp):]
-                     for cp, mp in REMAP if ckpt_name.startswith(cp)),
-                    ckpt_name,
-                )
-            ]
-        }
+            param = params[mapped]
+
+            if shard_id is not None:
+                # Use the registered weight_loader for proper shard merging
+                weight_loader = getattr(param, "weight_loader", None)
+                if weight_loader is not None:
+                    weight_loader(param, tensor, shard_id)
+                    loaded_module_names.add(mapped)
+                else:
+                    logger.warning(
+                        "[MossTTS AR] No weight_loader on %s, cannot merge shard %s — skipping",
+                        mapped, shard_id,
+                    )
+            else:
+                if param.data.shape != tensor.shape:
+                    logger.warning(
+                        "[MossTTS AR] Shape mismatch for %s: ckpt %s vs model %s — skipping.",
+                        ckpt_name, tuple(tensor.shape), tuple(param.data.shape),
+                    )
+                    continue
+                wl = getattr(param, "weight_loader", default_weight_loader)
+                wl(param, tensor)
+                loaded_module_names.add(mapped)
+
+        missing = set(params.keys()) - loaded_module_names
         if missing:
-            logger.warning("[MossTTS AR] Parameters not loaded from checkpoint:\n%s",
-                           "\n".join(sorted(missing)[:20]))
-        return loaded
+            logger.warning(
+                "[MossTTS AR] Parameters not loaded from checkpoint:\n%s",
+                "\n".join(sorted(missing)[:20]),
+            )
+        return loaded_module_names
