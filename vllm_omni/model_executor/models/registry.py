@@ -124,6 +124,11 @@ _OMNI_MODELS = {
         "moss_tts",
         "MossTTSForConditionalGeneration",
     ),
+    "MossTTSForConditionalGeneration": (
+        "moss_tts",
+        "moss_tts",
+        "MossTTSForConditionalGeneration",
+    ),
     ## glm_image
     "GlmImageForConditionalGeneration": (
         "glm_image",
