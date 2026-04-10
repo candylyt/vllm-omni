@@ -123,6 +123,10 @@ class MossTTSForConditionalGeneration(nn.Module, SupportsPP):
             multimodal_outputs={"model_outputs": []},
         )
 
+    def _clear_warmup_state(self) -> None:
+        if hasattr(self._model, "_clear_warmup_state"):
+            self._model._clear_warmup_state()
+
     def load_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
