@@ -36,8 +36,6 @@ import copy
 import logging
 from collections import defaultdict
 from collections.abc import Iterable
-from pyexpat.errors import codes
-from pyexpat.errors import codes
 from typing import Any, Optional
 
 import torch
@@ -487,19 +485,7 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         # exactly 1 scheduled token (= decode phase).
         code_tensor: Optional[torch.Tensor] = None
 
-        print("[debug] hidden_states.shape =", tuple(hidden_states.shape), flush=True)
-        print("[debug] decode_positions =", decode_positions, flush=True)
-        print("[debug] len(decode_positions) =", len(decode_positions) if decode_positions is not None else None, flush=True)
-        print("[debug] request_ids =", kwargs.get("request_ids", None), flush=True)
-
-
-
         if decode_positions and not torch.cuda.is_current_stream_capturing():
-
-            print("[debug] entering local transformer", flush=True)
-            print("[debug] pos_t =", pos_t.tolist(), flush=True)
-            print("[debug] decode_hidden.shape =", tuple(decode_hidden.shape), flush=True)
-
             pos_t = torch.tensor(decode_positions, device=hidden_states.device)
             decode_hidden = hidden_states[pos_t]  # [B, D_global]
 
@@ -509,9 +495,6 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                 top_k=kwargs.get("audio_top_k", 50),
                 top_p=kwargs.get("audio_top_p", 0.95),
             )  # [B, n_vq]
-
-            print("[debug] codes.shape =", tuple(codes.shape), flush=True)
-            print("[debug] codes[0][:8] =", codes[0][:8].tolist() if codes.numel() > 0 else [], flush=True)
 
             # Cache codes for the NEXT step's multi-channel embedding.
             # max_num_seqs=1, so a single slot suffices.

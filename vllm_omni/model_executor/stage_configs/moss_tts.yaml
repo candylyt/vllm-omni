@@ -57,7 +57,7 @@ stage_args:
       temperature: 0.6 # text channel temperature
       top_p: 0.95
       top_k: 50
-      max_tokens: 4000
+      max_tokens: 300
       seed: 42
       detokenize: true
       repetition_penalty: 1.1
