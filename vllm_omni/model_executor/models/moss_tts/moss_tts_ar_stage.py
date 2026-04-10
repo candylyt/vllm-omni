@@ -307,10 +307,10 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
             for slen in seq_lens:
                 if slen == 1:
                     # Single-token decode step: add audio channel embeddings
-                    codes = self._last_codes_slot  # [n_vq]
+                    codes = self._last_codes_slot  # [n_vq] on CPU
                     for ch_idx in range(self.n_vq):
-                        ch_code = codes[ch_idx].unsqueeze(0)              # [1]
-                        ch_emb  = self.embedding_list[ch_idx + 1](ch_code)  # [1, D]
+                        ch_code = codes[ch_idx].unsqueeze(0).to(embeds.device)  # [1]
+                        ch_emb  = self.embedding_list[ch_idx + 1](ch_code)      # [1, D]
                         embeds[offset] = embeds[offset] + ch_emb[0]
                 offset += slen
 
