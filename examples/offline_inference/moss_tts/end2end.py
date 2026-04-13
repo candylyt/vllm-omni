@@ -130,9 +130,14 @@ def main():
     print(f"[Info] Prompt ({len(prompt)} chars):\n{prompt}\n")
 
     # ── Sampling params ──────────────────────────────────────────────────────
+    # AR stage (stage 0): each generated token produces 32 RVQ codes fed to
+    # stage 1. Stage 1 has max_model_len=18192, so the flat code sequence must
+    # stay within that limit: max_ar_tokens = floor(18192 / 32) = 568.
+    # Use 500 to leave headroom; yaml default_sampling_params says 300 for
+    # the same reason.
     ar_params = SamplingParams(
         temperature=0.6, top_p=0.95, top_k=50,
-        max_tokens=18192, seed=SEED, repetition_penalty=1.1,
+        max_tokens=500, seed=SEED, repetition_penalty=1.1,
     )
     decoder_params = SamplingParams(
         temperature=0.0, top_p=1.0, top_k=-1,

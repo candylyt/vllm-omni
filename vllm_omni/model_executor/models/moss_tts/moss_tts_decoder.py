@@ -89,7 +89,7 @@ class CATCodecWorker:
             codec_path,
             trust_remote_code=True,
         )
-        self.codec = self.codec.to(self.device).eval()
+        self.codec = self.codec.to(self.device).eval().float()
 
         self.sample_rate: int = getattr(self.codec.config, "sampling_rate", 24_000)
         # Config exposes num_quantizers as a @property backed by quantizer_kwargs
