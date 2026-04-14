@@ -2,7 +2,7 @@
 #
 # Licensed under the Apache License, Version 2.0.
 #
-# Stage 0 → Stage 1 transition processor for MOSS-TTS-Local.
+# Stage 0 → Stage 1 transition processors for MOSS-TTS.
 #
 # Role
 # ----
@@ -10,6 +10,11 @@
 # code_predictor_codes tensor of shape [B, 1, n_vq, 1] = [B, 1, 32, 1].
 # This processor accumulates those per-step codes across the full generation,
 # then packages them as a flat token sequence for the Stage 1 (CAT codec).
+#
+# Variants:
+#   - Local: Stage 0 already emits frame-major [T, n_vq] rows.
+#   - Delay: Stage 0 emits delay-pattern rows that must be de-delayed before
+#            flattening for the shared CAT decoder.
 #
 # Flat format (row-major, matching _parse_flat_codes in moss_tts_decoder.py):
 #
@@ -41,6 +46,7 @@ logger = logging.getLogger(__name__)
 # Default chunk / context sizes for streaming (post-MVP).
 _DEFAULT_CHUNK_FRAMES   = 3
 _DEFAULT_CONTEXT_FRAMES = 3
+_DEFAULT_AUDIO_PAD_CODE = 1024
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -97,6 +103,63 @@ def _codes_to_flat_list(codes: Any, n_vq: int) -> list[int] | None:
 def _make_finished_sentinel() -> dict[str, Any]:
     """Minimal payload signalling Stage 1 to end the request."""
     return {"code_predictor_codes": [], "finished": torch.tensor(True, dtype=torch.bool)}
+
+
+def _has_no_codes(codes: Any) -> bool:
+    """Treat only None / zero-length payloads as missing.
+
+    Audio code value 0 is valid for MOSS, so unlike `_is_codes_empty` we must
+    not treat all-zero rows as empty data.
+    """
+    if codes is None:
+        return True
+    if isinstance(codes, torch.Tensor):
+        return codes.numel() == 0
+    if hasattr(codes, "__len__"):
+        return len(codes) == 0
+    return False
+
+
+def _normalize_codes_tensor(codes_raw: Any) -> torch.Tensor | None:
+    """Normalise stacked stage outputs to [T, n_vq]."""
+    codes = codes_raw if isinstance(codes_raw, torch.Tensor) else torch.tensor(codes_raw, dtype=torch.long)
+    codes = codes.to(torch.long)
+
+    if codes.ndim == 4:
+        return codes.squeeze(1).squeeze(-1)
+    if codes.ndim == 3:
+        return codes.squeeze(-1)
+    if codes.ndim == 2:
+        return codes
+    return None
+
+
+def _apply_de_delay_pattern(
+    codes: torch.Tensor,
+    *,
+    audio_pad_code: int = _DEFAULT_AUDIO_PAD_CODE,
+) -> torch.Tensor:
+    """Invert the diagonal delay schedule back to frame-major [T, n_vq].
+
+    Input rows follow the upstream Delay pattern:
+      delayed[t, q] = frame[t - q, q]  (pad when out of range)
+
+    So the original frame-major codes are recovered by:
+      frame[t, q] = delayed[t + q, q]
+    """
+    if codes.ndim != 2:
+        raise ValueError(f"Expected [T, n_vq] codes, got shape {tuple(codes.shape)}")
+
+    total_steps, n_vq = codes.shape
+    restored = torch.full_like(codes, fill_value=audio_pad_code)
+
+    for ch_idx in range(n_vq):
+        restored[: total_steps - ch_idx, ch_idx] = codes[ch_idx:, ch_idx]
+
+    valid_rows = ~(restored == audio_pad_code).all(dim=1)
+    if not valid_rows.any():
+        return restored[:0]
+    return restored[valid_rows]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -203,6 +266,79 @@ def llm2decoder(
         decoder_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=flat,
+                multi_modal_data=None,
+                mm_processor_kwargs=None,
+            )
+        )
+
+    return decoder_inputs
+
+
+def llm2decoder_delay(
+    stage_list: list[Any],
+    engine_input_source: list[int],
+    prompt: OmniTokensPrompt | TextPrompt | None = None,
+    requires_multimodal_data: bool = False,
+) -> list[OmniTokensPrompt]:
+    """Convert Delay-stage outputs to decoder-ready flat CAT codes.
+
+    The Delay AR stage emits diagonally shifted RVQ rows. Before Stage 1 can
+    decode them, we must invert that schedule back to ordinary frame-major
+    [T, n_vq] codes, then flatten row-major.
+    """
+    if not engine_input_source:
+        raise ValueError("[MossTTS Delay processor] engine_input_source cannot be empty.")
+
+    src_stage_id = engine_input_source[0]
+    if src_stage_id >= len(stage_list):
+        raise IndexError(
+            f"[MossTTS Delay processor] Invalid stage_id={src_stage_id} "
+            f"(only {len(stage_list)} stages present)."
+        )
+
+    stage = stage_list[src_stage_id]
+    if stage.engine_outputs is None:
+        raise RuntimeError(
+            f"[MossTTS Delay processor] Stage {src_stage_id} has no outputs yet."
+        )
+
+    decoder_inputs: list[OmniTokensPrompt] = []
+
+    for req_idx, req_output in enumerate(stage.engine_outputs):
+        output = req_output.outputs[0]
+        mm_out = output.multimodal_output or {}
+        codes_raw = mm_out.get("code_predictor_codes")
+
+        if _has_no_codes(codes_raw):
+            logger.warning(
+                "[MossTTS Delay processor] Request %s: no code_predictor_codes — skipping.",
+                getattr(req_output, "request_id", req_idx),
+            )
+            continue
+
+        codes = _normalize_codes_tensor(codes_raw)
+        if codes is None:
+            logger.warning(
+                "[MossTTS Delay processor] Unexpected codes shape for request %s: %s",
+                getattr(req_output, "request_id", req_idx),
+                tuple(codes_raw.shape) if isinstance(codes_raw, torch.Tensor) else type(codes_raw),
+            )
+            continue
+
+        restored = _apply_de_delay_pattern(
+            codes,
+            audio_pad_code=int(mm_out.get("audio_pad_code", _DEFAULT_AUDIO_PAD_CODE)),
+        )
+        if restored.numel() == 0:
+            logger.warning(
+                "[MossTTS Delay processor] Request %s: de-delayed codes are empty — skipping.",
+                getattr(req_output, "request_id", req_idx),
+            )
+            continue
+
+        decoder_inputs.append(
+            OmniTokensPrompt(
+                prompt_token_ids=restored.reshape(-1).tolist(),
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
             )

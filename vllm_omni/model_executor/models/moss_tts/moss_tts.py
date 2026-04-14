@@ -2,12 +2,13 @@
 #
 # Licensed under the Apache License, Version 2.0.
 #
-# Unified MOSS-TTS-Local entry point.
-# Dispatches to one of two stage-specific sub-models based on the
+# Unified MOSS-TTS entry point.
+# Dispatches to one of the stage-specific sub-models based on the
 # `model_stage` field set in the YAML stage config:
 #
-#   "ar_stage" → MossTTSARStageModel   (global Qwen3 backbone + local transformer)
-#   "decoder"  → MossTTSDecoderModel   (CAT codec: RVQ codes → waveform audio)
+#   "ar_stage"        → MossTTSARStageModel        (Local variant)
+#   "delay_ar_stage"  → MossTTSDelayARStageModel   (Delay variant)
+#   "decoder"         → MossTTSDecoderModel        (shared CAT codec)
 
 from collections.abc import Iterable
 from typing import Optional
@@ -21,6 +22,9 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.models.moss_tts.moss_tts_ar_stage import MossTTSARStageModel
+from vllm_omni.model_executor.models.moss_tts.moss_tts_delay_ar_stage import (
+    MossTTSDelayARStageModel,
+)
 from vllm_omni.model_executor.models.moss_tts.moss_tts_decoder import MossTTSDecoderModel
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
@@ -32,9 +36,14 @@ class MossTTSForConditionalGeneration(nn.Module, SupportsPP):
     Two-stage pipeline
     ------------------
     Stage 0  "ar_stage"
-        Global Qwen3-1.7B transformer produces per-step hidden states.
-        A lightweight local transformer (4 blocks, no positional embeddings)
+        Global Qwen3-1.7B transformer plus a lightweight local transformer
         autoregressively predicts 32 RVQ codes per audio frame.
+        Output: OmniOutput carrying code_predictor_codes [B, 1, n_vq, 1].
+
+    Stage 0  "delay_ar_stage"
+        Single Qwen3-scale backbone with 32 parallel RVQ heads and an internal
+        per-request Delay FSM. The scheduler still sees a 1-D text token stream;
+        the extra audio channels are reconstructed inside the model.
         Output: OmniOutput carrying code_predictor_codes [B, 1, n_vq, 1].
 
     Stage 1  "decoder"
@@ -58,12 +67,14 @@ class MossTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         if self._stage == "ar_stage":
             self._model: nn.Module = MossTTSARStageModel(vllm_config, prefix=prefix)
+        elif self._stage == "delay_ar_stage":
+            self._model = MossTTSDelayARStageModel(vllm_config, prefix=prefix)
         elif self._stage == "decoder":
             self._model = MossTTSDecoderModel(vllm_config, prefix=prefix)
         else:
             raise ValueError(
                 f"[MossTTS] Unknown model_stage={self._stage!r}. "
-                f"Expected 'ar_stage' or 'decoder'."
+                f"Expected 'ar_stage', 'delay_ar_stage', or 'decoder'."
             )
 
     # ------------------------------------------------------------------ #
