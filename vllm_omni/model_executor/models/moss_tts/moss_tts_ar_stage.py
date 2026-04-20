@@ -165,11 +165,6 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         self.audio_pad_code: int  = cfg.audio_pad_code                   # 1024
         self.gen_slot_id: int     = cfg.audio_assistant_gen_slot_token_id # 151656
         self.audio_end_id: int    = cfg.audio_end_token_id               # 151653
-        self.register_buffer(
-            "_tts_allowed_token_ids",
-            torch.tensor([self.gen_slot_id, self.audio_end_id], dtype=torch.long),
-            persistent=False,
-        )
 
         lang_cfg = cfg.language_config          # Qwen3Config
         self.hidden_size: int = lang_cfg.hidden_size
@@ -491,21 +486,6 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         code_tensor: Optional[torch.Tensor] = None
 
         if decode_positions and not torch.cuda.is_current_stream_capturing():
-            decode_input_ids = (
-                input_ids[decode_positions] if input_ids is not None else None
-            )
-            if decode_input_ids is not None:
-                gen_slot_mask = decode_input_ids == self.gen_slot_id
-                decode_positions = [
-                    pos
-                    for pos, keep in zip(decode_positions, gen_slot_mask.tolist())
-                    if keep
-                ]
-
-            if not decode_positions:
-                self._last_codes_slot = None
-                return OmniOutput(text_hidden_states=hidden_states, multimodal_outputs={})
-
             pos_t = torch.tensor(decode_positions, device=hidden_states.device)
             decode_hidden = hidden_states[pos_t]  # [B, D_global]
 
@@ -539,12 +519,7 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Text channel logits (channel-0 LM head)."""
-        logits = self.lm_heads[0](hidden_states)   # [L, vocab_size]
-        allowed = self._tts_allowed_token_ids.to(device=logits.device)
-        allowed_logits = logits.index_select(-1, allowed)
-        logits.fill_(float("-inf"))
-        logits.index_copy_(-1, allowed, allowed_logits)
-        return logits
+        return self.lm_heads[0](hidden_states)   # [L, vocab_size]
 
     def sample(
         self,
