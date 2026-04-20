@@ -129,15 +129,38 @@ def main():
     prompt = build_tts_prompt(args.text, args.model)
     print(f"[Info] Prompt ({len(prompt)} chars):\n{prompt}\n")
 
+    # ── Resolve EOS / stop tokens from the model config ─────────────────────
+    # The AR stage stops when it samples <|audio_end|> (audio_end_token_id)
+    # which signals the model has finished generating audio frames.
+    # We also include the standard text EOS so generation never overshoots.
+    from transformers import AutoConfig
+    _cfg = AutoConfig.from_pretrained(
+        os.path.abspath(args.model), trust_remote_code=True
+    )
+    _audio_end_id = getattr(_cfg, "audio_end_token_id", None)
+    _eos_id       = getattr(_cfg, "eos_token_id",       None)
+    # eos_token_id may be a list (Qwen3 has two EOS tokens)
+    if isinstance(_eos_id, list):
+        _eos_ids = _eos_id
+    elif _eos_id is not None:
+        _eos_ids = [_eos_id]
+    else:
+        _eos_ids = []
+    ar_stop_ids = list(dict.fromkeys(
+        ([_audio_end_id] if _audio_end_id is not None else []) + _eos_ids
+    ))
+    print(f"[Info] AR stop token IDs: {ar_stop_ids}  "
+          f"(audio_end={_audio_end_id}, eos={_eos_ids})")
+
     # ── Sampling params ──────────────────────────────────────────────────────
     # AR stage (stage 0): each generated token produces 32 RVQ codes fed to
     # stage 1. Stage 1 has max_model_len=18192, so the flat code sequence must
     # stay within that limit: max_ar_tokens = floor(18192 / 32) = 568.
-    # Use 500 to leave headroom; yaml default_sampling_params says 300 for
-    # the same reason.
+    # Use 500 as a hard ceiling; EOS stopping should end generation much sooner.
     ar_params = SamplingParams(
         temperature=0.6, top_p=0.95, top_k=50,
         max_tokens=500, seed=SEED, repetition_penalty=1.1,
+        stop_token_ids=ar_stop_ids if ar_stop_ids else None,
     )
     decoder_params = SamplingParams(
         temperature=0.0, top_p=1.0, top_k=-1,
