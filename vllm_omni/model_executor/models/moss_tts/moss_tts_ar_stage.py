@@ -270,6 +270,8 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         # warmup via _clear_warmup_state().
         self._last_codes_slot: Optional[torch.Tensor] = None
         self._force_audio_end_next: bool = False
+        self._debug_decode_steps: int = 0
+        self._debug_code_steps: int = 0
 
     # ══════════════════════════════════════════════════════════════════
     #  Embedding
@@ -465,6 +467,8 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         if any(s > 1 for s in seq_lens_per_req):
             self._last_codes_slot = None
             self._force_audio_end_next = False
+            self._debug_decode_steps = 0
+            self._debug_code_steps = 0
 
         # ── 1. Build embeddings (multi-channel) ───────────────────────
         if inputs_embeds is None:
@@ -492,7 +496,15 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                 input_ids[decode_positions] if input_ids is not None else None
             )
             if decode_input_ids is not None:
+                self._debug_decode_steps += int(decode_input_ids.numel())
                 gen_slot_mask = decode_input_ids == self.gen_slot_id
+                if self._debug_decode_steps <= 8 or self._debug_decode_steps % 25 == 0:
+                    logger.warning(
+                        "[MossTTS AR] decode_step=%d input_ids=%s gen_slot=%s",
+                        self._debug_decode_steps,
+                        decode_input_ids.detach().cpu().tolist(),
+                        gen_slot_mask.detach().cpu().tolist(),
+                    )
                 decode_positions = [
                     pos
                     for pos, keep in zip(decode_positions, gen_slot_mask.tolist())
@@ -517,6 +529,13 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
             # Cache codes for the NEXT step's multi-channel embedding.
             # max_num_seqs=1, so a single slot suffices.
             self._last_codes_slot = codes[0].cpu()
+            self._debug_code_steps += B
+            if self._debug_code_steps <= 8 or self._debug_code_steps % 25 == 0:
+                logger.warning(
+                    "[MossTTS AR] emitted_code_steps=%d last_codes_shape=%s",
+                    self._debug_code_steps,
+                    tuple(codes.shape),
+                )
 
             # Shape convention: [B, 1, n_vq, 1]  (matches MiMo's [B, 1, 8, 4])
             B = codes.shape[0]
