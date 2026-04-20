@@ -60,7 +60,7 @@ stage_args:
       max_tokens: 300
       seed: 42
       detokenize: true
-      repetition_penalty: 1.1
+      # NOTE: no repetition_penalty — gen_slot (151656) repeats every step.
       # Stop at <|audio_end|> (151653) so the model doesn't run to max_tokens.
       # Also include <|im_end|> (151645) and <|endoftext|> (151643) as fallbacks.
       stop_token_ids: [151653, 151645, 151643]

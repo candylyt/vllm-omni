@@ -159,7 +159,12 @@ def main():
     # Use 500 as a hard ceiling; EOS stopping should end generation much sooner.
     ar_params = SamplingParams(
         temperature=0.6, top_p=0.95, top_k=50,
-        max_tokens=500, seed=SEED, repetition_penalty=1.1,
+        max_tokens=500, seed=SEED,
+        # NOTE: do NOT set repetition_penalty here.
+        # The gen_slot token (151656) must repeat every single decode step.
+        # A repetition penalty ≠ 1.0 suppresses it after the first occurrence,
+        # causing the backbone to emit random vocabulary tokens instead of
+        # gen_slot tokens, which produces garbled/random audio content.
         stop_token_ids=ar_stop_ids if ar_stop_ids else None,
     )
     decoder_params = SamplingParams(
