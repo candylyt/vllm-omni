@@ -540,11 +540,7 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Text channel logits (channel-0 LM head)."""
         logits = self.lm_heads[0](hidden_states)   # [L, vocab_size]
-        allowed = (
-            self._tts_allowed_token_ids
-            if self._last_codes_slot is not None
-            else self._tts_allowed_token_ids[:1]
-        )
+        allowed = self._tts_allowed_token_ids.to(device=logits.device)
         allowed_logits = logits.index_select(-1, allowed)
         logits.fill_(float("-inf"))
         logits.index_copy_(-1, allowed, allowed_logits)
