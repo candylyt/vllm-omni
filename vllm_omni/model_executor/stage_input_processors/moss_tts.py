@@ -161,8 +161,15 @@ def llm2decoder(
         if _is_codes_empty(codes_raw):
             logger.warning(
                 "[MossTTS processor] Request %s: empty code_predictor_codes — "
-                "skipping (model may not have generated audio).",
+                "forwarding empty decoder input.",
                 getattr(req_output, "request_id", req_idx),
+            )
+            decoder_inputs.append(
+                OmniTokensPrompt(
+                    prompt_token_ids=[],
+                    multi_modal_data=None,
+                    mm_processor_kwargs=None,
+                )
             )
             continue
 
@@ -190,8 +197,16 @@ def llm2decoder(
         # Skip all-zero sequences (dummy output)
         if not codes.any():
             logger.warning(
-                "[MossTTS processor] Request %s: all-zero codes — skipping.",
+                "[MossTTS processor] Request %s: all-zero codes — "
+                "forwarding empty decoder input.",
                 req_idx,
+            )
+            decoder_inputs.append(
+                OmniTokensPrompt(
+                    prompt_token_ids=[],
+                    multi_modal_data=None,
+                    mm_processor_kwargs=None,
+                )
             )
             continue
 
