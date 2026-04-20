@@ -20,6 +20,7 @@ from __future__ import annotations
 import copy
 import os
 
+import torch
 import soundfile as sf
 from vllm import SamplingParams
 
@@ -166,6 +167,14 @@ def main() -> None:
         if audio_tensor is None:
             print(f"[{request_id}] No audio in output.")
             continue
+
+        # async_chunk mode accumulates a list of per-chunk tensors
+        if isinstance(audio_tensor, list):
+            chunks = [t for t in audio_tensor if isinstance(t, torch.Tensor) and t.numel() > 0]
+            if not chunks:
+                print(f"[{request_id}] No audio chunks in output.")
+                continue
+            audio_tensor = torch.cat(chunks, dim=0)
 
         audio_np = audio_tensor.float().detach().cpu().numpy()
         if audio_np.ndim > 1:

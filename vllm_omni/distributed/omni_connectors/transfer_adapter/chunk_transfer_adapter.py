@@ -165,6 +165,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 request.additional_information = {}
                 if "left_context_size" in payload_data:
                     request.additional_information["left_context_size"] = payload_data["left_context_size"]
+                if "request_id" in payload_data:
+                    request.additional_information["request_id"] = payload_data["request_id"]
+                if "finished" in payload_data:
+                    request.additional_information["finished"] = payload_data["finished"]
                 request.num_computed_tokens = 0
 
                 # Empty chunk with more data expected: keep polling.

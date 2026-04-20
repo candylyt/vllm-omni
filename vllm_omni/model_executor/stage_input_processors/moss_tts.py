@@ -145,7 +145,23 @@ def _apply_de_delay_pattern(
       delayed[t, q] = frame[t - q, q]  (pad when out of range)
 
     So the original frame-major codes are recovered by:
-      frame[t, q] = delayed[t + q, q]
+      frame[f, q] = delayed[f + q, q]
+
+    A frame is *valid* iff ALL n_vq positions contain actual codes (no pad).
+    Pad appears in two cases:
+      (1) Ramp-up rows (first ~n_vq delay-slot steps) where the AR model
+          emits pad because no quantizer is active yet.
+      (2) Trailing rows where the buffer lacks enough future delay steps to
+          fill all quantizer positions (f + n_vq > total_steps).
+
+    We use the stricter .any() check (invalid if ANY code is pad) rather
+    than .all() (invalid only if ALL codes are pad).  The .all() check misses
+    partially-filled frames which would send pad=audio_pad_code to the codec
+    and trigger an out-of-bounds gather assertion (codebook index 1024 ≥
+    codebook_size 1024).
+
+    audio_pad_code (1024) is explicitly masked to -inf during AR sampling, so
+    it never appears as a real audio token — the .any() filter is lossless.
     """
     if codes.ndim != 2:
         raise ValueError(f"Expected [T, n_vq] codes, got shape {tuple(codes.shape)}")
@@ -154,9 +170,12 @@ def _apply_de_delay_pattern(
     restored = torch.full_like(codes, fill_value=audio_pad_code)
 
     for ch_idx in range(n_vq):
-        restored[: total_steps - ch_idx, ch_idx] = codes[ch_idx:, ch_idx]
+        n_elems = total_steps - ch_idx
+        if n_elems > 0:
+            restored[:n_elems, ch_idx] = codes[ch_idx : ch_idx + n_elems, ch_idx]
 
-    valid_rows = ~(restored == audio_pad_code).all(dim=1)
+    # Keep only rows where every quantizer position holds an actual code.
+    valid_rows = ~(restored == audio_pad_code).any(dim=1)
     if not valid_rows.any():
         return restored[:0]
     return restored[valid_rows]
@@ -443,5 +462,157 @@ def _flush_remaining(
         "code_flat_numel":      numel,
         "codec_chunk_frames":   chunk_size,
         "left_context_size":    0,
+        "request_id":           request_id,
         "finished":             torch.tensor(True, dtype=torch.bool),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Delay-model streaming / async-chunk mode
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def llm2decoder_delay_async_chunk(
+    transfer_manager: Any,
+    pooling_output: dict[str, Any] | None,
+    request: Any,
+    is_finished: bool = False,
+) -> dict[str, Any] | None:
+    """
+    Async-chunk processor for MOSS-TTS-Delay.
+
+    Called by Stage 0 (delay AR) after every decode step via
+    ``custom_process_next_stage_input_func``.  Accumulates the raw
+    delay-pattern rows emitted by the AR stage, recovers valid frame-major
+    codes by applying the inverse delay transform on the growing buffer,
+    and flushes a payload to Stage 1 (CAT codec) whenever ``chunk_frames``
+    new valid frames are ready.
+
+    De-delay math
+    -------------
+    The delay AR stage emits rows where ``delayed[t, q] = frame[t-q, q]``.
+    Inverse: ``frame[t, q] = delayed[t+q, q]``.
+    Accumulating N delay steps recovers at most ``max(0, N - n_vq + 1)``
+    valid frame-major rows.  With n_vq=32 (MOSS), the first flush therefore
+    requires ``chunk_frames + 31`` delay steps.
+
+    Buffer strategy
+    ---------------
+    All delay-pattern rows are kept in
+    ``transfer_manager.code_prompt_token_ids[request_id]`` (never cleared
+    per-chunk).  ``transfer_manager._delay_frames_sent[request_id]`` tracks
+    how many valid frames have already been delivered to Stage 1.  On each
+    call the full buffer is de-delayed, and only the *newly recovered* frames
+    are shipped.  The framework's ``cleanup_sender()`` clears
+    ``code_prompt_token_ids`` after the final chunk; we clear
+    ``_delay_frames_sent`` in-function when ``is_finished=True``.
+
+    left_context_size = 0
+    ---------------------
+    ``MossTTSDecoderModel.forward()`` does not trim a left-context region
+    from its decoded audio, so we send only the new frames with no overlap
+    and set ``left_context_size=0``.
+
+    Returns a payload dict when enough new frames are ready (or when
+    ``is_finished=True`` with any remaining frames), otherwise ``None``.
+    """
+    connector = getattr(transfer_manager, "connector", None)
+    raw_cfg   = getattr(connector, "config", {}) or {}
+    cfg       = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
+    chunk_size = int(cfg.get("codec_chunk_frames", _DEFAULT_CHUNK_FRAMES))
+
+    request_id = getattr(request, "external_req_id", None)
+    if request_id is None:
+        return None
+
+    # ── Accumulate this step's raw delay-pattern row ──────────────────────
+    if isinstance(pooling_output, dict):
+        codes_raw = pooling_output.get("code_predictor_codes")
+        if not _has_no_codes(codes_raw):
+            row = (
+                codes_raw
+                if isinstance(codes_raw, torch.Tensor)
+                else torch.tensor(codes_raw, dtype=torch.long)
+            )
+            row = row.to(torch.long).reshape(-1)   # [n_vq]
+            if row.numel() > 0:
+                transfer_manager.code_prompt_token_ids[request_id].append(row.tolist())
+    elif not is_finished:
+        return None
+
+    accumulated = transfer_manager.code_prompt_token_ids[request_id]
+    n_steps = len(accumulated)
+
+    if n_steps == 0:
+        if is_finished:
+            return _make_finished_sentinel()
+        return None
+
+    # ── De-delay all accumulated rows → valid frame-major codes ──────────
+    # Build tensor robustly: filter out any inconsistent entries (e.g. from
+    # unexpected calls with wrong shapes) and use torch.stack instead of
+    # torch.tensor(list_of_lists) which fails on inhomogeneous content in
+    # newer PyTorch.
+    row_tensors = []
+    for entry in accumulated:
+        if isinstance(entry, (list, tuple)) and len(entry) > 0:
+            row_tensors.append(torch.tensor(entry, dtype=torch.long))
+        elif isinstance(entry, torch.Tensor) and entry.numel() > 0:
+            row_tensors.append(entry.to(torch.long).reshape(-1))
+    if not row_tensors:
+        if is_finished:
+            return _make_finished_sentinel()
+        return None
+    n_vq_ref = row_tensors[0].numel()
+    row_tensors = [r for r in row_tensors if r.numel() == row_tensors[0].numel()]
+    if not row_tensors:
+        if is_finished:
+            return _make_finished_sentinel()
+        return None
+    raw_tensor = torch.stack(row_tensors, dim=0)  # [n_steps, n_vq]
+    valid_frames = _apply_de_delay_pattern(
+        raw_tensor, audio_pad_code=_DEFAULT_AUDIO_PAD_CODE
+    )   # [n_valid, n_vq]
+    n_valid = valid_frames.shape[0]
+
+    # ── Track how many valid frames have already been sent ────────────────
+    _delay_sent: dict[str, int] = getattr(transfer_manager, "_delay_frames_sent", None)  # type: ignore[assignment]
+    if _delay_sent is None:
+        _delay_sent = {}
+        transfer_manager._delay_frames_sent = _delay_sent
+    frames_sent = _delay_sent.get(request_id, 0)
+    n_new = n_valid - frames_sent
+
+    if n_new <= 0:
+        # Not enough delay steps yet to recover a new valid frame.
+        if is_finished:
+            _delay_sent.pop(request_id, None)
+            return _make_finished_sentinel()
+        return None
+
+    if not is_finished and n_new < chunk_size:
+        return None   # still accumulating
+
+    # ── Decide how many frames to flush this call ─────────────────────────
+    if is_finished:
+        flush_count = n_new   # everything remaining
+    else:
+        flush_count = (n_new // chunk_size) * chunk_size
+        if flush_count == 0:
+            return None
+
+    flush_frames = valid_frames[frames_sent : frames_sent + flush_count]   # [flush_count, n_vq]
+    flat  = flush_frames.reshape(-1).tolist()
+
+    # ── Update sent counter; clean up on final flush ──────────────────────
+    _delay_sent[request_id] = frames_sent + flush_count
+    if is_finished:
+        _delay_sent.pop(request_id, None)
+
+    return {
+        "code_predictor_codes": flat,
+        "code_flat_numel":      len(flat),
+        "codec_chunk_frames":   chunk_size,
+        "left_context_size":    0,
+        "request_id":           request_id,
+        "finished":             torch.tensor(is_finished, dtype=torch.bool),
     }
