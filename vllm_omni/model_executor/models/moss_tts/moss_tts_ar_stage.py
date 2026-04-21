@@ -330,20 +330,30 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
     ) -> None:
         """Advance the per-request FSM by one observed text-channel token.
 
-        - `audio_start` / `gen_slot` → enter audio mode
-        - `audio_end`               → leave audio mode
-        - everything else           → no state change
+        Entry / exit rules:
+          - Not in audio:
+              * `audio_start` / `gen_slot`  → enter audio mode
+              * everything else             → stay outside
+          - In audio:
+              * `gen_slot`                  → stay in audio mode
+              * anything else (including
+                `audio_end` and stray vocab)→ leave audio mode
+
+        The "leave on any non-gen_slot token" rule is the key fix for the
+        trailing-garbage symptom: the original code had no FSM at all and
+        kept generating audio codes for whatever token the text head emitted
+        once the model wanted to stop, producing garbage at the tail.
         """
+        if state.is_audio:
+            if token_id != self.gen_slot_id:
+                state.is_audio = False
+                state.pending_audio_row = torch.full(
+                    (self.n_vq,), self.audio_pad_code, dtype=torch.long
+                )
+            return
+
         if token_id in (self.audio_start_token_id, self.gen_slot_id):
             state.is_audio = True
-            return
-        if token_id == self.audio_end_id:
-            state.is_audio = False
-            # Clear the pending audio row so any subsequent text decode steps
-            # don't get contaminated by leftover audio embeddings.
-            state.pending_audio_row = torch.full(
-                (self.n_vq,), self.audio_pad_code, dtype=torch.long
-            )
 
     def _reset_prefill_state(
         self,
@@ -673,13 +683,20 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata | None = None,
     ) -> torch.Tensor:
-        """Text channel logits (channel-0 LM head), with FSM-driven gating.
+        """Text channel logits (channel-0 LM head), with light FSM-driven gating.
 
-        Without this gating the text head can sample arbitrary vocab tokens
-        once it should be emitting `gen_slot` or `audio_end`. Stage 1 then
-        receives garbage `code_predictor_codes` for those steps. This mirrors
-        the equivalent gating in `MossTTSDelayARStageModel.compute_logits`,
-        minus the delay-pattern branch (no `delayed_length` here).
+        Strategy:
+          - In audio mode → DO NOT mask. The model was trained to emit
+            `gen_slot` here naturally; over-restricting (e.g. keeping only
+            gen_slot/audio_end) skews the relative ranking and can cause
+            instant termination on the very first sampling step.
+          - Outside audio mode → mask the audio control tokens so they
+            cannot leak into text generation.
+
+        The "garbage at end of audio" symptom is fixed by the FSM exiting
+        audio mode on any non-`gen_slot` token (see
+        `_advance_state_with_text_token`) and by `forward()` skipping
+        `_local_forward` for non-audio decode steps.
         """
         logits = self.lm_heads[0](hidden_states)   # [L, vocab_size]
         if not self._last_request_ids:
@@ -690,30 +707,14 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
             if row_idx >= logits.shape[0]:
                 break
             state = self._request_states.get(request_id)
-            if state is None:
+            if state is None or state.is_audio:
+                # Audio mode: leave the distribution alone.
                 continue
 
             row = logits[row_idx]
-
-            if state.is_audio:
-                # Only `gen_slot` (continue audio) or `audio_end` (terminate)
-                # are legal next tokens during audio generation.
-                gen_keep = row[self.gen_slot_id].clone()
-                end_keep = row[self.audio_end_id].clone()
-                row.fill_(neg_inf)
-                row[self.gen_slot_id] = gen_keep
-                row[self.audio_end_id] = end_keep
-            else:
-                # Outside audio: forbid the audio control tokens (and pad).
-                row[self.pad_token_id] = neg_inf
-                row[self.gen_slot_id]  = neg_inf
-                row[self.audio_end_id] = neg_inf
-
-            # Prevent premature `im_end` until we've emitted at least one
-            # audio frame — otherwise the model can terminate the assistant
-            # turn before saying anything.
-            if state.audio_steps_generated == 0:
-                row[self.im_end_token_id] = neg_inf
+            row[self.pad_token_id] = neg_inf
+            row[self.gen_slot_id]  = neg_inf
+            row[self.audio_end_id] = neg_inf
 
         return logits
 
