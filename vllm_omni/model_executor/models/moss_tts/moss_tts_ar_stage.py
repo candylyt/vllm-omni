@@ -703,14 +703,18 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
     # ══════════════════════════════════════════════════════════════════
 
     # Minimum number of audio frames to emit before allowing the model to
-    # sample `audio_end`. Without this guard the model can terminate audio
-    # generation on the very first sampling step, producing 0–1 frames of
-    # output. Empirically the unconstrained MOSS-TTS-Local text head does
-    # NOT favor `gen_slot` after `<|audio_start|>` — its distribution leans
-    # toward random vocab tokens — so we have to force the right control
-    # token until enough audio context has accumulated for `audio_end` to be
-    # a meaningful choice.
-    MIN_AUDIO_FRAMES: int = 10
+    # sample `audio_end`. Without this guard the model terminates audio
+    # generation almost immediately: empirically the unconstrained text head
+    # in vllm-omni's setup does NOT favor `gen_slot` after `<|audio_start|>`
+    # (it leans toward random vocab tokens), and once both `gen_slot` and
+    # `audio_end` are made the only legal options, `audio_end`'s raw logit
+    # tends to win at the boundary.
+    #
+    # Rough sizing: codec is 24kHz with ~12.5 frames/sec, so 150 frames
+    # caps the forced-audio period at ~12 seconds. For longer utterances
+    # bump this higher; for very short ones the trailing silence will be
+    # modest (and can be trimmed downstream).
+    MIN_AUDIO_FRAMES: int = 150
 
     def compute_logits(
         self,
