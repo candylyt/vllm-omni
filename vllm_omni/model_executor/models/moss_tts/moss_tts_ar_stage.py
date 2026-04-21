@@ -727,7 +727,7 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
     # model genuinely wants to stop, regardless of whether the utterance
     # is 2s or 20s. A streak of 2 filters single-step blips while still
     # terminating within ~one frame of the true endpoint.
-    END_ARGMAX_STREAK: int = 20
+    END_ARGMAX_STREAK: int = 2
 
     def compute_logits(
         self,
