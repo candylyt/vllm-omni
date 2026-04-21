@@ -36,6 +36,7 @@ import copy
 import logging
 from collections import defaultdict
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import torch
@@ -122,6 +123,37 @@ class MossTTSLocalTransformerWrapper(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Per-request FSM state
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class MossTTSLocalRequestState:
+    """Per-request FSM tracking whether the model is currently emitting audio.
+
+    Mirrors `MossTTSDelayRequestState` from the delay stage but without the
+    delay-pattern bookkeeping (no `delayed_length`, no per-channel mask) since
+    the local architecture emits all n_vq codes together at every audio step.
+    """
+
+    n_vq: int
+    audio_pad_code: int
+    is_audio: bool = False
+    audio_steps_generated: int = 0
+    pending_audio_row: torch.Tensor = field(init=False)
+
+    def __post_init__(self) -> None:
+        # Initialised to pad so it is a no-op on prefill / non-audio decode steps.
+        self.pending_audio_row = torch.full(
+            (self.n_vq,), self.audio_pad_code, dtype=torch.long
+        )
+
+    def store_next_audio_row(self, row: torch.Tensor) -> None:
+        """Cache the [n_vq] codes just sampled, to be summed into the next decode embedding."""
+        self.pending_audio_row = row.detach().to(torch.long).cpu().reshape(self.n_vq)
+        self.audio_steps_generated += 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  AR Stage Model
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -165,6 +197,14 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         self.audio_pad_code: int  = cfg.audio_pad_code                   # 1024
         self.gen_slot_id: int     = cfg.audio_assistant_gen_slot_token_id # 151656
         self.audio_end_id: int    = cfg.audio_end_token_id               # 151653
+
+        # Tokens needed by the FSM / logits gating
+        self.pad_token_id: int          = cfg.pad_token_id
+        self.im_end_token_id: int       = cfg.im_end_token_id
+        self.audio_start_token_id: int  = cfg.audio_start_token_id
+        self.audio_user_slot_token_id: int = getattr(
+            cfg, "audio_user_slot_token_id", -1
+        )
 
         lang_cfg = cfg.language_config          # Qwen3Config
         self.hidden_size: int = lang_cfg.hidden_size
@@ -264,11 +304,101 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         self.logits_processor = LogitsProcessor(lang_cfg.vocab_size)
         self.sampler = Sampler()
 
-        # ── Audio code cache (single slot; max_num_seqs=1) ────────────────
-        # Holds the [n_vq] codes from the most-recently completed decode step.
-        # Cleared at the start of each new request (prefill detection) and after
-        # warmup via _clear_warmup_state().
-        self._last_codes_slot: Optional[torch.Tensor] = None
+        # ── Per-request FSM state ─────────────────────────────────────────
+        # Replaces the old single-slot `_last_codes_slot` cache. Each request
+        # carries its own `MossTTSLocalRequestState` that knows whether the
+        # decoder is currently in audio mode and what audio codes were emitted
+        # on the previous step (for next-step embedding contribution).
+        self._request_states: dict[str, MossTTSLocalRequestState] = {}
+        self._last_request_ids: list[str] = []
+        self._last_seq_lens: list[int] = []
+
+    # ══════════════════════════════════════════════════════════════════
+    #  FSM helpers (per-request audio-mode tracking)
+    # ══════════════════════════════════════════════════════════════════
+
+    def _new_request_state(self) -> MossTTSLocalRequestState:
+        return MossTTSLocalRequestState(
+            n_vq=self.n_vq,
+            audio_pad_code=self.audio_pad_code,
+        )
+
+    def _advance_state_with_text_token(
+        self,
+        state: MossTTSLocalRequestState,
+        token_id: int,
+    ) -> None:
+        """Advance the per-request FSM by one observed text-channel token.
+
+        - `audio_start` / `gen_slot` → enter audio mode
+        - `audio_end`               → leave audio mode
+        - everything else           → no state change
+        """
+        if token_id in (self.audio_start_token_id, self.gen_slot_id):
+            state.is_audio = True
+            return
+        if token_id == self.audio_end_id:
+            state.is_audio = False
+            # Clear the pending audio row so any subsequent text decode steps
+            # don't get contaminated by leftover audio embeddings.
+            state.pending_audio_row = torch.full(
+                (self.n_vq,), self.audio_pad_code, dtype=torch.long
+            )
+
+    def _reset_prefill_state(
+        self,
+        request_id: str,
+        prompt_tokens: torch.Tensor,
+    ) -> MossTTSLocalRequestState:
+        """Build a fresh FSM state for a request and replay its prompt tokens."""
+        state = self._new_request_state()
+        tokens = prompt_tokens.reshape(-1).tolist()
+
+        if self.audio_user_slot_token_id >= 0:
+            if any(int(t) == self.audio_user_slot_token_id for t in tokens):
+                logger.warning(
+                    "[MossTTS Local] Request %s contains continuation prompt tokens. "
+                    "Phase-1 only validates direct TTS prompts.",
+                    request_id,
+                )
+
+        for token in tokens:
+            self._advance_state_with_text_token(state, int(token))
+
+        self._request_states[request_id] = state
+        return state
+
+    def _prepare_request_states(
+        self,
+        input_ids: torch.Tensor,
+        request_ids: list[str],
+        seq_lens: list[int],
+    ) -> tuple[list[int], list[MossTTSLocalRequestState]]:
+        """Walk the scheduled batch, prefill-or-decode each request, and return
+        the flat decode positions + their FSM states (in the same order)."""
+        decode_positions: list[int] = []
+        decode_states: list[MossTTSLocalRequestState] = []
+
+        offset = 0
+        for request_id, seq_len in zip(request_ids, seq_lens):
+            req_tokens = input_ids[offset : offset + seq_len].reshape(-1)
+            state = self._request_states.get(request_id)
+
+            if seq_len > 1 or state is None:
+                # Prefill (or first time we've seen this request) — rebuild FSM.
+                state = self._reset_prefill_state(request_id, req_tokens)
+            else:
+                # Decode step — advance FSM by the single newly-sampled token.
+                self._advance_state_with_text_token(state, int(req_tokens[-1].item()))
+
+            if seq_len == 1:
+                decode_positions.append(offset)
+                decode_states.append(state)
+            offset += seq_len
+
+        self._last_request_ids = list(request_ids)
+        self._last_seq_lens = list(seq_lens)
+        return decode_positions, decode_states
 
     # ══════════════════════════════════════════════════════════════════
     #  Embedding
@@ -285,13 +415,11 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         """
         Build multi-channel embeddings.
 
-        For positions that are gen_slot tokens, the audio embeddings from the
-        previous step are fetched from _last_codes and summed in.  This mirrors
-        MosiTTSModel._prepare_multi_modal_inputs() but operates token-by-token
-        as vllm feeds individual decode steps.
-
-        For prefill (text input only), multi-channel audio sum is zero-padded
-        because no audio codes have been generated yet.
+        For each decode-step position that is *currently in audio mode*
+        (per per-request FSM), the previously-emitted [n_vq] audio codes are
+        embedded and summed into the text-channel embedding. Decode steps
+        outside audio mode get only the text embedding (no audio contamination).
+        Prefill positions also get only the text embedding.
         """
         # Channel 0: text embedding
         embeds = self.embedding_list[0](input_ids)  # [L, D]
@@ -300,19 +428,23 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         if multimodal_embeddings is not None:
             embeds = embeds + multimodal_embeddings
 
-        # Add audio embeddings for decode-step positions.
-        # seq_lens is [tokens_per_request]; a single-token entry means decode.
-        if seq_lens is not None and self._last_codes_slot is not None:
-            offset = 0
-            for slen in seq_lens:
-                if slen == 1:
-                    # Single-token decode step: add audio channel embeddings
-                    codes = self._last_codes_slot  # [n_vq] on CPU
+        if not request_ids or not seq_lens:
+            return embeds
+
+        offset = 0
+        for request_id, slen in zip(request_ids, seq_lens):
+            if slen == 1:
+                state = self._request_states.get(request_id)
+                # Only inject audio embeddings if the request is currently
+                # producing audio. Otherwise the cached pad row is a no-op,
+                # but skipping the loop entirely is cheaper.
+                if state is not None and state.is_audio:
+                    row = state.pending_audio_row.to(embeds.device)
                     for ch_idx in range(self.n_vq):
-                        ch_code = codes[ch_idx].unsqueeze(0).to(embeds.device)  # [1]
-                        ch_emb  = self.embedding_list[ch_idx + 1](ch_code)      # [1, D]
+                        ch_code = row[ch_idx].unsqueeze(0)
+                        ch_emb  = self.embedding_list[ch_idx + 1](ch_code)
                         embeds[offset] = embeds[offset] + ch_emb[0]
-                offset += slen
+            offset += slen
 
         return embeds
 
@@ -401,45 +533,50 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
     #  Request-info helpers (vLLM v0.19+)
     # ══════════════════════════════════════════════════════════════════
 
-    def _extract_request_info(self) -> tuple[list[int], list[int]]:
+    def _extract_request_info(
+        self,
+        runtime_additional_information: Optional[list[dict]] = None,
+    ) -> tuple[list[str], list[int], list[int]]:
         """
-        Derive per-request token counts and decode positions from the vLLM
-        forward context (vLLM v0.19+).
-
-        In vLLM v0.19, attention metadata is stored in the forward context
-        (set via set_forward_context / accessed via get_forward_context) rather
-        than passed as a `forward()` argument.
+        Derive per-request schedule info from the vLLM forward context (v0.19+).
 
         Returns
         -------
-        seq_lens       : list[int]  — #tokens scheduled per request
-        decode_positions : list[int] — positions in the flat hidden_states
-                          tensor for requests with exactly 1 scheduled token
-                          (i.e., decode-phase requests)
+        request_ids      : list[str] — req_id for each scheduled request
+        seq_lens         : list[int] — #tokens scheduled per request
+        decode_positions : list[int] — flat positions of decode-phase requests
         """
         try:
             from vllm.forward_context import get_forward_context
             ctx = get_forward_context()
             attn_meta_dict = ctx.attn_metadata
             if not attn_meta_dict:
-                return [], []
-            # DBO / microbatch: attn_meta_dict is a list; use first element.
+                return [], [], []
             if isinstance(attn_meta_dict, list):
                 attn_meta_dict = attn_meta_dict[0]
-            # All layers share the same request structure; pick any layer.
             attn_meta = next(iter(attn_meta_dict.values()))
-            qsl = attn_meta.query_start_loc.cpu().tolist()  # [N_reqs + 1]
+            qsl = attn_meta.query_start_loc.cpu().tolist()
             num_reqs = len(qsl) - 1
             seq_lens = [qsl[i + 1] - qsl[i] for i in range(num_reqs)]
             decode_positions = [qsl[i] for i, s in enumerate(seq_lens) if s == 1]
-            return seq_lens, decode_positions
         except Exception as exc:
             logger.debug("[MossTTS AR] _extract_request_info failed: %s", exc)
-            return [], []
+            return [], [], []
+
+        if runtime_additional_information:
+            request_ids = [
+                info.get("req_id", str(i))
+                for i, info in enumerate(runtime_additional_information)
+            ]
+        else:
+            request_ids = [str(i) for i in range(len(seq_lens))]
+        return request_ids, seq_lens, decode_positions
 
     def _clear_warmup_state(self) -> None:
         """Clear any state accumulated during the vLLM profiling / warmup pass."""
-        self._last_codes_slot = None
+        self._request_states.clear()
+        self._last_request_ids = []
+        self._last_seq_lens = []
 
     # ══════════════════════════════════════════════════════════════════
     #  Forward
@@ -456,23 +593,29 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         **kwargs,
     ) -> OmniOutput:
         # ── 0. Derive per-request schedule info from vLLM forward context ─
-        # In vLLM v0.19+, attention metadata is no longer passed as a forward()
-        # argument; use get_forward_context() instead.
-        seq_lens_per_req, decode_positions = self._extract_request_info()
+        request_ids, seq_lens_per_req, decode_positions = self._extract_request_info(
+            kwargs.get("runtime_additional_information"),
+        )
 
-        # New request starting (prefill): clear cached codes from previous req.
-        if any(s > 1 for s in seq_lens_per_req):
-            self._last_codes_slot = None
+        # ── 1. Per-request FSM bookkeeping ────────────────────────────
+        decode_states: list[MossTTSLocalRequestState] = []
+        if request_ids and seq_lens_per_req and input_ids is not None:
+            decode_positions, decode_states = self._prepare_request_states(
+                input_ids=input_ids,
+                request_ids=request_ids,
+                seq_lens=seq_lens_per_req,
+            )
 
-        # ── 1. Build embeddings (multi-channel) ───────────────────────
-        if inputs_embeds is None:
+        # ── 2. Build embeddings (multi-channel) ───────────────────────
+        if inputs_embeds is None and input_ids is not None:
             inputs_embeds = self.embed_input_ids(
                 input_ids,
                 multimodal_embeddings=kwargs.get("multimodal_embeddings"),
+                request_ids=request_ids if request_ids else None,
                 seq_lens=seq_lens_per_req if seq_lens_per_req else None,
             )
 
-        # ── 2. Global Qwen3 backbone ──────────────────────────────────
+        # ── 3. Global Qwen3 backbone ──────────────────────────────────
         hidden_states = self.backbone(
             input_ids=None,
             positions=positions,
@@ -480,46 +623,99 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
             inputs_embeds=inputs_embeds,
         )  # [L, D_global]
 
-        # ── 3. Local transformer (decode positions only) ──────────────
-        # decode_positions: flat indices into hidden_states for requests with
-        # exactly 1 scheduled token (= decode phase).
-        code_tensor: Optional[torch.Tensor] = None
+        # ── 4. Local transformer — only for decode steps in audio mode ─
+        # Outside of audio mode the local transformer's output is garbage
+        # for our purposes (downstream Stage 1 would treat it as audio codes).
+        # Restrict execution to FSM positions that are currently `is_audio`.
+        multimodal_outputs: dict[str, Any] = {}
 
-        if decode_positions and not torch.cuda.is_current_stream_capturing():
-            pos_t = torch.tensor(decode_positions, device=hidden_states.device)
-            decode_hidden = hidden_states[pos_t]  # [B, D_global]
+        if decode_positions and decode_states and not torch.cuda.is_current_stream_capturing():
+            audio_mask = [s.is_audio for s in decode_states]
+            audio_positions = [
+                p for p, m in zip(decode_positions, audio_mask) if m
+            ]
+            audio_states = [s for s, m in zip(decode_states, audio_mask) if m]
 
-            codes = self._local_forward(
-                decode_hidden,
-                temperature=kwargs.get("audio_temperature", 1.0),
-                top_k=kwargs.get("audio_top_k", 50),
-                top_p=kwargs.get("audio_top_p", 0.95),
-            )  # [B, n_vq]
+            if audio_positions:
+                pos_t = torch.tensor(audio_positions, device=hidden_states.device)
+                decode_hidden = hidden_states[pos_t]  # [B_audio, D_global]
 
-            # Cache codes for the NEXT step's multi-channel embedding.
-            # max_num_seqs=1, so a single slot suffices.
-            self._last_codes_slot = codes[0].cpu()
+                codes = self._local_forward(
+                    decode_hidden,
+                    temperature=kwargs.get("audio_temperature", 1.0),
+                    top_k=kwargs.get("audio_top_k", 50),
+                    top_p=kwargs.get("audio_top_p", 0.95),
+                )  # [B_audio, n_vq]
 
-            # Shape convention: [B, 1, n_vq, 1]  (matches MiMo's [B, 1, 8, 4])
-            B = codes.shape[0]
-            code_tensor = codes.reshape(B, 1, self.n_vq, 1)
+                # Cache codes per-request for the NEXT decode step's
+                # multi-channel embedding contribution.
+                for state, row in zip(audio_states, codes):
+                    state.store_next_audio_row(row)
+
+                # Shape convention: [B_audio, 1, n_vq, 1]
+                B = codes.shape[0]
+                multimodal_outputs = {
+                    "code_predictor_codes": codes.reshape(B, 1, self.n_vq, 1),
+                    "audio_pad_code": self.audio_pad_code,
+                }
 
         return OmniOutput(
             text_hidden_states=hidden_states,
-            multimodal_outputs=(
-                {"code_predictor_codes": code_tensor}
-                if code_tensor is not None
-                else {}
-            ),
+            multimodal_outputs=multimodal_outputs,
         )
 
     # ══════════════════════════════════════════════════════════════════
     #  vllm model protocol
     # ══════════════════════════════════════════════════════════════════
 
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Text channel logits (channel-0 LM head)."""
-        return self.lm_heads[0](hidden_states)   # [L, vocab_size]
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata | None = None,
+    ) -> torch.Tensor:
+        """Text channel logits (channel-0 LM head), with FSM-driven gating.
+
+        Without this gating the text head can sample arbitrary vocab tokens
+        once it should be emitting `gen_slot` or `audio_end`. Stage 1 then
+        receives garbage `code_predictor_codes` for those steps. This mirrors
+        the equivalent gating in `MossTTSDelayARStageModel.compute_logits`,
+        minus the delay-pattern branch (no `delayed_length` here).
+        """
+        logits = self.lm_heads[0](hidden_states)   # [L, vocab_size]
+        if not self._last_request_ids:
+            return logits
+
+        neg_inf = float("-inf")
+        for row_idx, request_id in enumerate(self._last_request_ids):
+            if row_idx >= logits.shape[0]:
+                break
+            state = self._request_states.get(request_id)
+            if state is None:
+                continue
+
+            row = logits[row_idx]
+
+            if state.is_audio:
+                # Only `gen_slot` (continue audio) or `audio_end` (terminate)
+                # are legal next tokens during audio generation.
+                gen_keep = row[self.gen_slot_id].clone()
+                end_keep = row[self.audio_end_id].clone()
+                row.fill_(neg_inf)
+                row[self.gen_slot_id] = gen_keep
+                row[self.audio_end_id] = end_keep
+            else:
+                # Outside audio: forbid the audio control tokens (and pad).
+                row[self.pad_token_id] = neg_inf
+                row[self.gen_slot_id]  = neg_inf
+                row[self.audio_end_id] = neg_inf
+
+            # Prevent premature `im_end` until we've emitted at least one
+            # audio frame — otherwise the model can terminate the assistant
+            # turn before saying anything.
+            if state.audio_steps_generated == 0:
+                row[self.im_end_token_id] = neg_inf
+
+        return logits
 
     def sample(
         self,
