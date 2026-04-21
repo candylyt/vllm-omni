@@ -775,32 +775,36 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                 else:
                     state.consecutive_end_preferred = 0
 
-                if state.audio_steps_generated < self.MIN_AUDIO_FRAMES:
-                    # Warm-up: force gen_slot. The text head emits noise for
-                    # the first few decode steps after `<|audio_start|>`; this
-                    # gives the local transformer enough audio context to
-                    # produce meaningful codes.
-                    keep = row[self.gen_slot_id].clone()
-                    row.fill_(neg_inf)
-                    row[self.gen_slot_id] = keep
-                elif state.consecutive_end_preferred >= self.END_PREFERRED_STREAK:
-                    # Sustained stop signal — force audio_end this step.
+                # Termination is fully deterministic: we never let the
+                # stochastic sampler pick between gen_slot and audio_end.
+                # With temperature > 0 and only two valid tokens, the model's
+                # natural ranking gets washed out (e.g. a +0.3 logit advantage
+                # for gen_slot still gives audio_end ~35% probability), which
+                # caused early stochastic termination at MIN_AUDIO_FRAMES.
+                #
+                # Instead: force gen_slot every step UNTIL the unmasked text
+                # head has preferred audio_end for END_PREFERRED_STREAK
+                # consecutive steps — a much cleaner stop signal that ignores
+                # transient flips. Past MIN_AUDIO_FRAMES the streak detector
+                # is allowed to fire; before that, warm-up dominates.
+                force_end = (
+                    state.audio_steps_generated >= self.MIN_AUDIO_FRAMES
+                    and state.consecutive_end_preferred >= self.END_PREFERRED_STREAK
+                )
+                if force_end:
                     end_keep = row[self.audio_end_id].clone()
                     row.fill_(neg_inf)
                     row[self.audio_end_id] = end_keep
                     logger.info(
                         "[MossTTS Local] req=%s force-terminating at step=%d "
-                        "(end>%s gen for %d consecutive steps)",
+                        "(end>gen for %d consecutive steps)",
                         request_id, state.audio_steps_generated,
-                        ">", state.consecutive_end_preferred,
+                        state.consecutive_end_preferred,
                     )
                 else:
-                    # Allow gen_slot or audio_end; let the model decide.
-                    gen_keep = row[self.gen_slot_id].clone()
-                    end_keep = row[self.audio_end_id].clone()
+                    keep = row[self.gen_slot_id].clone()
                     row.fill_(neg_inf)
-                    row[self.gen_slot_id]  = gen_keep
-                    row[self.audio_end_id] = end_keep
+                    row[self.gen_slot_id] = keep
             else:
                 if self.pad_token_id >= 0:
                     row[self.pad_token_id] = neg_inf
