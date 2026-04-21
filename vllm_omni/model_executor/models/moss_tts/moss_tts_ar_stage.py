@@ -139,11 +139,6 @@ class MossTTSLocalRequestState:
     audio_pad_code: int
     is_audio: bool = False
     audio_steps_generated: int = 0
-    # Number of consecutive decode steps where `audio_end` was the unmasked
-    # text-head argmax over the FULL vocabulary (rank 0). A length-invariant
-    # "model wants to stop" signal — far more robust than `end > gen_slot`,
-    # which fires on transient noise. See compute_logits.
-    consecutive_end_argmax: int = 0
     pending_audio_row: torch.Tensor = field(init=False)
 
     def __post_init__(self) -> None:
@@ -326,6 +321,13 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         self._last_request_ids: list[str] = []
         self._last_seq_lens: list[int] = []
 
+        # Per-step text-channel logits captured from the local pipeline's
+        # channel-0 path. Populated by `_local_forward` and consumed by
+        # `compute_logits`. Cleared at the start of every `forward`.
+        # Keyed by request_id; each value is a [vocab_size] tensor on the
+        # same device/dtype as the backbone hidden states.
+        self._pending_text_logits: dict[str, torch.Tensor] = {}
+
     # ══════════════════════════════════════════════════════════════════
     #  FSM helpers (per-request audio-mode tracking)
     # ══════════════════════════════════════════════════════════════════
@@ -485,21 +487,30 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
     def _local_forward(
         self,
         global_hidden: torch.Tensor,   # [B, D_global]  (B = num decode seqs)
+        forced_text_token_id: int,
         temperature: float = 1.0,
         top_k: int = 50,
         top_p: float = 0.95,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Autoregressively predict (1 text token + 32 audio codes) per batch element.
 
-        Implements the inner loop of MossTTSDelayModel._sample():
-            - ch 0  → text token  (text LM head, not used by Stage 1)
-            - ch 1..32 → audio codes (audio LM heads, sent to Stage 1)
+        Mirrors the inner loop of `CustomMixin._sample` in modeling_moss_tts.py:
+        every channel (text + n_vq audio) is run through the local transformer
+        pipeline before its LM head. The channel-0 ("text") logits are returned
+        so the caller can route them into vllm's sampler via `compute_logits`
+        — applying `lm_heads[0]` to the raw global hidden state directly is an
+        off-distribution shortcut that destroys text conditioning.
+
+        For ch == 1's input we embed `forced_text_token_id` (the token vllm's
+        sampler will pick — we force gen_slot via masking) instead of running
+        an internal sample on channel 0. This keeps the local transformer's
+        per-channel context in sync with what the next decode step will see.
 
         Returns
         -------
-        audio_codes : Tensor [B, n_vq]  (long)
-            The 32 predicted RVQ codes for each sequence in the batch.
+        audio_codes : Tensor [B, n_vq]   (long)  predicted RVQ codes
+        text_logits : Tensor [B, V_text] (model dtype) channel-0 logits
         """
         B     = global_hidden.shape[0]
         dev   = global_hidden.device
@@ -511,6 +522,7 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         local_ctx    = torch.zeros(B, 0, local_dim, device=dev, dtype=dtype)
 
         audio_codes: list[torch.Tensor] = []
+        text_logits: torch.Tensor | None = None
 
         for ch in range(self.channels):   # ch = 0 (text), 1..32 (audio)
             # Grow local context by one token
@@ -527,26 +539,29 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
             normed   = self.layer_norm_before_lm_heads[ch](proj_out)     # [B, D_global]
             logits   = self.lm_heads[ch](normed)                         # [B, V]
 
-            # Prevent the model from sampling the pad code in audio channels
-            if ch > 0:
-                logits[:, self.audio_pad_code] = float("-inf")
-
-            # Sampling (temperature / top-k / top-p)
-            # TODO: wire in per-request sampling params from SamplingMetadata
-            if temperature > 0.0 and ch > 0:
-                logits = logits / temperature
-                if top_k > 0:
-                    top_k_vals = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1).values
-                    logits[logits < top_k_vals[..., -1:]] = float("-inf")
-                probs      = torch.softmax(logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1).squeeze(1)  # [B]
-            else:
-                next_token = logits.argmax(dim=-1)  # [B]
-
             if ch == 0:
-                # Text token — skip from audio output, but embed for next local step
-                pass
+                # Capture channel-0 logits for vllm's sampler. Defer the
+                # actual sampling to `compute_logits` so the user's
+                # SamplingParams (temp/top-k/top-p, masking) take effect.
+                # Use the forced text token (gen_slot) to drive the next
+                # local step's input — matches what vllm will append to the
+                # global stream after sampling.
+                text_logits = logits
+                next_token = torch.full(
+                    (B,), forced_text_token_id, dtype=torch.long, device=dev,
+                )
             else:
+                # Audio channel: prevent the pad code from being sampled.
+                logits[:, self.audio_pad_code] = float("-inf")
+                if temperature > 0.0:
+                    logits = logits / temperature
+                    if top_k > 0:
+                        top_k_vals = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1).values
+                        logits[logits < top_k_vals[..., -1:]] = float("-inf")
+                    probs      = torch.softmax(logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1).squeeze(1)  # [B]
+                else:
+                    next_token = logits.argmax(dim=-1)  # [B]
                 audio_codes.append(next_token)
 
             # Re-embed sampled token → next local step's input
@@ -555,8 +570,13 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
 
         # Stack: [B, n_vq]
         if audio_codes:
-            return torch.stack(audio_codes, dim=1).to(torch.long)
-        return torch.zeros(B, self.n_vq, dtype=torch.long, device=dev)
+            codes = torch.stack(audio_codes, dim=1).to(torch.long)
+        else:
+            codes = torch.zeros(B, self.n_vq, dtype=torch.long, device=dev)
+
+        if text_logits is None:
+            text_logits = torch.zeros(B, self.lm_heads[0].out_features, device=dev, dtype=dtype)
+        return codes, text_logits
 
     # ══════════════════════════════════════════════════════════════════
     #  Request-info helpers (vLLM v0.19+)
@@ -626,6 +646,10 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
             kwargs.get("runtime_additional_information"),
         )
 
+        # Reset per-step text-logit cache. Populated below by `_local_forward`
+        # for any audio-mode decode positions, then consumed by `compute_logits`.
+        self._pending_text_logits = {}
+
         # ── 1. Per-request FSM bookkeeping ────────────────────────────
         decode_states: list[MossTTSLocalRequestState] = []
         if request_ids and seq_lens_per_req and input_ids is not None:
@@ -674,22 +698,35 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                 p for p, m in zip(decode_positions, audio_mask) if m
             ]
             audio_states = [s for s, m in zip(decode_states, audio_mask) if m]
+            decode_request_ids = [
+                r for r, sl in zip(request_ids, seq_lens_per_req) if sl == 1
+            ]
+            audio_request_ids = [
+                r for r, m in zip(decode_request_ids, audio_mask) if m
+            ]
 
             if audio_positions:
                 pos_t = torch.tensor(audio_positions, device=hidden_states.device)
                 decode_hidden = hidden_states[pos_t]  # [B_audio, D_global]
 
-                codes = self._local_forward(
+                codes, text_logits = self._local_forward(
                     decode_hidden,
+                    forced_text_token_id=self.gen_slot_id,
                     temperature=kwargs.get("audio_temperature", 1.0),
                     top_k=kwargs.get("audio_top_k", 50),
                     top_p=kwargs.get("audio_top_p", 0.95),
-                )  # [B_audio, n_vq]
+                )  # [B_audio, n_vq], [B_audio, V_text]
 
                 # Cache codes per-request for the NEXT decode step's
                 # multi-channel embedding contribution.
                 for state, row in zip(audio_states, codes):
                     state.store_next_audio_row(row)
+
+                # Cache channel-0 text logits so `compute_logits` can return
+                # the local-pipeline-processed distribution rather than
+                # reapplying lm_heads[0] to the raw global hidden state.
+                for req_id, tl in zip(audio_request_ids, text_logits):
+                    self._pending_text_logits[req_id] = tl
 
                 # Shape convention: [B_audio, 1, n_vq, 1]
                 B = codes.shape[0]
@@ -721,14 +758,6 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
     # modest (and can be trimmed downstream).
     MIN_AUDIO_FRAMES: int = 10
 
-    # Force-terminate audio when `audio_end` is the unmasked text-head's
-    # global argmax (over the full vocab) for this many consecutive decode
-    # steps. This is a content-length-invariant signal: it fires when the
-    # model genuinely wants to stop, regardless of whether the utterance
-    # is 2s or 20s. A streak of 2 filters single-step blips while still
-    # terminating within ~one frame of the true endpoint.
-    END_ARGMAX_STREAK: int = 4
-
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
@@ -736,19 +765,22 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
     ) -> torch.Tensor:
         """Text channel logits (channel-0 LM head), with FSM-driven gating.
 
-        Strategy:
-          - In audio mode, audio_steps < MIN_AUDIO_FRAMES → force `gen_slot`
-            (only legal token). Guarantees we generate a minimum amount of
-            audio before the model can decide to stop.
-          - In audio mode, audio_steps ≥ MIN_AUDIO_FRAMES → allow
-            `{gen_slot, audio_end}`. Model picks based on accumulated
-            audio context.
-          - Outside audio mode → mask audio-control tokens so they can't
-            leak into text generation.
+        For audio-mode rows we substitute the channel-0 logits captured by
+        `_local_forward` (computed via the full local pipeline:
+        speech_embedding_to_local_mlp → local_transformer →
+        local_to_speech_embedding_mlps[0] → layer_norm_before_lm_heads[0] →
+        lm_heads[0]). Applying lm_heads[0] directly to the raw global hidden
+        state — which is what we did originally — is off-distribution and
+        produces a degraded "want to stop" signal that fires regardless of
+        text length.
 
-        The delay-pattern stage uses an analogous scheme (gen_slot vs.
-        delay_slot vs. forced audio_end). The local stage's variant is
-        simpler because there is no delay-drain phase.
+        Masking:
+          - Audio mode, steps < MIN_AUDIO_FRAMES → force `gen_slot` (warm-up
+            guard against premature termination right after `<|audio_start|>`).
+          - Audio mode, steps ≥ MIN_AUDIO_FRAMES → unmask only
+            `{gen_slot, audio_end}` so vllm's sampler picks freely between
+            "continue" and "stop" using the corrected logits.
+          - Outside audio mode → mask audio-control tokens.
         """
         logits = self.lm_heads[0](hidden_states)   # [L, vocab_size]
         if not self._last_request_ids:
@@ -762,58 +794,24 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
             if state is None:
                 continue
 
+            # Substitute local-pipeline text logits when available.
+            cached_tl = self._pending_text_logits.get(request_id)
+            if cached_tl is not None:
+                logits[row_idx] = cached_tl.to(logits.dtype)
+
             row = logits[row_idx]
 
             if state.is_audio:
-                # Track whether the unmasked text head's TOP choice over the
-                # full vocabulary is `audio_end`. This is the cleanest "model
-                # wants to stop" signal: it ignores transient gen↔end flips
-                # and is invariant to utterance length.
-                with torch.no_grad():
-                    raw = row.detach().float()
-                    raw_argmax = int(raw.argmax().item())
-                    raw_gen = float(raw[self.gen_slot_id].item())
-                    raw_end = float(raw[self.audio_end_id].item())
-                    end_rank = int((raw > raw_end).sum().item())
-                if raw_argmax == self.audio_end_id:
-                    state.consecutive_end_argmax += 1
-                else:
-                    state.consecutive_end_argmax = 0
-
-                # Diagnostic — remove once termination behavior is verified.
-                logger.warning(
-                    "[debug-stop] req=%s step=%d argmax=%d end_rank=%d "
-                    "gen_l=%.3f end_l=%.3f streak=%d",
-                    request_id, state.audio_steps_generated,
-                    raw_argmax, end_rank, raw_gen, raw_end,
-                    state.consecutive_end_argmax,
-                )
-
-                # Termination is fully deterministic: never let the stochastic
-                # sampler pick between gen_slot and audio_end (with temp > 0
-                # and only two valid tokens, even a clear gen_slot logit
-                # advantage gives audio_end ~30%+ probability). Force gen_slot
-                # every step until the streak detector trips, then force
-                # audio_end. MIN_AUDIO_FRAMES guards against firing during the
-                # noisy warm-up window after `<|audio_start|>`.
-                force_end = (
-                    state.audio_steps_generated >= self.MIN_AUDIO_FRAMES
-                    and state.consecutive_end_argmax >= self.END_ARGMAX_STREAK
-                )
-                if force_end:
-                    end_keep = row[self.audio_end_id].clone()
-                    row.fill_(neg_inf)
-                    row[self.audio_end_id] = end_keep
-                    logger.info(
-                        "[MossTTS Local] req=%s force-terminating at step=%d "
-                        "(audio_end was argmax for %d consecutive steps)",
-                        request_id, state.audio_steps_generated,
-                        state.consecutive_end_argmax,
-                    )
-                else:
+                if state.audio_steps_generated < self.MIN_AUDIO_FRAMES:
                     keep = row[self.gen_slot_id].clone()
                     row.fill_(neg_inf)
                     row[self.gen_slot_id] = keep
+                else:
+                    gen_keep = row[self.gen_slot_id].clone()
+                    end_keep = row[self.audio_end_id].clone()
+                    row.fill_(neg_inf)
+                    row[self.gen_slot_id]  = gen_keep
+                    row[self.audio_end_id] = end_keep
             else:
                 if self.pad_token_id >= 0:
                     row[self.pad_token_id] = neg_inf
