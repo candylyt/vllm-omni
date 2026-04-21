@@ -770,11 +770,24 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                 # wants to stop" signal: it ignores transient gen↔end flips
                 # and is invariant to utterance length.
                 with torch.no_grad():
-                    raw_argmax = int(row.argmax().item())
+                    raw = row.detach().float()
+                    raw_argmax = int(raw.argmax().item())
+                    raw_gen = float(raw[self.gen_slot_id].item())
+                    raw_end = float(raw[self.audio_end_id].item())
+                    end_rank = int((raw > raw_end).sum().item())
                 if raw_argmax == self.audio_end_id:
                     state.consecutive_end_argmax += 1
                 else:
                     state.consecutive_end_argmax = 0
+
+                # Diagnostic — remove once termination behavior is verified.
+                logger.warning(
+                    "[debug-stop] req=%s step=%d argmax=%d end_rank=%d "
+                    "gen_l=%.3f end_l=%.3f streak=%d",
+                    request_id, state.audio_steps_generated,
+                    raw_argmax, end_rank, raw_gen, raw_end,
+                    state.consecutive_end_argmax,
+                )
 
                 # Termination is fully deterministic: never let the stochastic
                 # sampler pick between gen_slot and audio_end (with temp > 0
