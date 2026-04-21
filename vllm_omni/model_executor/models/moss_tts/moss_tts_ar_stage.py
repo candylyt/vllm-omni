@@ -714,7 +714,7 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
     # caps the forced-audio period at ~12 seconds. For longer utterances
     # bump this higher; for very short ones the trailing silence will be
     # modest (and can be trimmed downstream).
-    MIN_AUDIO_FRAMES: int = 150
+    MIN_AUDIO_FRAMES: int = 20
 
     def compute_logits(
         self,
