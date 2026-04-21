@@ -714,7 +714,7 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
     # caps the forced-audio period at ~12 seconds. For longer utterances
     # bump this higher; for very short ones the trailing silence will be
     # modest (and can be trimmed downstream).
-    MIN_AUDIO_FRAMES: int = 20
+    MIN_AUDIO_FRAMES: int = 200
 
     def compute_logits(
         self,
@@ -750,6 +750,29 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                 continue
 
             row = logits[row_idx]
+
+            # Diagnostic: snapshot raw (unmasked) logits during audio mode so
+            # we can tell whether the model is trying to terminate naturally.
+            # Logged BEFORE any gating mutation. Remove once trailing-silence
+            # behavior is understood.
+            if state.is_audio:
+                with torch.no_grad():
+                    raw = row.detach().float()
+                    gen_l = float(raw[self.gen_slot_id].item())
+                    end_l = float(raw[self.audio_end_id].item())
+                    top_v, top_i = torch.topk(raw, k=5)
+                    top_pairs = [
+                        (int(i.item()), float(v.item()))
+                        for v, i in zip(top_v, top_i)
+                    ]
+                    argmax_id = int(raw.argmax().item())
+                    end_rank = int((raw > end_l).sum().item())  # 0 == best
+                logger.warning(
+                    "[debug-logits] req=%s step=%d gen_logit=%.3f end_logit=%.3f "
+                    "diff(gen-end)=%+.3f end_rank=%d argmax=%d top5=%s",
+                    request_id, state.audio_steps_generated,
+                    gen_l, end_l, gen_l - end_l, end_rank, argmax_id, top_pairs,
+                )
 
             if state.is_audio:
                 if state.audio_steps_generated < self.MIN_AUDIO_FRAMES:
