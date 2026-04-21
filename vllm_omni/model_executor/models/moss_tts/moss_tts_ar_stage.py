@@ -139,10 +139,11 @@ class MossTTSLocalRequestState:
     audio_pad_code: int
     is_audio: bool = False
     audio_steps_generated: int = 0
-    # Number of consecutive decode steps where the unmasked text-head logit
-    # for `audio_end` exceeded `gen_slot`. Used to detect a sustained
-    # "model wants to stop" signal — see compute_logits.
-    consecutive_end_preferred: int = 0
+    # Number of consecutive decode steps where `audio_end` was the unmasked
+    # text-head argmax over the FULL vocabulary (rank 0). A length-invariant
+    # "model wants to stop" signal — far more robust than `end > gen_slot`,
+    # which fires on transient noise. See compute_logits.
+    consecutive_end_argmax: int = 0
     pending_audio_row: torch.Tensor = field(init=False)
 
     def __post_init__(self) -> None:
@@ -720,12 +721,13 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
     # modest (and can be trimmed downstream).
     MIN_AUDIO_FRAMES: int = 10
 
-    # Force-terminate audio when the unmasked text-head prefers `audio_end`
-    # over `gen_slot` for this many consecutive decode steps. Empirically the
-    # model emits a clear stop signal around the true end of speech (see
-    # diagnostics run with MIN_AUDIO_FRAMES ≥ 200); a streak of 2 is long
-    # enough to filter transient fluctuations while still terminating quickly.
-    END_PREFERRED_STREAK: int = 20
+    # Force-terminate audio when `audio_end` is the unmasked text-head's
+    # global argmax (over the full vocab) for this many consecutive decode
+    # steps. This is a content-length-invariant signal: it fires when the
+    # model genuinely wants to stop, regardless of whether the utterance
+    # is 2s or 20s. A streak of 2 filters single-step blips while still
+    # terminating within ~one frame of the true endpoint.
+    END_ARGMAX_STREAK: int = 20
 
     def compute_logits(
         self,
@@ -763,33 +765,27 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
             row = logits[row_idx]
 
             if state.is_audio:
-                # Sample the raw text-head's preference between gen_slot and
-                # audio_end BEFORE any gating mutation, so we can detect when
-                # the model is genuinely trying to terminate (see comment on
-                # END_PREFERRED_STREAK).
+                # Track whether the unmasked text head's TOP choice over the
+                # full vocabulary is `audio_end`. This is the cleanest "model
+                # wants to stop" signal: it ignores transient gen↔end flips
+                # and is invariant to utterance length.
                 with torch.no_grad():
-                    raw_gen = float(row[self.gen_slot_id].item())
-                    raw_end = float(row[self.audio_end_id].item())
-                if raw_end > raw_gen:
-                    state.consecutive_end_preferred += 1
+                    raw_argmax = int(row.argmax().item())
+                if raw_argmax == self.audio_end_id:
+                    state.consecutive_end_argmax += 1
                 else:
-                    state.consecutive_end_preferred = 0
+                    state.consecutive_end_argmax = 0
 
-                # Termination is fully deterministic: we never let the
-                # stochastic sampler pick between gen_slot and audio_end.
-                # With temperature > 0 and only two valid tokens, the model's
-                # natural ranking gets washed out (e.g. a +0.3 logit advantage
-                # for gen_slot still gives audio_end ~35% probability), which
-                # caused early stochastic termination at MIN_AUDIO_FRAMES.
-                #
-                # Instead: force gen_slot every step UNTIL the unmasked text
-                # head has preferred audio_end for END_PREFERRED_STREAK
-                # consecutive steps — a much cleaner stop signal that ignores
-                # transient flips. Past MIN_AUDIO_FRAMES the streak detector
-                # is allowed to fire; before that, warm-up dominates.
+                # Termination is fully deterministic: never let the stochastic
+                # sampler pick between gen_slot and audio_end (with temp > 0
+                # and only two valid tokens, even a clear gen_slot logit
+                # advantage gives audio_end ~30%+ probability). Force gen_slot
+                # every step until the streak detector trips, then force
+                # audio_end. MIN_AUDIO_FRAMES guards against firing during the
+                # noisy warm-up window after `<|audio_start|>`.
                 force_end = (
                     state.audio_steps_generated >= self.MIN_AUDIO_FRAMES
-                    and state.consecutive_end_preferred >= self.END_PREFERRED_STREAK
+                    and state.consecutive_end_argmax >= self.END_ARGMAX_STREAK
                 )
                 if force_end:
                     end_keep = row[self.audio_end_id].clone()
@@ -797,9 +793,9 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                     row[self.audio_end_id] = end_keep
                     logger.info(
                         "[MossTTS Local] req=%s force-terminating at step=%d "
-                        "(end>gen for %d consecutive steps)",
+                        "(audio_end was argmax for %d consecutive steps)",
                         request_id, state.audio_steps_generated,
-                        state.consecutive_end_preferred,
+                        state.consecutive_end_argmax,
                     )
                 else:
                     keep = row[self.gen_slot_id].clone()
