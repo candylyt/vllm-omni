@@ -139,6 +139,10 @@ class MossTTSLocalRequestState:
     audio_pad_code: int
     is_audio: bool = False
     audio_steps_generated: int = 0
+    # Number of consecutive decode steps where the unmasked text-head logit
+    # for `audio_end` exceeded `gen_slot`. Used to detect a sustained
+    # "model wants to stop" signal — see compute_logits.
+    consecutive_end_preferred: int = 0
     pending_audio_row: torch.Tensor = field(init=False)
 
     def __post_init__(self) -> None:
@@ -714,7 +718,14 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
     # caps the forced-audio period at ~12 seconds. For longer utterances
     # bump this higher; for very short ones the trailing silence will be
     # modest (and can be trimmed downstream).
-    MIN_AUDIO_FRAMES: int = 200
+    MIN_AUDIO_FRAMES: int = 10
+
+    # Force-terminate audio when the unmasked text-head prefers `audio_end`
+    # over `gen_slot` for this many consecutive decode steps. Empirically the
+    # model emits a clear stop signal around the true end of speech (see
+    # diagnostics run with MIN_AUDIO_FRAMES ≥ 200); a streak of 2 is long
+    # enough to filter transient fluctuations while still terminating quickly.
+    END_PREFERRED_STREAK: int = 20
 
     def compute_logits(
         self,
@@ -751,35 +762,38 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
 
             row = logits[row_idx]
 
-            # Diagnostic: snapshot raw (unmasked) logits during audio mode so
-            # we can tell whether the model is trying to terminate naturally.
-            # Logged BEFORE any gating mutation. Remove once trailing-silence
-            # behavior is understood.
             if state.is_audio:
+                # Sample the raw text-head's preference between gen_slot and
+                # audio_end BEFORE any gating mutation, so we can detect when
+                # the model is genuinely trying to terminate (see comment on
+                # END_PREFERRED_STREAK).
                 with torch.no_grad():
-                    raw = row.detach().float()
-                    gen_l = float(raw[self.gen_slot_id].item())
-                    end_l = float(raw[self.audio_end_id].item())
-                    top_v, top_i = torch.topk(raw, k=5)
-                    top_pairs = [
-                        (int(i.item()), float(v.item()))
-                        for v, i in zip(top_v, top_i)
-                    ]
-                    argmax_id = int(raw.argmax().item())
-                    end_rank = int((raw > end_l).sum().item())  # 0 == best
-                logger.warning(
-                    "[debug-logits] req=%s step=%d gen_logit=%.3f end_logit=%.3f "
-                    "diff(gen-end)=%+.3f end_rank=%d argmax=%d top5=%s",
-                    request_id, state.audio_steps_generated,
-                    gen_l, end_l, gen_l - end_l, end_rank, argmax_id, top_pairs,
-                )
+                    raw_gen = float(row[self.gen_slot_id].item())
+                    raw_end = float(row[self.audio_end_id].item())
+                if raw_end > raw_gen:
+                    state.consecutive_end_preferred += 1
+                else:
+                    state.consecutive_end_preferred = 0
 
-            if state.is_audio:
                 if state.audio_steps_generated < self.MIN_AUDIO_FRAMES:
-                    # Force gen_slot: it's the ONLY non-(-inf) token.
+                    # Warm-up: force gen_slot. The text head emits noise for
+                    # the first few decode steps after `<|audio_start|>`; this
+                    # gives the local transformer enough audio context to
+                    # produce meaningful codes.
                     keep = row[self.gen_slot_id].clone()
                     row.fill_(neg_inf)
                     row[self.gen_slot_id] = keep
+                elif state.consecutive_end_preferred >= self.END_PREFERRED_STREAK:
+                    # Sustained stop signal — force audio_end this step.
+                    end_keep = row[self.audio_end_id].clone()
+                    row.fill_(neg_inf)
+                    row[self.audio_end_id] = end_keep
+                    logger.info(
+                        "[MossTTS Local] req=%s force-terminating at step=%d "
+                        "(end>%s gen for %d consecutive steps)",
+                        request_id, state.audio_steps_generated,
+                        ">", state.consecutive_end_preferred,
+                    )
                 else:
                     # Allow gen_slot or audio_end; let the model decide.
                     gen_keep = row[self.gen_slot_id].clone()
