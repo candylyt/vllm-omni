@@ -352,20 +352,11 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         kept generating audio codes for whatever token the text head emitted
         once the model wanted to stop, producing garbage at the tail.
         """
+        # In audio mode the only legal text-channel tokens are `gen_slot`
+        # (continue) and `audio_end` (terminate). `compute_logits` enforces
+        # this via masking, so any other id here would indicate a bug.
         if state.is_audio:
-            # Clean exit on the dedicated audio-end token.
             if token_id == self.audio_end_id:
-                state.is_audio = False
-                state.pending_audio_row = torch.full(
-                    (self.n_vq,), self.audio_pad_code, dtype=torch.long
-                )
-                return
-            # Stray non-gen_slot token mid-audio: only treat as termination
-            # AFTER we've actually generated something. The very first decode
-            # step after `<|audio_start|>` may not be exactly `gen_slot` in
-            # the unconstrained sampling distribution; we don't want to kill
-            # audio generation before it starts.
-            if token_id != self.gen_slot_id and state.audio_steps_generated >= 1:
                 state.is_audio = False
                 state.pending_audio_row = torch.full(
                     (self.n_vq,), self.audio_pad_code, dtype=torch.long
@@ -711,25 +702,36 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
     #  vllm model protocol
     # ══════════════════════════════════════════════════════════════════
 
+    # Minimum number of audio frames to emit before allowing the model to
+    # sample `audio_end`. Without this guard the model can terminate audio
+    # generation on the very first sampling step, producing 0–1 frames of
+    # output. Empirically the unconstrained MOSS-TTS-Local text head does
+    # NOT favor `gen_slot` after `<|audio_start|>` — its distribution leans
+    # toward random vocab tokens — so we have to force the right control
+    # token until enough audio context has accumulated for `audio_end` to be
+    # a meaningful choice.
+    MIN_AUDIO_FRAMES: int = 10
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata | None = None,
     ) -> torch.Tensor:
-        """Text channel logits (channel-0 LM head), with light FSM-driven gating.
+        """Text channel logits (channel-0 LM head), with FSM-driven gating.
 
         Strategy:
-          - In audio mode → DO NOT mask. The model was trained to emit
-            `gen_slot` here naturally; over-restricting (e.g. keeping only
-            gen_slot/audio_end) skews the relative ranking and can cause
-            instant termination on the very first sampling step.
-          - Outside audio mode → mask the audio control tokens so they
-            cannot leak into text generation.
+          - In audio mode, audio_steps < MIN_AUDIO_FRAMES → force `gen_slot`
+            (only legal token). Guarantees we generate a minimum amount of
+            audio before the model can decide to stop.
+          - In audio mode, audio_steps ≥ MIN_AUDIO_FRAMES → allow
+            `{gen_slot, audio_end}`. Model picks based on accumulated
+            audio context.
+          - Outside audio mode → mask audio-control tokens so they can't
+            leak into text generation.
 
-        The "garbage at end of audio" symptom is fixed by the FSM exiting
-        audio mode on any non-`gen_slot` token (see
-        `_advance_state_with_text_token`) and by `forward()` skipping
-        `_local_forward` for non-audio decode steps.
+        The delay-pattern stage uses an analogous scheme (gen_slot vs.
+        delay_slot vs. forced audio_end). The local stage's variant is
+        simpler because there is no delay-drain phase.
         """
         logits = self.lm_heads[0](hidden_states)   # [L, vocab_size]
         if not self._last_request_ids:
@@ -740,15 +742,29 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
             if row_idx >= logits.shape[0]:
                 break
             state = self._request_states.get(request_id)
-            if state is None or state.is_audio:
-                # Audio mode: leave the distribution alone.
+            if state is None:
                 continue
 
             row = logits[row_idx]
-            if self.pad_token_id >= 0:
-                row[self.pad_token_id] = neg_inf
-            row[self.gen_slot_id]  = neg_inf
-            row[self.audio_end_id] = neg_inf
+
+            if state.is_audio:
+                if state.audio_steps_generated < self.MIN_AUDIO_FRAMES:
+                    # Force gen_slot: it's the ONLY non-(-inf) token.
+                    keep = row[self.gen_slot_id].clone()
+                    row.fill_(neg_inf)
+                    row[self.gen_slot_id] = keep
+                else:
+                    # Allow gen_slot or audio_end; let the model decide.
+                    gen_keep = row[self.gen_slot_id].clone()
+                    end_keep = row[self.audio_end_id].clone()
+                    row.fill_(neg_inf)
+                    row[self.gen_slot_id]  = gen_keep
+                    row[self.audio_end_id] = end_keep
+            else:
+                if self.pad_token_id >= 0:
+                    row[self.pad_token_id] = neg_inf
+                row[self.gen_slot_id]  = neg_inf
+                row[self.audio_end_id] = neg_inf
 
         return logits
 
