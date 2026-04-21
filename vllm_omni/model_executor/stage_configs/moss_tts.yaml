@@ -40,7 +40,7 @@ stage_args:
       # Local transformer (4 blocks, 1536 hidden) ≈ 0.5 GB @ bf16
       # Embeddings + LM heads (33 channels) ≈ 0.3 GB @ bf16
       # Total AR stage ≈ 4.2 GB → 0.3 utilisation leaves KV cache headroom
-      gpu_memory_utilization: 0.3
+      gpu_memory_utilization: 0.2
 
       enforce_eager: true # local transformer runs eagerly (no CUDA graph)
       trust_remote_code: true # required for MossTTSLocalTransformer import
@@ -86,7 +86,7 @@ stage_args:
       # CAT codec (1.6 B parameters) ≈ 3.2 GB @ bf16
       # Activation memory during decode ≈ 1 GB
       # Total ≈ 4.2 GB → 0.4 utilisation on a 96 GB GPU
-      gpu_memory_utilization: 0.4
+      gpu_memory_utilization: 0.1
 
       enforce_eager: true
       trust_remote_code: true

@@ -198,12 +198,20 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         self.gen_slot_id: int     = cfg.audio_assistant_gen_slot_token_id # 151656
         self.audio_end_id: int    = cfg.audio_end_token_id               # 151653
 
-        # Tokens needed by the FSM / logits gating
-        self.pad_token_id: int          = cfg.pad_token_id
-        self.im_end_token_id: int       = cfg.im_end_token_id
-        self.audio_start_token_id: int  = cfg.audio_start_token_id
+        # Tokens needed by the FSM / logits gating.
+        # All optional — if a config doesn't carry them we just skip the
+        # corresponding gating branch (defensive against config drift).
+        self.pad_token_id: int          = getattr(cfg, "pad_token_id", -1)
+        self.im_end_token_id: int       = getattr(cfg, "im_end_token_id", -1)
+        self.audio_start_token_id: int  = getattr(cfg, "audio_start_token_id", -1)
         self.audio_user_slot_token_id: int = getattr(
             cfg, "audio_user_slot_token_id", -1
+        )
+        logger.info(
+            "[MossTTS Local] FSM token ids: pad=%d im_end=%d audio_start=%d "
+            "gen_slot=%d audio_end=%d",
+            self.pad_token_id, self.im_end_token_id,
+            self.audio_start_token_id, self.gen_slot_id, self.audio_end_id,
         )
 
         lang_cfg = cfg.language_config          # Qwen3Config
@@ -352,7 +360,10 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                 )
             return
 
-        if token_id in (self.audio_start_token_id, self.gen_slot_id):
+        entry_tokens = {self.gen_slot_id}
+        if self.audio_start_token_id >= 0:
+            entry_tokens.add(self.audio_start_token_id)
+        if token_id in entry_tokens:
             state.is_audio = True
 
     def _reset_prefill_state(
@@ -712,7 +723,8 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                 continue
 
             row = logits[row_idx]
-            row[self.pad_token_id] = neg_inf
+            if self.pad_token_id >= 0:
+                row[self.pad_token_id] = neg_inf
             row[self.gen_slot_id]  = neg_inf
             row[self.audio_end_id] = neg_inf
 
