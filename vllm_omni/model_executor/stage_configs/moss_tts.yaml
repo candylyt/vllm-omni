@@ -48,6 +48,7 @@ stage_args:
       engine_output_type: latent
       max_model_len: 4096
       max_num_batched_tokens: 4096
+      async_scheduling: false
 
     is_comprehension: true
     final_output: true
