@@ -157,6 +157,20 @@ def main() -> None:
 
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Instrument first-chunk latency via a shared timestamp dir.  The Stage-1
+    # decoder (different process) writes a file the first time it produces
+    # a non-empty waveform for each request_id; we read those back below.
+    first_chunk_dir = os.path.abspath(os.path.join(args.output_dir, "_first_chunk"))
+    os.makedirs(first_chunk_dir, exist_ok=True)
+    # Clear any stale timestamp files from a previous run.
+    for _stale in os.listdir(first_chunk_dir):
+        if _stale.endswith(".first_chunk.ts"):
+            try:
+                os.remove(os.path.join(first_chunk_dir, _stale))
+            except OSError:
+                pass
+    os.environ["MOSS_FIRST_CHUNK_DIR"] = first_chunk_dir
+
     prompt = build_tts_prompt(args.text, args.model)
     print(f"[Info] Mode:   {args.mode}")
     print(f"[Info] Config: {args.stage_configs_path}")
@@ -191,6 +205,9 @@ def main() -> None:
 
     # ── Benchmark ───────────────────────────────────────────────────────
     print(f"[Info] Running {len(prompts)} prompt(s) in {args.mode} mode ...")
+    # Use both a monotonic clock (for total_time accuracy) and a wall-clock
+    # reference (shared with the Stage-1 decoder subprocess for first-chunk).
+    t_start_wall = time.time()
     t_start = time.perf_counter()
     omni_outputs = omni.generate(prompts, [ar_params, decoder_params])
     t_end = time.perf_counter()
@@ -231,6 +248,21 @@ def main() -> None:
         audio_dur = len(audio_np) / 24000
         rtf = total_time / audio_dur if audio_dur > 0 else float("inf")
 
+        # Read first-chunk timestamp written by the Stage-1 decoder process.
+        # Sync mode decodes everything at once so no per-chunk file is written
+        # — in that case first_chunk_latency ≡ total_time by construction.
+        first_chunk_path = os.path.join(first_chunk_dir, f"{request_id}.first_chunk.ts")
+        first_chunk_latency: float
+        if os.path.exists(first_chunk_path):
+            try:
+                with open(first_chunk_path) as f:
+                    ts = float(f.read().strip())
+                first_chunk_latency = max(0.0, ts - t_start_wall)
+            except (OSError, ValueError):
+                first_chunk_latency = total_time
+        else:
+            first_chunk_latency = total_time
+
         wav_path = os.path.join(args.output_dir, f"{request_id}.wav")
         sf.write(wav_path, audio_np, samplerate=24000, format="WAV")
 
@@ -241,18 +273,21 @@ def main() -> None:
             "audio_dur_s": round(audio_dur, 3),
             "rtf": round(rtf, 4),
             "num_chunks": num_chunks,
+            "first_chunk_latency_s": round(first_chunk_latency, 3),
             "wav": wav_path,
         })
 
         print(
             f"\n{'='*60}\n"
-            f"  mode         : {args.mode}\n"
-            f"  total_time   : {total_time:.3f}s\n"
-            f"  audio_dur    : {audio_dur:.3f}s\n"
-            f"  RTF          : {rtf:.4f}  ({'faster' if rtf < 1 else 'slower'} than real-time)\n"
-            f"  num_chunks   : {num_chunks}  "
+            f"  mode              : {args.mode}\n"
+            f"  total_time        : {total_time:.3f}s\n"
+            f"  audio_dur         : {audio_dur:.3f}s\n"
+            f"  RTF               : {rtf:.4f}  ({'faster' if rtf < 1 else 'slower'} than real-time)\n"
+            f"  num_chunks        : {num_chunks}  "
             f"({'streaming pipelined' if num_chunks > 1 else 'single batch'})\n"
-            f"  wav          : {wav_path}\n"
+            f"  first_chunk_latency: {first_chunk_latency:.3f}s  "
+            f"(time from generate() start to first audio sample available)\n"
+            f"  wav               : {wav_path}\n"
             f"{'='*60}\n"
         )
 

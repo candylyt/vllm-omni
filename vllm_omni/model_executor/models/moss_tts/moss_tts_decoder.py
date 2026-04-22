@@ -31,6 +31,7 @@
 
 import logging
 import os
+import time
 from collections.abc import Iterable
 from contextlib import ExitStack
 from typing import Any, Optional
@@ -247,6 +248,35 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         # request and closed when ``is_finished=True`` is observed.
         self._streaming_states: dict[str, ExitStack] = {}
 
+        # First-chunk latency instrumentation.
+        # When MOSS_FIRST_CHUNK_DIR is set, we write a wall-clock timestamp
+        # file the very first time a non-empty waveform is produced for each
+        # request_id.  The benchmark reads these files to compute the
+        # time-to-first-audio metric that highlights the async_chunk win.
+        self._first_chunk_dir: Optional[str] = os.environ.get("MOSS_FIRST_CHUNK_DIR")
+        self._first_chunk_seen: set[str] = set()
+        if self._first_chunk_dir:
+            try:
+                os.makedirs(self._first_chunk_dir, exist_ok=True)
+            except OSError:
+                self._first_chunk_dir = None
+
+    def _record_first_chunk(self, request_id: Optional[str]) -> None:
+        """Write a wall-clock timestamp file the first time a non-empty
+        waveform is produced for ``request_id``.  No-op if instrumentation
+        is disabled or this request_id has already been recorded."""
+        if not self._first_chunk_dir or not request_id:
+            return
+        if request_id in self._first_chunk_seen:
+            return
+        self._first_chunk_seen.add(request_id)
+        path = os.path.join(self._first_chunk_dir, f"{request_id}.first_chunk.ts")
+        try:
+            with open(path, "w") as f:
+                f.write(f"{time.time():.6f}\n")
+        except OSError as exc:
+            logger.debug("[MossTTS Decoder] Could not write %s: %s", path, exc)
+
     # ══════════════════════════════════════════════════════════════════
     #  Core decode logic
     # ══════════════════════════════════════════════════════════════════
@@ -323,6 +353,8 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
                 # Fallback: stateless single-call decode (sync / non-streaming mode).
                 wav = self._codec.decode(codes)
 
+            if wav is not None and wav.numel() > 0:
+                self._record_first_chunk(request_id)
             return wav.to(self.device)
         except Exception as exc:
             logger.error("[MossTTS Decoder] Codec decode failed: %s", exc, exc_info=True)
