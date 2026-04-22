@@ -248,6 +248,16 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         # request and closed when ``is_finished=True`` is observed.
         self._streaming_states: dict[str, ExitStack] = {}
 
+        # Synthetic request-id tracking (workaround: the SharedMemoryConnector
+        # strips the processor's ``request_id`` / ``finished`` keys, so Stage 1
+        # only sees ``generated_len`` + ``left_context_size``).  With
+        # max_num_seqs=1 there is at most one active stream at any time, so we
+        # mint a stable key and detect a new request by watching
+        # ``generated_len`` reset to a smaller value.
+        self._active_key: Optional[str] = None
+        self._last_gen_len: Optional[int] = None
+        self._run_counter: int = 0
+
         # First-chunk latency instrumentation.
         # When MOSS_FIRST_CHUNK_DIR is set, we write a wall-clock timestamp
         # file the very first time a non-empty waveform is produced for each
@@ -459,8 +469,37 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
             request_ids = []
             finished_flags = []
             for info in runtime_additional_information:
-                request_ids.append(info.get("request_id") if isinstance(info, dict) else None)
-                fin = info.get("finished") if isinstance(info, dict) else None
+                if not isinstance(info, dict):
+                    request_ids.append(None)
+                    finished_flags.append(False)
+                    continue
+
+                rid = info.get("request_id")
+                if rid is None:
+                    # Synthesize a stable per-run key.  Detect a new request
+                    # by watching generated_len reset to a smaller value
+                    # (valid because max_num_seqs=1).
+                    gen_len = info.get("generated_len")
+                    if (
+                        self._active_key is None
+                        or (
+                            isinstance(gen_len, int)
+                            and isinstance(self._last_gen_len, int)
+                            and gen_len < self._last_gen_len
+                        )
+                    ):
+                        # Close any leftover streaming state from a prior run.
+                        if self._active_key is not None:
+                            self._exit_streaming(self._active_key)
+                        self._run_counter += 1
+                        self._active_key = f"run_{self._run_counter}"
+                    rid = self._active_key
+                    if isinstance(gen_len, int):
+                        self._last_gen_len = gen_len
+
+                request_ids.append(rid)
+
+                fin = info.get("finished")
                 if isinstance(fin, torch.Tensor):
                     fin = bool(fin.item())
                 finished_flags.append(bool(fin) if fin is not None else False)
