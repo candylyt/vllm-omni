@@ -265,6 +265,15 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         """Write a wall-clock timestamp file the first time a non-empty
         waveform is produced for ``request_id``.  No-op if instrumentation
         is disabled or this request_id has already been recorded."""
+        # Always log the arrival of a non-empty waveform so we can tell
+        # whether Stage 1 is truly pipelining (many "first-wav" lines over
+        # time) or batching (all lines near the end of the run).
+        logger.info(
+            "[MossTTS Decoder][TIMING] non-empty wav produced at wall=%.3f "
+            "request_id=%s first_chunk_dir=%s first_chunk_seen=%s",
+            time.time(), request_id, self._first_chunk_dir,
+            request_id in self._first_chunk_seen if request_id else None,
+        )
         if not self._first_chunk_dir or not request_id:
             return
         if request_id in self._first_chunk_seen:
