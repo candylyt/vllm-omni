@@ -32,6 +32,7 @@
 import logging
 import os
 from collections.abc import Iterable
+from contextlib import ExitStack
 from typing import Any, Optional
 
 import torch
@@ -241,53 +242,108 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         self.logits_processor = LogitsProcessor(cfg.language_config.vocab_size)
         self.sampler = Sampler()
 
+        # Per-request streaming state: request_id → ExitStack holding codec
+        # KV-cache context.  Entries are created on the first chunk for a
+        # request and closed when ``is_finished=True`` is observed.
+        self._streaming_states: dict[str, ExitStack] = {}
+
     # ══════════════════════════════════════════════════════════════════
     #  Core decode logic
     # ══════════════════════════════════════════════════════════════════
 
-    def _decode_one_request(self, flat_codes: torch.Tensor) -> torch.Tensor:
+    def _enter_streaming(self, request_id: str) -> None:
+        """Enter codec streaming mode for a new request, storing KV-cache state."""
+        if request_id in self._streaming_states:
+            return
+        stack = ExitStack()
+        codec = self._codec.codec
+        for decoder_module in codec.decoder:
+            if hasattr(decoder_module, "streaming") and callable(decoder_module.streaming):
+                stack.enter_context(decoder_module.streaming(batch_size=1))
+        self._streaming_states[request_id] = stack
+
+    def _exit_streaming(self, request_id: str) -> None:
+        """Exit and discard the streaming state for a finished request."""
+        stack = self._streaming_states.pop(request_id, None)
+        if stack is not None:
+            stack.close()
+
+    def _decode_one_request(
+        self,
+        flat_codes: torch.Tensor,
+        request_id: Optional[str] = None,
+        is_finished: bool = False,
+    ) -> torch.Tensor:
         """
         Decode one request's flat code tensor to a waveform.
 
-        flat_codes : [T * n_vq]  long
-        Returns    : [samples]   float32  (empty tensor if codes are invalid)
+        When ``request_id`` is provided, uses the codec's streaming KV-cache
+        so that causal state is maintained across successive chunk calls
+        for the same request (async_chunk mode).  When ``request_id`` is
+        None, falls back to the stateless single-call decode (sync/batch).
+
+        flat_codes  : [T * n_vq]  long
+        request_id  : str or None — if set, enables per-request streaming state
+        is_finished : bool — if True, streaming state is released after this call
+        Returns     : [samples]   float32  (empty tensor if codes are invalid)
         """
         empty = torch.zeros(0, dtype=torch.float32, device=self.device)
 
         if flat_codes is None or flat_codes.numel() == 0:
+            if request_id and is_finished:
+                self._exit_streaming(request_id)
             return empty
 
         codes = _parse_flat_codes(flat_codes, self.n_vq)  # [n_vq, T] or None
         if codes is None:
+            if request_id and is_finished:
+                self._exit_streaming(request_id)
             return empty
 
         # Skip all-zero code tensors (dummy / padding frames)
         if not codes.any():
+            if request_id and is_finished:
+                self._exit_streaming(request_id)
             return empty
 
         try:
-            wav = self._codec.decode(codes)   # [samples] float32 CPU
+            if request_id is not None:
+                # Streaming path: maintain causal KV-cache across chunks.
+                self._enter_streaming(request_id)
+                codec = self._codec.codec
+                codes_3d = codes.unsqueeze(1).to(self.device)   # [n_vq, 1, T]
+                lengths = torch.tensor(
+                    [codes_3d.shape[-1]], device=self.device, dtype=torch.long
+                )
+                result = codec._decode_frame(codes_3d, lengths)
+                wav = result.audio[0, 0, : result.audio_lengths[0]].float().cpu()
+                if is_finished:
+                    self._exit_streaming(request_id)
+            else:
+                # Fallback: stateless single-call decode (sync / non-streaming mode).
+                wav = self._codec.decode(codes)
+
             return wav.to(self.device)
         except Exception as exc:
-            logger.error("[MossTTS Decoder] Codec decode failed: %s", exc)
+            logger.error("[MossTTS Decoder] Codec decode failed: %s", exc, exc_info=True)
+            if request_id and is_finished:
+                self._exit_streaming(request_id)
             return empty
 
     @torch.inference_mode()
     def _batch_decode(
         self,
         request_codes_list: list[torch.Tensor],
+        request_ids: Optional[list[Optional[str]]] = None,
+        finished_flags: Optional[list[bool]] = None,
     ) -> list[torch.Tensor]:
-        """
-        Batch-decode multiple requests.
-
-        For efficiency, this calls the codec once per request.
-        TODO (post-MVP): batch all requests into a single codec forward pass
-        by packing hidden states (same optimisation as MiMo's _batch_decode_waveforms).
-        """
+        """Decode multiple requests, using per-request streaming state when available."""
         empty = torch.zeros(0, dtype=torch.float32, device=self.device)
         results: list[torch.Tensor] = []
-        for req_codes in request_codes_list:
-            wav = self._decode_one_request(req_codes)
+        for i, req_codes in enumerate(request_codes_list):
+            req_id = request_ids[i] if request_ids else None
+            finished = finished_flags[i] if finished_flags else False
+            wav = self._decode_one_request(req_codes, request_id=req_id, is_finished=finished)
             results.append(wav if wav.numel() > 0 else empty)
         return results
 
@@ -312,6 +368,24 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         code_tensor = codes if codes is not None else input_ids
         empty       = torch.zeros(0, dtype=torch.float32, device=self.device)
 
+        # Async-chunk path: when input_ids is empty/None but codes were
+        # shipped through runtime_additional_information (SharedMemory
+        # connector payload), extract them directly from the per-request
+        # ``code_predictor_codes`` field.
+        if (code_tensor is None or code_tensor.numel() == 0) and runtime_additional_information:
+            code_parts: list[torch.Tensor] = []
+            for info in runtime_additional_information:
+                if not isinstance(info, dict):
+                    continue
+                cp = info.get("code_predictor_codes")
+                if cp is None:
+                    continue
+                if not isinstance(cp, torch.Tensor):
+                    cp = torch.tensor(cp, dtype=torch.long)
+                code_parts.append(cp.reshape(-1).to(torch.long))
+            if code_parts:
+                code_tensor = torch.cat(code_parts, dim=0)
+
         if code_tensor is None or code_tensor.numel() == 0:
             return OmniOutput(
                 text_hidden_states=None,
@@ -335,7 +409,20 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
             kwargs.get("seq_token_counts"),
         )
 
-        audios = self._batch_decode(request_codes_list)
+        # Extract per-request streaming metadata when available.
+        request_ids: Optional[list[Optional[str]]] = None
+        finished_flags: Optional[list[bool]] = None
+        if runtime_additional_information:
+            request_ids = []
+            finished_flags = []
+            for info in runtime_additional_information:
+                request_ids.append(info.get("request_id") if isinstance(info, dict) else None)
+                fin = info.get("finished") if isinstance(info, dict) else None
+                if isinstance(fin, torch.Tensor):
+                    fin = bool(fin.item())
+                finished_flags.append(bool(fin) if fin is not None else False)
+
+        audios = self._batch_decode(request_codes_list, request_ids, finished_flags)
 
         return OmniOutput(
             text_hidden_states=None,
