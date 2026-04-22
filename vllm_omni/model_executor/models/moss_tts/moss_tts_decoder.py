@@ -31,7 +31,9 @@
 
 import logging
 import os
+import time
 from collections.abc import Iterable
+from contextlib import ExitStack
 from typing import Any, Optional
 
 import torch
@@ -241,53 +243,160 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         self.logits_processor = LogitsProcessor(cfg.language_config.vocab_size)
         self.sampler = Sampler()
 
+        # Per-request streaming state: request_id → ExitStack holding codec
+        # KV-cache context.  Entries are created on the first chunk for a
+        # request and closed when ``is_finished=True`` is observed.
+        self._streaming_states: dict[str, ExitStack] = {}
+
+        # Synthetic request-id tracking (workaround: the SharedMemoryConnector
+        # strips the processor's ``request_id`` / ``finished`` keys, so Stage 1
+        # only sees ``generated_len`` + ``left_context_size``).  With
+        # max_num_seqs=1 there is at most one active stream at any time, so we
+        # mint a stable key and detect a new request by watching
+        # ``generated_len`` reset to a smaller value.
+        self._active_key: Optional[str] = None
+        self._last_gen_len: Optional[int] = None
+        self._run_counter: int = 0
+
+        # First-chunk latency instrumentation.
+        # When MOSS_FIRST_CHUNK_DIR is set, we write a wall-clock timestamp
+        # file the very first time a non-empty waveform is produced for each
+        # request_id.  The benchmark reads these files to compute the
+        # time-to-first-audio metric that highlights the async_chunk win.
+        self._first_chunk_dir: Optional[str] = os.environ.get("MOSS_FIRST_CHUNK_DIR")
+        self._first_chunk_seen: set[str] = set()
+        if self._first_chunk_dir:
+            try:
+                os.makedirs(self._first_chunk_dir, exist_ok=True)
+            except OSError:
+                self._first_chunk_dir = None
+
+    def _record_first_chunk(self, request_id: Optional[str]) -> None:
+        """Write a wall-clock timestamp file the first time a non-empty
+        waveform is produced.  For single-request benchmarks we also write
+        a ``first.first_chunk.ts`` fallback so the metric still works even
+        when ``request_id`` isn't propagated through the connector payload."""
+        now = time.time()
+        logger.info(
+            "[MossTTS Decoder][TIMING] non-empty wav produced at wall=%.3f "
+            "request_id=%s",
+            now, request_id,
+        )
+        if not self._first_chunk_dir:
+            return
+        # Candidate keys: the real request_id (if any) plus a generic
+        # "first" fallback covering single-request benchmarks.
+        keys = [k for k in (request_id, "first") if k]
+        for key in keys:
+            if key in self._first_chunk_seen:
+                continue
+            self._first_chunk_seen.add(key)
+            path = os.path.join(self._first_chunk_dir, f"{key}.first_chunk.ts")
+            try:
+                with open(path, "w") as f:
+                    f.write(f"{now:.6f}\n")
+            except OSError as exc:
+                logger.debug("[MossTTS Decoder] Could not write %s: %s", path, exc)
+
     # ══════════════════════════════════════════════════════════════════
     #  Core decode logic
     # ══════════════════════════════════════════════════════════════════
 
-    def _decode_one_request(self, flat_codes: torch.Tensor) -> torch.Tensor:
+    def _enter_streaming(self, request_id: str) -> None:
+        """Enter codec streaming mode for a new request, storing KV-cache state."""
+        if request_id in self._streaming_states:
+            return
+        stack = ExitStack()
+        codec = self._codec.codec
+        for decoder_module in codec.decoder:
+            if hasattr(decoder_module, "streaming") and callable(decoder_module.streaming):
+                stack.enter_context(decoder_module.streaming(batch_size=1))
+        self._streaming_states[request_id] = stack
+
+    def _exit_streaming(self, request_id: str) -> None:
+        """Exit and discard the streaming state for a finished request."""
+        stack = self._streaming_states.pop(request_id, None)
+        if stack is not None:
+            stack.close()
+
+    def _decode_one_request(
+        self,
+        flat_codes: torch.Tensor,
+        request_id: Optional[str] = None,
+        is_finished: bool = False,
+    ) -> torch.Tensor:
         """
         Decode one request's flat code tensor to a waveform.
 
-        flat_codes : [T * n_vq]  long
-        Returns    : [samples]   float32  (empty tensor if codes are invalid)
+        When ``request_id`` is provided, uses the codec's streaming KV-cache
+        so that causal state is maintained across successive chunk calls
+        for the same request (async_chunk mode).  When ``request_id`` is
+        None, falls back to the stateless single-call decode (sync/batch).
+
+        flat_codes  : [T * n_vq]  long
+        request_id  : str or None — if set, enables per-request streaming state
+        is_finished : bool — if True, streaming state is released after this call
+        Returns     : [samples]   float32  (empty tensor if codes are invalid)
         """
         empty = torch.zeros(0, dtype=torch.float32, device=self.device)
 
         if flat_codes is None or flat_codes.numel() == 0:
+            if request_id and is_finished:
+                self._exit_streaming(request_id)
             return empty
 
         codes = _parse_flat_codes(flat_codes, self.n_vq)  # [n_vq, T] or None
         if codes is None:
+            if request_id and is_finished:
+                self._exit_streaming(request_id)
             return empty
 
         # Skip all-zero code tensors (dummy / padding frames)
         if not codes.any():
+            if request_id and is_finished:
+                self._exit_streaming(request_id)
             return empty
 
         try:
-            wav = self._codec.decode(codes)   # [samples] float32 CPU
+            if request_id is not None:
+                # Streaming path: maintain causal KV-cache across chunks.
+                self._enter_streaming(request_id)
+                codec = self._codec.codec
+                codes_3d = codes.unsqueeze(1).to(self.device)   # [n_vq, 1, T]
+                lengths = torch.tensor(
+                    [codes_3d.shape[-1]], device=self.device, dtype=torch.long
+                )
+                result = codec._decode_frame(codes_3d, lengths)
+                wav = result.audio[0, 0, : result.audio_lengths[0]].float().cpu()
+                if is_finished:
+                    self._exit_streaming(request_id)
+            else:
+                # Fallback: stateless single-call decode (sync / non-streaming mode).
+                wav = self._codec.decode(codes)
+
+            if wav is not None and wav.numel() > 0:
+                self._record_first_chunk(request_id)
             return wav.to(self.device)
         except Exception as exc:
-            logger.error("[MossTTS Decoder] Codec decode failed: %s", exc)
+            logger.error("[MossTTS Decoder] Codec decode failed: %s", exc, exc_info=True)
+            if request_id and is_finished:
+                self._exit_streaming(request_id)
             return empty
 
     @torch.inference_mode()
     def _batch_decode(
         self,
         request_codes_list: list[torch.Tensor],
+        request_ids: Optional[list[Optional[str]]] = None,
+        finished_flags: Optional[list[bool]] = None,
     ) -> list[torch.Tensor]:
-        """
-        Batch-decode multiple requests.
-
-        For efficiency, this calls the codec once per request.
-        TODO (post-MVP): batch all requests into a single codec forward pass
-        by packing hidden states (same optimisation as MiMo's _batch_decode_waveforms).
-        """
+        """Decode multiple requests, using per-request streaming state when available."""
         empty = torch.zeros(0, dtype=torch.float32, device=self.device)
         results: list[torch.Tensor] = []
-        for req_codes in request_codes_list:
-            wav = self._decode_one_request(req_codes)
+        for i, req_codes in enumerate(request_codes_list):
+            req_id = request_ids[i] if request_ids else None
+            finished = finished_flags[i] if finished_flags else False
+            wav = self._decode_one_request(req_codes, request_id=req_id, is_finished=finished)
             results.append(wav if wav.numel() > 0 else empty)
         return results
 
@@ -312,6 +421,24 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         code_tensor = codes if codes is not None else input_ids
         empty       = torch.zeros(0, dtype=torch.float32, device=self.device)
 
+        # Async-chunk path: when input_ids is empty/None but codes were
+        # shipped through runtime_additional_information (SharedMemory
+        # connector payload), extract them directly from the per-request
+        # ``code_predictor_codes`` field.
+        if (code_tensor is None or code_tensor.numel() == 0) and runtime_additional_information:
+            code_parts: list[torch.Tensor] = []
+            for info in runtime_additional_information:
+                if not isinstance(info, dict):
+                    continue
+                cp = info.get("code_predictor_codes")
+                if cp is None:
+                    continue
+                if not isinstance(cp, torch.Tensor):
+                    cp = torch.tensor(cp, dtype=torch.long)
+                code_parts.append(cp.reshape(-1).to(torch.long))
+            if code_parts:
+                code_tensor = torch.cat(code_parts, dim=0)
+
         if code_tensor is None or code_tensor.numel() == 0:
             return OmniOutput(
                 text_hidden_states=None,
@@ -335,7 +462,65 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
             kwargs.get("seq_token_counts"),
         )
 
-        audios = self._batch_decode(request_codes_list)
+        # Extract per-request streaming metadata when available.
+        request_ids: Optional[list[Optional[str]]] = None
+        finished_flags: Optional[list[bool]] = None
+        if runtime_additional_information:
+            request_ids = []
+            finished_flags = []
+            for info in runtime_additional_information:
+                if not isinstance(info, dict):
+                    request_ids.append(None)
+                    finished_flags.append(False)
+                    continue
+
+                rid = info.get("request_id")
+                if rid is None:
+                    # Synthesize a stable per-run key.  Detect a new request
+                    # by watching generated_len reset to a smaller value
+                    # (valid because max_num_seqs=1).
+                    gen_len = info.get("generated_len")
+                    if (
+                        self._active_key is None
+                        or (
+                            isinstance(gen_len, int)
+                            and isinstance(self._last_gen_len, int)
+                            and gen_len < self._last_gen_len
+                        )
+                    ):
+                        # Close any leftover streaming state from a prior run.
+                        if self._active_key is not None:
+                            self._exit_streaming(self._active_key)
+                        self._run_counter += 1
+                        self._active_key = f"run_{self._run_counter}"
+                    rid = self._active_key
+                    if isinstance(gen_len, int):
+                        self._last_gen_len = gen_len
+
+                request_ids.append(rid)
+
+                fin = info.get("finished")
+                if isinstance(fin, torch.Tensor):
+                    fin = bool(fin.item())
+                finished_flags.append(bool(fin) if fin is not None else False)
+            # One-shot structural dump so we can see which keys actually
+            # arrived on the Stage-1 side (helps debug request_id drops).
+            if not getattr(self, "_dumped_info_keys", False):
+                self._dumped_info_keys = True
+                for idx, info in enumerate(runtime_additional_information):
+                    if isinstance(info, dict):
+                        logger.info(
+                            "[MossTTS Decoder][DEBUG] info[%d] keys=%s types=%s",
+                            idx, list(info.keys()),
+                            {k: type(v).__name__ for k, v in info.items()},
+                        )
+                    else:
+                        logger.info(
+                            "[MossTTS Decoder][DEBUG] info[%d] type=%s (not a dict)",
+                            idx, type(info).__name__,
+                        )
+
+        audios = self._batch_decode(request_codes_list, request_ids, finished_flags)
 
         return OmniOutput(
             text_hidden_states=None,

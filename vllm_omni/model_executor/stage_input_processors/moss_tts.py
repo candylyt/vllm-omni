@@ -217,95 +217,109 @@ def llm2decoder(
 
 def llm2decoder_async_chunk(
     transfer_manager: Any,
-    pooling_output: dict[str, Any],
+    pooling_output: dict[str, Any] | None,
     request: Any,
     is_finished: bool = False,
 ) -> dict[str, Any] | None:
     """
-    Async-chunk version: accumulate per-step codes and flush every chunk_frames steps.
+    Async-chunk processor for MOSS-TTS-Local (no-delay variant).
 
-    Returns a payload dict when a full chunk is ready (or when is_finished=True),
-    otherwise returns None to signal "still accumulating".
+    Called by Stage 0 (AR stage) after every decode step via
+    ``custom_process_next_stage_input_func``.  Accumulates the frame-major
+    RVQ rows emitted by the AR stage and flushes ``codec_chunk_frames``
+    newly generated frames to Stage 1 (CAT codec) whenever a chunk fills
+    up, or when ``is_finished=True``.
+
+    Buffer strategy
+    ---------------
+    All generated rows are kept in
+    ``transfer_manager.code_prompt_token_ids[request_id]`` for the sender's
+    internal bookkeeping (the framework's ``cleanup_sender()`` clears it
+    after the final chunk).  ``transfer_manager._moss_frames_sent[request_id]``
+    tracks how many frames have already been shipped to Stage 1 so that
+    only the *new* frames are included in each chunk payload — the codec
+    uses a streaming KV-cache across calls, so resending earlier frames
+    would produce overlapping / duplicate audio.
+
+    left_context_size = 0
+    ---------------------
+    ``MossTTSDecoderModel.forward()`` does not trim a left-context region
+    from its decoded audio, so we send only the new frames with no overlap.
+
+    Returns a payload dict when enough new frames are ready (or when
+    ``is_finished=True`` with any remaining frames), otherwise ``None``.
 
     Payload keys consumed by MossTTSDecoderModel.forward():
         code_predictor_codes : list[int]    flat codes for this chunk
         code_flat_numel      : int          length of the list
+        request_id           : str          used to key streaming KV-cache
         finished             : Tensor(bool)
         codec_chunk_frames   : int          (informational)
-        left_context_size    : int          (informational, 0 for MOSS — no delay)
+        left_context_size    : int          (informational, 0 for MOSS-Local)
     """
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg   = getattr(connector, "config", {}) or {}
     cfg       = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
-    chunk_size  = int(cfg.get("codec_chunk_frames",   _DEFAULT_CHUNK_FRAMES))
+    chunk_size = int(cfg.get("codec_chunk_frames", _DEFAULT_CHUNK_FRAMES))
 
     request_id = getattr(request, "external_req_id", None)
-
-    codes_raw = pooling_output.get("code_predictor_codes")
-
-    # ── Nothing to flush ──────────────────────────────────────────────
-    if _is_codes_empty(codes_raw):
-        if is_finished:
-            return _flush_remaining(transfer_manager, request_id, chunk_size)
-        return None
-
-    # ── Convert to per-step flat list ─────────────────────────────────
-    codes = (
-        codes_raw
-        if isinstance(codes_raw, torch.Tensor)
-        else torch.tensor(codes_raw, dtype=torch.long)
-    )
-    codes = codes.to(torch.long).reshape(-1)  # [n_vq]
-    n_vq  = codes.numel()
-
-    if n_vq == 0:
-        if is_finished:
-            return _flush_remaining(transfer_manager, request_id, chunk_size)
-        return None
-
     if request_id is None:
         return None
 
-    # Accumulate this frame's codes
-    transfer_manager.code_prompt_token_ids[request_id].append(codes.tolist())
+    # ── Accumulate this step's frame-major row ────────────────────────
+    if isinstance(pooling_output, dict):
+        codes_raw = pooling_output.get("code_predictor_codes")
+        if not _is_codes_empty(codes_raw):
+            row = (
+                codes_raw
+                if isinstance(codes_raw, torch.Tensor)
+                else torch.tensor(codes_raw, dtype=torch.long)
+            )
+            row = row.to(torch.long).reshape(-1)   # [n_vq]
+            if row.numel() > 0:
+                transfer_manager.code_prompt_token_ids[request_id].append(row.tolist())
+
     accumulated = transfer_manager.code_prompt_token_ids[request_id]
-    n_frames    = len(accumulated)
+    n_frames = len(accumulated)
 
-    # Flush when chunk is full or generation is done
-    if n_frames % chunk_size != 0 and not is_finished:
-        return None   # still waiting
+    # ── Track how many frames have already been sent ──────────────────
+    sent_map: dict[str, int] = getattr(transfer_manager, "_moss_frames_sent", None)  # type: ignore[assignment]
+    if sent_map is None:
+        sent_map = {}
+        transfer_manager._moss_frames_sent = sent_map
+    frames_sent = sent_map.get(request_id, 0)
+    n_new = n_frames - frames_sent
 
-    # Build flush payload
-    flat  = [code for frame in accumulated for code in frame]
-    numel = len(flat)
+    if n_new <= 0:
+        if is_finished:
+            sent_map.pop(request_id, None)
+            return _make_finished_sentinel()
+        return None
+
+    if not is_finished and n_new < chunk_size:
+        return None   # still accumulating
+
+    # ── Decide how many frames to flush this call ─────────────────────
+    if is_finished:
+        flush_count = n_new
+    else:
+        flush_count = (n_new // chunk_size) * chunk_size
+        if flush_count == 0:
+            return None
+
+    flush_frames = accumulated[frames_sent : frames_sent + flush_count]
+    flat = [code for frame in flush_frames for code in frame]
+
+    # ── Update sent counter; clean up on final flush ──────────────────
+    sent_map[request_id] = frames_sent + flush_count
+    if is_finished:
+        sent_map.pop(request_id, None)
+
     return {
         "code_predictor_codes": flat,
-        "code_flat_numel":      numel,
+        "code_flat_numel":      len(flat),
         "codec_chunk_frames":   chunk_size,
-        "left_context_size":    0,   # MOSS has no delay pattern → no left context
+        "left_context_size":    0,   # MOSS-Local has no delay pattern → no left context
+        "request_id":           request_id,
         "finished":             torch.tensor(is_finished, dtype=torch.bool),
-    }
-
-
-def _flush_remaining(
-    transfer_manager: Any,
-    request_id: str | None,
-    chunk_size: int,
-) -> dict[str, Any]:
-    """Flush any leftover codes when the request finishes mid-chunk."""
-    if request_id is None:
-        return _make_finished_sentinel()
-
-    accumulated = transfer_manager.code_prompt_token_ids.get(request_id, [])
-    if not accumulated:
-        return _make_finished_sentinel()
-
-    flat  = [code for frame in accumulated for code in frame]
-    numel = len(flat)
-    return {
-        "code_predictor_codes": flat,
-        "code_flat_numel":      numel,
-        "codec_chunk_frames":   chunk_size,
-        "left_context_size":    0,
-        "finished":             torch.tensor(True, dtype=torch.bool),
     }
