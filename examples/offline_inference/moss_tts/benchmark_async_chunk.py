@@ -249,19 +249,20 @@ def main() -> None:
         rtf = total_time / audio_dur if audio_dur > 0 else float("inf")
 
         # Read first-chunk timestamp written by the Stage-1 decoder process.
-        # Sync mode decodes everything at once so no per-chunk file is written
-        # — in that case first_chunk_latency ≡ total_time by construction.
-        first_chunk_path = os.path.join(first_chunk_dir, f"{request_id}.first_chunk.ts")
-        first_chunk_latency: float
-        if os.path.exists(first_chunk_path):
-            try:
-                with open(first_chunk_path) as f:
-                    ts = float(f.read().strip())
-                first_chunk_latency = max(0.0, ts - t_start_wall)
-            except (OSError, ValueError):
-                first_chunk_latency = total_time
-        else:
-            first_chunk_latency = total_time
+        # Try the real request_id first; fall back to the generic "first"
+        # key that the decoder writes when request_id wasn't propagated
+        # through the connector payload (single-request benchmarks).
+        first_chunk_latency: float = total_time
+        for key in (request_id, "first"):
+            first_chunk_path = os.path.join(first_chunk_dir, f"{key}.first_chunk.ts")
+            if os.path.exists(first_chunk_path):
+                try:
+                    with open(first_chunk_path) as f:
+                        ts = float(f.read().strip())
+                    first_chunk_latency = max(0.0, ts - t_start_wall)
+                    break
+                except (OSError, ValueError):
+                    continue
 
         wav_path = os.path.join(args.output_dir, f"{request_id}.wav")
         sf.write(wav_path, audio_np, samplerate=24000, format="WAV")

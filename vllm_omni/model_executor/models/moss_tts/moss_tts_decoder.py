@@ -263,28 +263,30 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
 
     def _record_first_chunk(self, request_id: Optional[str]) -> None:
         """Write a wall-clock timestamp file the first time a non-empty
-        waveform is produced for ``request_id``.  No-op if instrumentation
-        is disabled or this request_id has already been recorded."""
-        # Always log the arrival of a non-empty waveform so we can tell
-        # whether Stage 1 is truly pipelining (many "first-wav" lines over
-        # time) or batching (all lines near the end of the run).
+        waveform is produced.  For single-request benchmarks we also write
+        a ``first.first_chunk.ts`` fallback so the metric still works even
+        when ``request_id`` isn't propagated through the connector payload."""
+        now = time.time()
         logger.info(
             "[MossTTS Decoder][TIMING] non-empty wav produced at wall=%.3f "
-            "request_id=%s first_chunk_dir=%s first_chunk_seen=%s",
-            time.time(), request_id, self._first_chunk_dir,
-            request_id in self._first_chunk_seen if request_id else None,
+            "request_id=%s",
+            now, request_id,
         )
-        if not self._first_chunk_dir or not request_id:
+        if not self._first_chunk_dir:
             return
-        if request_id in self._first_chunk_seen:
-            return
-        self._first_chunk_seen.add(request_id)
-        path = os.path.join(self._first_chunk_dir, f"{request_id}.first_chunk.ts")
-        try:
-            with open(path, "w") as f:
-                f.write(f"{time.time():.6f}\n")
-        except OSError as exc:
-            logger.debug("[MossTTS Decoder] Could not write %s: %s", path, exc)
+        # Candidate keys: the real request_id (if any) plus a generic
+        # "first" fallback covering single-request benchmarks.
+        keys = [k for k in (request_id, "first") if k]
+        for key in keys:
+            if key in self._first_chunk_seen:
+                continue
+            self._first_chunk_seen.add(key)
+            path = os.path.join(self._first_chunk_dir, f"{key}.first_chunk.ts")
+            try:
+                with open(path, "w") as f:
+                    f.write(f"{now:.6f}\n")
+            except OSError as exc:
+                logger.debug("[MossTTS Decoder] Could not write %s: %s", path, exc)
 
     # ══════════════════════════════════════════════════════════════════
     #  Core decode logic
@@ -462,6 +464,22 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
                 if isinstance(fin, torch.Tensor):
                     fin = bool(fin.item())
                 finished_flags.append(bool(fin) if fin is not None else False)
+            # One-shot structural dump so we can see which keys actually
+            # arrived on the Stage-1 side (helps debug request_id drops).
+            if not getattr(self, "_dumped_info_keys", False):
+                self._dumped_info_keys = True
+                for idx, info in enumerate(runtime_additional_information):
+                    if isinstance(info, dict):
+                        logger.info(
+                            "[MossTTS Decoder][DEBUG] info[%d] keys=%s types=%s",
+                            idx, list(info.keys()),
+                            {k: type(v).__name__ for k, v in info.items()},
+                        )
+                    else:
+                        logger.info(
+                            "[MossTTS Decoder][DEBUG] info[%d] type=%s (not a dict)",
+                            idx, type(info).__name__,
+                        )
 
         audios = self._batch_decode(request_codes_list, request_ids, finished_flags)
 
