@@ -82,6 +82,17 @@ def test_default_all_values_are_initialized():
     str(cfg)
 
 
+def test_audio_tokenizer_path_is_omni_config_field():
+    """Ensure external codec checkpoint paths survive Omni config construction."""
+    model_config = EngineArgs().create_model_config()
+    cfg = OmniModelConfig.from_vllm_model_config(
+        model_config,
+        audio_tokenizer_path="/tmp/moss-audio-tokenizer",
+    )
+
+    assert cfg.audio_tokenizer_path == "/tmp/moss-audio-tokenizer"
+
+
 def test_qwen3_tts_codec_frame_rate_patching():
     """Ensure the patch for qwen3 tts is applied correctly when creating the omni config."""
     # Create a vLLM ModelConfig

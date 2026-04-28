@@ -33,14 +33,13 @@ import logging
 import os
 from collections.abc import Iterable
 from contextlib import ExitStack
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from torch import nn
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models import SupportsPP
-from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
@@ -53,6 +52,7 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CAT Codec worker (singleton per process / device)
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 class CATCodecWorker:
     """
@@ -79,11 +79,14 @@ class CATCodecWorker:
         # Newer transformers renamed the class to PretrainedConfig (lowercase 't').
         # Inject the alias so the old import path resolves.
         import transformers.configuration_utils as _cfg_utils
+
         if not hasattr(_cfg_utils, "PreTrainedConfig"):
-            from transformers import PretrainedConfig as _ptc
-            _cfg_utils.PreTrainedConfig = _ptc
+            from transformers import PretrainedConfig as _PretrainedConfig
+
+            _cfg_utils.PreTrainedConfig = _PretrainedConfig
 
         from transformers import AutoModel
+
         # Do NOT pass torch_dtype here — the CAT codec has mixed-precision layers
         # that break when forced to bfloat16.  It outputs float32 natively.
         self.codec = AutoModel.from_pretrained(
@@ -94,7 +97,7 @@ class CATCodecWorker:
 
         self.sample_rate: int = getattr(self.codec.config, "sampling_rate", 24_000)
         # Config exposes num_quantizers as a @property backed by quantizer_kwargs
-        self.n_vq: int        = getattr(self.codec.config, "num_quantizers", 32)
+        self.n_vq: int = getattr(self.codec.config, "num_quantizers", 32)
 
         logger.info(
             "[MossTTS Decoder] CAT codec loaded: sample_rate=%d, n_vq=%d",
@@ -116,7 +119,7 @@ class CATCodecWorker:
         """
         codes = codes.to(self.device)
         out = self.codec.decode(codes, chunk_duration=8)  # MossAudioTokenizerDecoderOutput
-        wav = out.audio[0, 0]                   # [T_audio]  float32
+        wav = out.audio[0, 0]  # [T_audio]  float32
         return wav.float().cpu()
 
 
@@ -124,8 +127,31 @@ class CATCodecWorker:
 _CODEC_WORKER_CACHE: dict[tuple[str, str], CATCodecWorker] = {}
 
 
+def _normalize_codec_path_for_cache(codec_path: str) -> str:
+    if os.path.exists(codec_path):
+        return os.path.realpath(codec_path)
+    return codec_path
+
+
+def _resolve_codec_path(vllm_config: VllmConfig) -> str:
+    codec_path = (
+        getattr(vllm_config.model_config, "audio_tokenizer_path", None)
+        or os.environ.get("MOSS_AUDIO_TOKENIZER_PATH")
+        or "OpenMOSS-Team/MOSS-Audio-Tokenizer"
+    )
+    codec_path = os.path.expanduser(str(codec_path))
+    if os.path.isabs(codec_path) and not os.path.exists(codec_path):
+        raise FileNotFoundError(
+            "[MossTTS Decoder] audio_tokenizer_path points to a missing local path: "
+            f"{codec_path}. Set model_config.audio_tokenizer_path or "
+            "MOSS_AUDIO_TOKENIZER_PATH to a valid MOSS-Audio-Tokenizer checkpoint, "
+            "or use the HuggingFace repo ID OpenMOSS-Team/MOSS-Audio-Tokenizer."
+        )
+    return codec_path
+
+
 def _get_codec_worker(device: torch.device, codec_path: str) -> CATCodecWorker:
-    key = (device.type, os.path.realpath(codec_path))
+    key = (device.type, _normalize_codec_path_for_cache(codec_path))
     if key not in _CODEC_WORKER_CACHE:
         _CODEC_WORKER_CACHE[key] = CATCodecWorker(device.type, codec_path)
     return _CODEC_WORKER_CACHE[key]
@@ -135,10 +161,11 @@ def _get_codec_worker(device: torch.device, codec_path: str) -> CATCodecWorker:
 #  Flat-code parsing helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def _parse_flat_codes(
     flat_codes: torch.Tensor,
     n_vq: int,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     """
     Reshape a 1-D flat code tensor into [n_vq, T].
 
@@ -159,8 +186,8 @@ def _parse_flat_codes(
 
 def _split_per_request(
     ids: torch.Tensor,
-    runtime_info: Optional[list[dict[str, Any]]],
-    seq_token_counts: Optional[list[int]],
+    runtime_info: list[dict[str, Any]] | None,
+    seq_token_counts: list[int] | None,
 ) -> list[torch.Tensor]:
     """
     Split a flat code tensor into per-request slices.
@@ -174,14 +201,13 @@ def _split_per_request(
         return [ids]
 
     if runtime_info and all(
-        isinstance(info.get("code_flat_numel"), int) and info["code_flat_numel"] > 0
-        for info in runtime_info
+        isinstance(info.get("code_flat_numel"), int) and info["code_flat_numel"] > 0 for info in runtime_info
     ):
         sizes = [int(info["code_flat_numel"]) for info in runtime_info]
         if sum(sizes) == n:
             parts, offset = [], 0
             for sz in sizes:
-                parts.append(ids[offset: offset + sz])
+                parts.append(ids[offset : offset + sz])
                 offset += sz
             return parts
 
@@ -189,8 +215,7 @@ def _split_per_request(
         boundaries = [0]
         for c in seq_token_counts:
             boundaries.append(boundaries[-1] + c)
-        return [ids[boundaries[i]: min(boundaries[i + 1], n)]
-                for i in range(len(seq_token_counts))]
+        return [ids[boundaries[i] : min(boundaries[i + 1], n)] for i in range(len(seq_token_counts))]
 
     return [ids]
 
@@ -198,6 +223,7 @@ def _split_per_request(
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Decoder Stage Model
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 class MossTTSDecoderModel(nn.Module, SupportsPP):
     """
@@ -210,7 +236,7 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
     load_weights() is a no-op except for logging.
     """
 
-    have_multimodal_outputs    = True
+    have_multimodal_outputs = True
     enable_update_additional_information = True
 
     def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
@@ -219,24 +245,20 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         cfg = vllm_config.model_config.hf_config
         self.config = cfg
 
-        self.n_vq: int        = cfg.n_vq           # 32
+        self.n_vq: int = cfg.n_vq  # 32
         self.sample_rate: int = getattr(cfg, "sampling_rate", 24_000)
 
         device_str = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device_str)
 
-        # Resolve CAT codec checkpoint path
-        # Resolution order (mirrors processing_moss_tts.py logic):
+        # Resolve CAT codec checkpoint path.
+        # Resolution order:
         #   1. model_config.audio_tokenizer_path  (set in YAML engine_args)
         #   2. MOSS_AUDIO_TOKENIZER_PATH env var   (local path or HF repo ID)
         #   3. Hard-coded HF default               (auto-downloads on first use)
-        codec_path = (
-            getattr(vllm_config.model_config, "audio_tokenizer_path", None)
-            or os.environ.get("MOSS_AUDIO_TOKENIZER_PATH")
-            or "OpenMOSS-Team/MOSS-Audio-Tokenizer"  # verified default from processing_moss_tts.py
-        )
+        self.audio_tokenizer_path = _resolve_codec_path(vllm_config)
 
-        self._codec: CATCodecWorker = _get_codec_worker(self.device, codec_path)
+        self._codec: CATCodecWorker = _get_codec_worker(self.device, self.audio_tokenizer_path)
 
         # Per-request streaming state: request_id → ExitStack holding codec KV-cache context.
         # Entries are created on the first chunk and removed when finished=True.
@@ -267,10 +289,14 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         if stack is not None:
             stack.close()
 
+    def on_requests_finished(self, request_ids) -> None:
+        for request_id in request_ids:
+            self._exit_streaming(str(request_id))
+
     def _decode_one_request(
         self,
         flat_codes: torch.Tensor,
-        request_id: Optional[str] = None,
+        request_id: str | None = None,
         is_finished: bool = False,
     ) -> torch.Tensor:
         """
@@ -307,10 +333,8 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
                 # Streaming path: maintain causal KV-cache across chunks.
                 self._enter_streaming(request_id)
                 codec = self._codec.codec
-                codes_3d = codes.unsqueeze(1).to(self.device)   # [n_vq, 1, T]
-                lengths = torch.tensor(
-                    [codes_3d.shape[-1]], device=self.device, dtype=torch.long
-                )
+                codes_3d = codes.unsqueeze(1).to(self.device)  # [n_vq, 1, T]
+                lengths = torch.tensor([codes_3d.shape[-1]], device=self.device, dtype=torch.long)
                 result = codec._decode_frame(codes_3d, lengths)
                 wav = result.audio[0, 0, : result.audio_lengths[0]].float().cpu()
                 if is_finished:
@@ -330,8 +354,8 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
     def _batch_decode(
         self,
         request_codes_list: list[torch.Tensor],
-        request_ids: Optional[list[Optional[str]]] = None,
-        finished_flags: Optional[list[bool]] = None,
+        request_ids: list[str | None] | None = None,
+        finished_flags: list[bool] | None = None,
     ) -> list[torch.Tensor]:
         """Decode multiple requests, using per-request streaming state when available."""
         empty = torch.zeros(0, dtype=torch.float32, device=self.device)
@@ -349,16 +373,15 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
 
     def forward(
         self,
-        input_ids: Optional[torch.Tensor]              = None,
-        codes: Optional[torch.Tensor]                  = None,
-        runtime_additional_information: Optional[list[dict[str, Any]]] = None,
+        input_ids: torch.Tensor | None = None,
+        codes: torch.Tensor | None = None,
+        runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs,
     ) -> OmniOutput:
         # Resolve runtime_additional_information from alternate kwargs keys
         if runtime_additional_information is None:
-            runtime_additional_information = (
-                kwargs.get("model_intermediate_buffer")
-                or kwargs.get("runtime_additional_information")
+            runtime_additional_information = kwargs.get("model_intermediate_buffer") or kwargs.get(
+                "runtime_additional_information"
             )
 
         code_tensor = codes if codes is not None else input_ids
@@ -379,7 +402,7 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
             if code_parts:
                 code_tensor = torch.cat(code_parts, dim=0)
 
-        empty       = torch.zeros(0, dtype=torch.float32, device=self.device)
+        empty = torch.zeros(0, dtype=torch.float32, device=self.device)
 
         if code_tensor is None or code_tensor.numel() == 0:
             return OmniOutput(
@@ -405,8 +428,8 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         )
 
         # Extract per-request streaming metadata when available
-        request_ids: Optional[list[Optional[str]]] = None
-        finished_flags: Optional[list[bool]] = None
+        request_ids: list[str | None] | None = None
+        finished_flags: list[bool] | None = None
         if runtime_additional_information:
             request_ids = []
             finished_flags = []
@@ -438,19 +461,19 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         # vllm's pipeline interface.
         hidden_size = self.vllm_config.model_config.get_hidden_size()
         return torch.zeros(
-            input_ids.shape[0], hidden_size,
+            input_ids.shape[0],
+            hidden_size,
             dtype=torch.bfloat16,
             device=self.device,
         )
 
-    def compute_logits(
-        self, hidden_states: torch.Tensor
-    ) -> Optional[torch.Tensor]:
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         if hidden_states is None or hidden_states.numel() == 0:
             return None
         vocab_size = self.config.language_config.vocab_size
         return torch.zeros(
-            hidden_states.shape[0], vocab_size,
+            hidden_states.shape[0],
+            vocab_size,
             dtype=hidden_states.dtype,
             device=self.device,
         )
@@ -459,7 +482,7 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
+    ) -> SamplerOutput | None:
         if logits is None or logits.numel() == 0:
             return None
         return self.sampler(logits, sampling_metadata)
@@ -476,9 +499,7 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         if isinstance(model_output, torch.Tensor):
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={
-                    "model_outputs": [model_output.float().reshape(-1)]
-                },
+                multimodal_outputs={"model_outputs": [model_output.float().reshape(-1)]},
             )
         raise TypeError(f"Unexpected model output type: {type(model_output)}")
 

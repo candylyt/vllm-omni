@@ -33,7 +33,6 @@
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
 from typing import Any
 
 import torch
@@ -44,7 +43,7 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 logger = logging.getLogger(__name__)
 
 # Default chunk / context sizes for streaming (post-MVP).
-_DEFAULT_CHUNK_FRAMES   = 3
+_DEFAULT_CHUNK_FRAMES = 3
 _DEFAULT_CONTEXT_FRAMES = 3
 _DEFAULT_AUDIO_PAD_CODE = 1024
 
@@ -52,6 +51,7 @@ _DEFAULT_AUDIO_PAD_CODE = 1024
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Helpers
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 def _is_codes_empty(codes: Any) -> bool:
     """Return True if the codes payload should be treated as empty / invalid."""
@@ -61,11 +61,7 @@ def _is_codes_empty(codes: Any) -> bool:
         return codes.numel() == 0 or not codes.any()
     if hasattr(codes, "__len__") and len(codes) == 0:
         return True
-    t = (
-        codes
-        if isinstance(codes, torch.Tensor)
-        else torch.tensor(codes, dtype=torch.long)
-    )
+    t = codes if isinstance(codes, torch.Tensor) else torch.tensor(codes, dtype=torch.long)
     return not t.any()
 
 
@@ -86,8 +82,7 @@ def _codes_to_flat_list(codes: Any, n_vq: int) -> list[int] | None:
     codes = codes.to(torch.long).reshape(-1)  # flatten everything
     if codes.numel() != n_vq:
         logger.debug(
-            "[MossTTS processor] Unexpected codes shape after reshape: %d "
-            "(expected n_vq=%d)",
+            "[MossTTS processor] Unexpected codes shape after reshape: %d (expected n_vq=%d)",
             codes.numel(),
             n_vq,
         )
@@ -118,6 +113,16 @@ def _has_no_codes(codes: Any) -> bool:
     if hasattr(codes, "__len__"):
         return len(codes) == 0
     return False
+
+
+def _as_int(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return default
+        return int(value.reshape(-1)[0].item())
+    return int(value)
 
 
 def _normalize_codes_tensor(codes_raw: Any) -> torch.Tensor | None:
@@ -185,6 +190,7 @@ def _apply_de_delay_pattern(
 #  Batch mode  (mandatory for MVP)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def llm2decoder(
     stage_list: list[Any],
     engine_input_source: list[int],
@@ -221,17 +227,14 @@ def llm2decoder(
     src_stage_id = engine_input_source[0]
     if src_stage_id >= len(stage_list):
         raise IndexError(
-            f"[MossTTS processor] Invalid stage_id={src_stage_id} "
-            f"(only {len(stage_list)} stages present)."
+            f"[MossTTS processor] Invalid stage_id={src_stage_id} (only {len(stage_list)} stages present)."
         )
 
     stage = stage_list[src_stage_id]
     if stage.engine_outputs is None:
-        raise RuntimeError(
-            f"[MossTTS processor] Stage {src_stage_id} has no outputs yet."
-        )
+        raise RuntimeError(f"[MossTTS processor] Stage {src_stage_id} has no outputs yet.")
 
-    ar_outputs = stage.engine_outputs   # list[RequestOutput]
+    ar_outputs = stage.engine_outputs  # list[RequestOutput]
     decoder_inputs: list[OmniTokensPrompt] = []
 
     for req_idx, req_output in enumerate(ar_outputs):
@@ -260,7 +263,7 @@ def llm2decoder(
             # [T, n_vq, 1] → [T, n_vq]
             codes = codes.squeeze(-1)
         elif codes.ndim == 2:
-            pass   # already [T, n_vq]
+            pass  # already [T, n_vq]
         else:
             logger.warning(
                 "[MossTTS processor] Unexpected codes ndim=%d for request %s — skipping.",
@@ -276,8 +279,6 @@ def llm2decoder(
                 req_idx,
             )
             continue
-
-        n_vq = codes.shape[1]
 
         # Flatten: [T, n_vq] → [T * n_vq]  (row-major = frame-first)
         flat = codes.reshape(-1).tolist()
@@ -311,15 +312,12 @@ def llm2decoder_delay(
     src_stage_id = engine_input_source[0]
     if src_stage_id >= len(stage_list):
         raise IndexError(
-            f"[MossTTS Delay processor] Invalid stage_id={src_stage_id} "
-            f"(only {len(stage_list)} stages present)."
+            f"[MossTTS Delay processor] Invalid stage_id={src_stage_id} (only {len(stage_list)} stages present)."
         )
 
     stage = stage_list[src_stage_id]
     if stage.engine_outputs is None:
-        raise RuntimeError(
-            f"[MossTTS Delay processor] Stage {src_stage_id} has no outputs yet."
-        )
+        raise RuntimeError(f"[MossTTS Delay processor] Stage {src_stage_id} has no outputs yet.")
 
     decoder_inputs: list[OmniTokensPrompt] = []
 
@@ -370,6 +368,7 @@ def llm2decoder_delay(
 #  Streaming / async-chunk mode  (post-MVP, wired but not fully active)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def llm2decoder_async_chunk(
     transfer_manager: Any,
     pooling_output: dict[str, Any],
@@ -390,9 +389,9 @@ def llm2decoder_async_chunk(
         left_context_size    : int          (informational, 0 for MOSS — no delay)
     """
     connector = getattr(transfer_manager, "connector", None)
-    raw_cfg   = getattr(connector, "config", {}) or {}
-    cfg       = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
-    chunk_size  = int(cfg.get("codec_chunk_frames",   _DEFAULT_CHUNK_FRAMES))
+    raw_cfg = getattr(connector, "config", {}) or {}
+    cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
+    chunk_size = int(cfg.get("codec_chunk_frames", _DEFAULT_CHUNK_FRAMES))
 
     request_id = getattr(request, "external_req_id", None)
 
@@ -405,13 +404,9 @@ def llm2decoder_async_chunk(
         return None
 
     # ── Convert to per-step flat list ─────────────────────────────────
-    codes = (
-        codes_raw
-        if isinstance(codes_raw, torch.Tensor)
-        else torch.tensor(codes_raw, dtype=torch.long)
-    )
+    codes = codes_raw if isinstance(codes_raw, torch.Tensor) else torch.tensor(codes_raw, dtype=torch.long)
     codes = codes.to(torch.long).reshape(-1)  # [n_vq]
-    n_vq  = codes.numel()
+    n_vq = codes.numel()
 
     if n_vq == 0:
         if is_finished:
@@ -424,21 +419,21 @@ def llm2decoder_async_chunk(
     # Accumulate this frame's codes
     transfer_manager.code_prompt_token_ids[request_id].append(codes.tolist())
     accumulated = transfer_manager.code_prompt_token_ids[request_id]
-    n_frames    = len(accumulated)
+    n_frames = len(accumulated)
 
     # Flush when chunk is full or generation is done
     if n_frames % chunk_size != 0 and not is_finished:
-        return None   # still waiting
+        return None  # still waiting
 
     # Build flush payload
-    flat  = [code for frame in accumulated for code in frame]
+    flat = [code for frame in accumulated for code in frame]
     numel = len(flat)
     return {
         "code_predictor_codes": flat,
-        "code_flat_numel":      numel,
-        "codec_chunk_frames":   chunk_size,
-        "left_context_size":    0,   # MOSS has no delay pattern → no left context
-        "finished":             torch.tensor(is_finished, dtype=torch.bool),
+        "code_flat_numel": numel,
+        "codec_chunk_frames": chunk_size,
+        "left_context_size": 0,  # MOSS has no delay pattern → no left context
+        "finished": torch.tensor(is_finished, dtype=torch.bool),
     }
 
 
@@ -455,21 +450,22 @@ def _flush_remaining(
     if not accumulated:
         return _make_finished_sentinel()
 
-    flat  = [code for frame in accumulated for code in frame]
+    flat = [code for frame in accumulated for code in frame]
     numel = len(flat)
     return {
         "code_predictor_codes": flat,
-        "code_flat_numel":      numel,
-        "codec_chunk_frames":   chunk_size,
-        "left_context_size":    0,
-        "request_id":           request_id,
-        "finished":             torch.tensor(True, dtype=torch.bool),
+        "code_flat_numel": numel,
+        "codec_chunk_frames": chunk_size,
+        "left_context_size": 0,
+        "request_id": request_id,
+        "finished": torch.tensor(True, dtype=torch.bool),
     }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Delay-model streaming / async-chunk mode
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 def llm2decoder_delay_async_chunk(
     transfer_manager: Any,
@@ -516,8 +512,8 @@ def llm2decoder_delay_async_chunk(
     ``is_finished=True`` with any remaining frames), otherwise ``None``.
     """
     connector = getattr(transfer_manager, "connector", None)
-    raw_cfg   = getattr(connector, "config", {}) or {}
-    cfg       = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
+    raw_cfg = getattr(connector, "config", {}) or {}
+    cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
     chunk_size = int(cfg.get("codec_chunk_frames", _DEFAULT_CHUNK_FRAMES))
 
     request_id = getattr(request, "external_req_id", None)
@@ -526,14 +522,24 @@ def llm2decoder_delay_async_chunk(
 
     # ── Accumulate this step's raw delay-pattern row ──────────────────────
     if isinstance(pooling_output, dict):
+        audio_pad_code = _as_int(
+            pooling_output.get("audio_pad_code"),
+            _DEFAULT_AUDIO_PAD_CODE,
+        )
+        _pad_codes: dict[str, int] = getattr(  # type: ignore[assignment]
+            transfer_manager,
+            "_moss_tts_delay_audio_pad_code",
+            None,
+        )
+        if _pad_codes is None:
+            _pad_codes = {}
+            transfer_manager._moss_tts_delay_audio_pad_code = _pad_codes
+        _pad_codes[request_id] = audio_pad_code
+
         codes_raw = pooling_output.get("code_predictor_codes")
         if not _has_no_codes(codes_raw):
-            row = (
-                codes_raw
-                if isinstance(codes_raw, torch.Tensor)
-                else torch.tensor(codes_raw, dtype=torch.long)
-            )
-            row = row.to(torch.long).reshape(-1)   # [n_vq]
+            row = codes_raw if isinstance(codes_raw, torch.Tensor) else torch.tensor(codes_raw, dtype=torch.long)
+            row = row.to(torch.long).reshape(-1)  # [n_vq]
             if row.numel() > 0:
                 transfer_manager.code_prompt_token_ids[request_id].append(row.tolist())
     elif not is_finished:
@@ -562,16 +568,15 @@ def llm2decoder_delay_async_chunk(
         if is_finished:
             return _make_finished_sentinel()
         return None
-    n_vq_ref = row_tensors[0].numel()
     row_tensors = [r for r in row_tensors if r.numel() == row_tensors[0].numel()]
     if not row_tensors:
         if is_finished:
             return _make_finished_sentinel()
         return None
+    _pad_codes = getattr(transfer_manager, "_moss_tts_delay_audio_pad_code", {}) or {}
+    audio_pad_code = int(_pad_codes.get(request_id, _DEFAULT_AUDIO_PAD_CODE))
     raw_tensor = torch.stack(row_tensors, dim=0)  # [n_steps, n_vq]
-    valid_frames = _apply_de_delay_pattern(
-        raw_tensor, audio_pad_code=_DEFAULT_AUDIO_PAD_CODE
-    )   # [n_valid, n_vq]
+    valid_frames = _apply_de_delay_pattern(raw_tensor, audio_pad_code=audio_pad_code)  # [n_valid, n_vq]
     n_valid = valid_frames.shape[0]
 
     # ── Track how many valid frames have already been sent ────────────────
@@ -586,33 +591,37 @@ def llm2decoder_delay_async_chunk(
         # Not enough delay steps yet to recover a new valid frame.
         if is_finished:
             _delay_sent.pop(request_id, None)
+            if hasattr(transfer_manager, "_moss_tts_delay_audio_pad_code"):
+                transfer_manager._moss_tts_delay_audio_pad_code.pop(request_id, None)
             return _make_finished_sentinel()
         return None
 
     if not is_finished and n_new < chunk_size:
-        return None   # still accumulating
+        return None  # still accumulating
 
     # ── Decide how many frames to flush this call ─────────────────────────
     if is_finished:
-        flush_count = n_new   # everything remaining
+        flush_count = n_new  # everything remaining
     else:
         flush_count = (n_new // chunk_size) * chunk_size
         if flush_count == 0:
             return None
 
-    flush_frames = valid_frames[frames_sent : frames_sent + flush_count]   # [flush_count, n_vq]
-    flat  = flush_frames.reshape(-1).tolist()
+    flush_frames = valid_frames[frames_sent : frames_sent + flush_count]  # [flush_count, n_vq]
+    flat = flush_frames.reshape(-1).tolist()
 
     # ── Update sent counter; clean up on final flush ──────────────────────
     _delay_sent[request_id] = frames_sent + flush_count
     if is_finished:
         _delay_sent.pop(request_id, None)
+        if hasattr(transfer_manager, "_moss_tts_delay_audio_pad_code"):
+            transfer_manager._moss_tts_delay_audio_pad_code.pop(request_id, None)
 
     return {
         "code_predictor_codes": flat,
-        "code_flat_numel":      len(flat),
-        "codec_chunk_frames":   chunk_size,
-        "left_context_size":    0,
-        "request_id":           request_id,
-        "finished":             torch.tensor(is_finished, dtype=torch.bool),
+        "code_flat_numel": len(flat),
+        "codec_chunk_frames": chunk_size,
+        "left_context_size": 0,
+        "request_id": request_id,
+        "finished": torch.tensor(is_finished, dtype=torch.bool),
     }

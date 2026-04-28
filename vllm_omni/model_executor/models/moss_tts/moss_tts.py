@@ -11,7 +11,6 @@
 #   "decoder"         → MossTTSDecoderModel        (shared CAT codec)
 
 from collections.abc import Iterable
-from typing import Optional
 
 import torch
 from torch import nn
@@ -22,10 +21,10 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.models.moss_tts.moss_tts_ar_stage import MossTTSARStageModel
+from vllm_omni.model_executor.models.moss_tts.moss_tts_decoder import MossTTSDecoderModel
 from vllm_omni.model_executor.models.moss_tts.moss_tts_delay_ar_stage import (
     MossTTSDelayARStageModel,
 )
-from vllm_omni.model_executor.models.moss_tts.moss_tts_decoder import MossTTSDecoderModel
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 
@@ -73,8 +72,7 @@ class MossTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._model = MossTTSDecoderModel(vllm_config, prefix=prefix)
         else:
             raise ValueError(
-                f"[MossTTS] Unknown model_stage={self._stage!r}. "
-                f"Expected 'ar_stage', 'delay_ar_stage', or 'decoder'."
+                f"[MossTTS] Unknown model_stage={self._stage!r}. Expected 'ar_stage', 'delay_ar_stage', or 'decoder'."
             )
 
     # ------------------------------------------------------------------ #
@@ -83,7 +81,7 @@ class MossTTSForConditionalGeneration(nn.Module, SupportsPP):
 
     def forward(
         self,
-        input_ids: Optional[torch.Tensor] = None,
+        input_ids: torch.Tensor | None = None,
         **kwargs,
     ) -> "OmniOutput | torch.Tensor | IntermediateTensors":
         return self._model.forward(input_ids=input_ids, **kwargs)
@@ -104,13 +102,9 @@ class MossTTSForConditionalGeneration(nn.Module, SupportsPP):
                 multimodal_embeddings=multimodal_embeddings,
                 is_multimodal=is_multimodal,
             )
-        raise AttributeError(
-            f"Stage model {type(self._model).__name__} does not implement embed_input_ids"
-        )
+        raise AttributeError(f"Stage model {type(self._model).__name__} does not implement embed_input_ids")
 
-    def compute_logits(
-        self, hidden_states: torch.Tensor
-    ) -> Optional[torch.Tensor]:
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         if hasattr(self._model, "compute_logits"):
             return self._model.compute_logits(hidden_states)
         return None
@@ -119,7 +113,7 @@ class MossTTSForConditionalGeneration(nn.Module, SupportsPP):
         self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
+    ) -> SamplerOutput | None:
         if hasattr(self._model, "sample"):
             return self._model.sample(logits, sampling_metadata)
         return None
@@ -137,6 +131,10 @@ class MossTTSForConditionalGeneration(nn.Module, SupportsPP):
     def _clear_warmup_state(self) -> None:
         if hasattr(self._model, "_clear_warmup_state"):
             self._model._clear_warmup_state()
+
+    def on_requests_finished(self, request_ids) -> None:
+        if hasattr(self._model, "on_requests_finished"):
+            self._model.on_requests_finished(request_ids)
 
     def load_weights(
         self,

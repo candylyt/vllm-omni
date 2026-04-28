@@ -59,6 +59,9 @@ stage_args:
 
     engine_args:
       model_stage: decoder
+      # Path or HF repo ID for the separate MOSS-Audio-Tokenizer checkpoint.
+      # Override in production instead of relying on MOSS_AUDIO_TOKENIZER_PATH.
+      audio_tokenizer_path: null
       max_num_seqs: 1
       model_arch: MossTTSDelayModel
       worker_type: generation

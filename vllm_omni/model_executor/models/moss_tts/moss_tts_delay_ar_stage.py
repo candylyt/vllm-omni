@@ -16,7 +16,6 @@ import copy
 import logging
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Optional
 
 import torch
 from torch import nn
@@ -106,10 +105,7 @@ class MossTTSDelayARStageModel(nn.Module, SupportsPP):
         )
         self.lm_heads = nn.ModuleList(
             [nn.Linear(self.hidden_size, lang_cfg.vocab_size, bias=False)]
-            + [
-                nn.Linear(self.hidden_size, self.audio_vocab_size + 1, bias=False)
-                for _ in range(self.n_vq)
-            ]
+            + [nn.Linear(self.hidden_size, self.audio_vocab_size + 1, bias=False) for _ in range(self.n_vq)]
         )
         self.sampler = Sampler()
 
@@ -129,7 +125,7 @@ class MossTTSDelayARStageModel(nn.Module, SupportsPP):
 
     def _extract_request_schedule(
         self,
-        runtime_additional_information: Optional[list[dict]],
+        runtime_additional_information: list[dict] | None,
     ) -> tuple[list[str], list[int], list[int]]:
         try:
             from vllm.forward_context import get_forward_context
@@ -190,7 +186,8 @@ class MossTTSDelayARStageModel(nn.Module, SupportsPP):
         tokens = prompt_tokens.reshape(-1).tolist()
 
         unsupported = any(
-            token in (
+            token
+            in (
                 self.audio_user_slot_token_id,
                 self.audio_assistant_gen_slot_token_id,
                 self.audio_assistant_delay_slot_token_id,
@@ -243,6 +240,18 @@ class MossTTSDelayARStageModel(nn.Module, SupportsPP):
         self._last_request_ids = []
         self._last_seq_lens = []
 
+    def on_requests_finished(self, request_ids) -> None:
+        finished = {str(request_id) for request_id in request_ids}
+        for request_id in finished:
+            self._request_states.pop(str(request_id), None)
+        active = [
+            (request_id, seq_len)
+            for request_id, seq_len in zip(self._last_request_ids, self._last_seq_lens)
+            if request_id not in finished
+        ]
+        self._last_request_ids = [request_id for request_id, _ in active]
+        self._last_seq_lens = [seq_len for _, seq_len in active]
+
     # ------------------------------------------------------------------ #
     # Embedding                                                           #
     # ------------------------------------------------------------------ #
@@ -258,8 +267,8 @@ class MossTTSDelayARStageModel(nn.Module, SupportsPP):
         input_ids: torch.Tensor,
         multimodal_embeddings=None,
         is_multimodal: bool = False,
-        request_ids: Optional[list[str]] = None,
-        seq_lens: Optional[list[int]] = None,
+        request_ids: list[str] | None = None,
+        seq_lens: list[int] | None = None,
     ) -> torch.Tensor:
         embeds = self._get_text_embedding(input_ids)
         if multimodal_embeddings is not None:
@@ -412,12 +421,12 @@ class MossTTSDelayARStageModel(nn.Module, SupportsPP):
 
     def forward(
         self,
-        input_ids: Optional[torch.Tensor] = None,
-        positions: Optional[torch.Tensor] = None,
-        kv_caches: Optional[list] = None,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        kv_caches: list | None = None,
         attn_metadata=None,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> OmniOutput:
         request_ids, seq_lens, decode_positions = self._extract_request_schedule(
@@ -526,7 +535,7 @@ class MossTTSDelayARStageModel(nn.Module, SupportsPP):
         self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
+    ) -> SamplerOutput | None:
         return self.sampler(logits, sampling_metadata)
 
     def make_omni_output(self, model_output, **kwargs) -> OmniOutput:

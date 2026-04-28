@@ -346,7 +346,7 @@ def cuda_marks(*, res: str, num_cards: int):
     Get a collection of pytest marks to apply for `@cuda_test`.
 
     Args:
-        res: Resource type, e.g., "L4" or "H100".
+        res: Resource type, e.g., "L4", "A100", or "H100".
         num_cards: Number of GPU cards required.
 
     Returns:
@@ -356,10 +356,12 @@ def cuda_marks(*, res: str, num_cards: int):
 
     if res == "L4":
         test_resource = pytest.mark.L4
+    elif res == "A100":
+        test_resource = pytest.mark.A100
     elif res == "H100":
         test_resource = pytest.mark.H100
     else:
-        raise ValueError(f"Invalid CUDA resource type: {res}. Supported: L4, H100")
+        raise ValueError(f"Invalid CUDA resource type: {res}. Supported: L4, A100, H100")
 
     marks = [test_resource, test_platform_detail]
 
@@ -464,14 +466,14 @@ def gpu_marks(*, res: str, num_cards: int):
     Platform is automatically determined based on resource type.
 
     Args:
-        res: Resource type, e.g., "L4", "H100" for CUDA, or "MI325" for ROCm, or "B60" for XPU, or "S5000" for MUSA.
+        res: Resource type, e.g., "L4", "A100", "H100" for CUDA, or "MI325" for ROCm, or "B60" for XPU, or "S5000" for MUSA.
         num_cards: Number of GPU cards required.
 
     Returns:
         List of pytest marks to apply.
     """
     test_platform = pytest.mark.gpu
-    if res in ("L4", "H100"):
+    if res in ("L4", "A100", "H100"):
         return [test_platform] + cuda_marks(res=res, num_cards=num_cards)
     if res == "MI325":
         return [test_platform] + rocm_marks(res=res, num_cards=num_cards)
@@ -479,7 +481,7 @@ def gpu_marks(*, res: str, num_cards: int):
         return [test_platform] + xpu_marks(res=res, num_cards=num_cards)
     if res == "S5000":
         return [test_platform] + musa_marks(res=res, num_cards=num_cards)
-    raise ValueError(f"Invalid resource type: {res}. Supported: L4, H100, MI325, B60, S5000")
+    raise ValueError(f"Invalid resource type: {res}. Supported: L4, A100, H100, MI325, B60, S5000")
 
 
 def npu_marks(*, res: str, num_cards: int):
@@ -552,7 +554,7 @@ def hardware_test(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
 
     Args:
         res: Mapping from platform to resource type. Supported platforms/resources:
-            - cuda: L4, H100
+            - cuda: L4, A100, H100
             - rocm: MI325
             - xpu: B60
             - npu: A2, A3
