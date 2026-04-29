@@ -684,16 +684,6 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
 
         if decode_positions and decode_states and not torch.cuda.is_current_stream_capturing():
             audio_mask = [s.is_audio for s in decode_states]
-            # Debug: log FSM state + the input token that drove the transition.
-            # Remove once the pipeline is verified.
-            for p, s in zip(decode_positions, decode_states):
-                tok = int(input_ids[p].item()) if input_ids is not None else -1
-                logger.warning(
-                    "[debug-fsm] tok=%d is_audio=%s steps=%d "
-                    "(gen=%d end=%d start=%d)",
-                    tok, s.is_audio, s.audio_steps_generated,
-                    self.gen_slot_id, self.audio_end_id, self.audio_start_token_id,
-                )
             audio_positions = [
                 p for p, m in zip(decode_positions, audio_mask) if m
             ]
