@@ -12,6 +12,7 @@
 # llm2decoder_async_chunk() (set via custom_process_next_stage_input_func on
 # Stage 0) accumulates those rows and flushes codec_chunk_frames newly
 # generated frames to Stage 1 (CAT codec) via the shared-memory connector.
+
 # Stage 1 decodes each chunk to 24 kHz audio using the codec's streaming
 # KV-cache, without waiting for the full generation to finish.
 #
@@ -55,9 +56,11 @@ stage_args:
       max_model_len: 4096
       max_num_batched_tokens: 4096
       async_scheduling: true
-      # Flush frame-major rows to Stage 1 every codec_chunk_frames valid frames.
       custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.moss_tts.llm2decoder_async_chunk
 
+    # Names a transport channel from this stage to Stage 1.  The right-hand
+    # side ("connector_of_shared_memory") refers to the connector defined
+    # under `runtime.connectors` at the bottom of this file.
     output_connectors:
       to_stage_1: connector_of_shared_memory
 
@@ -98,9 +101,18 @@ stage_args:
       engine_output_type: audio
       max_model_len: 18192
       max_num_batched_tokens: 18192
+      # Stage 1 also schedules asynchronously so it can decode chunks as
+      # they arrive instead of blocking on a full input.
       async_scheduling: true
 
+    # Stage 1 reads from Stage 0 — index `[0]` is "first stage in the pipeline".
+    # In streaming mode, the actual transport is the connector below; in batch
+    # mode (moss_tts.yaml) the runtime invokes `custom_process_input_func` on
+    # the stage at index 0 instead.
     engine_input_source: [0]
+    # Counterpart to Stage 0's `output_connectors`.  The shared name
+    # ("connector_of_shared_memory") binds the two stages to the same
+    # connector instance defined under `runtime.connectors`.
     input_connectors:
       from_stage_0: connector_of_shared_memory
     is_comprehension: false
@@ -122,17 +134,35 @@ runtime:
     max_inflight: 1
 
   connectors:
+    # Inter-stage transport used by both `output_connectors` (Stage 0) and
+    # `input_connectors` (Stage 1).  The same dict instance is bound to both
+    # ends; payloads written here are read on the other side.
     connector_of_shared_memory:
-      name: SharedMemoryConnector
+      name: SharedMemoryConnector # transport implementation registered in vllm-omni
       extra:
+        # Switch to /dev/shm-backed buffers once a payload exceeds this size,
+        # to avoid the cost of pickling large tensors through the IPC queue.
         shm_threshold_bytes: 65536
+        # Engages the CAT codec's streaming KV-cache mode in Stage 1
+        # (consumed by MossTTSDecoderModel._enter_streaming).
         codec_streaming: true
+        # Stage 1 polls the connector every connector_get_sleep_s seconds
+        # while waiting for a chunk.  Smaller = lower latency, more CPU.
         connector_get_sleep_s: 0.01
+        # Max wait (ms) for the FIRST chunk of a request — long because
+        # Stage 0 prefill + first decode is slow on cold weights.
         connector_get_max_wait_first_chunk: 3000
+        # Max wait (ms) for SUBSEQUENT chunks — tighter because steady-state
+        # decode is fast and a stall here means Stage 0 has crashed.
         connector_get_max_wait: 300
         # Local (no-delay) first chunk needs just codec_chunk_frames steps.
+        # This must match (or be the source of) the chunk size that
+        # `llm2decoder_async_chunk` uses to flush; the bridge function reads
+        # it via `connector.config.extra.codec_chunk_frames`.
         codec_chunk_frames: 3
-        # MossTTSDecoderModel does not trim left context.
+        # MossTTSDecoderModel does not trim left context — the codec's
+        # internal KV-cache already carries the necessary context across
+        # chunks, so there is no overlap region to skip on this side.
         codec_left_context_frames: 0
 
   edges:

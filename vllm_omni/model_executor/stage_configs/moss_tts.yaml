@@ -39,17 +39,21 @@ stage_args:
       # Qwen3-1.7B global backbone ≈ 3.4 GB @ bf16
       # Local transformer (4 blocks, 1536 hidden) ≈ 0.5 GB @ bf16
       # Embeddings + LM heads (33 channels) ≈ 0.3 GB @ bf16
-      # Total AR stage ≈ 4.2 GB → 0.3 utilisation leaves KV cache headroom
+      # Total AR stage ≈ 4.2 GB
       gpu_memory_utilization: 0.3
 
       enforce_eager: true # local transformer runs eagerly (no CUDA graph)
       trust_remote_code: true # required for MossTTSLocalTransformer import
+      # MUST stay false: each audio code stream is unique and not a stable
+      # prefix.  Caching would corrupt downstream waveforms across requests.
       enable_prefix_caching: false
       engine_output_type: latent
       max_model_len: 4096
       max_num_batched_tokens: 4096
       async_scheduling: false
 
+    # `is_comprehension: true` on Stage 0 means it consumes a user prompt
+    # (vs Stage 1 which only consumes upstream stage output).
     is_comprehension: true
     final_output: true
     final_output_type: text # text tokens surfaced for debugging; audio in Stage 1
@@ -86,7 +90,7 @@ stage_args:
       # Memory budget
       # CAT codec (1.6 B parameters) ≈ 3.2 GB @ bf16
       # Activation memory during decode ≈ 1 GB
-      # Total ≈ 4.2 GB → 0.4 utilisation on a 96 GB GPU
+      # Total ≈ 4.2 GB
       gpu_memory_utilization: 0.25
 
       enforce_eager: true
@@ -97,7 +101,7 @@ stage_args:
       max_num_batched_tokens: 18192
       async_scheduling: false
 
-    engine_input_source: [0] # receives codes from Stage 0
+    engine_input_source: [0]
     is_comprehension: false
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.moss_tts.llm2decoder
     final_output: true
