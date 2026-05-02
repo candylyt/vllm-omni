@@ -33,7 +33,7 @@ import logging
 import os
 from collections.abc import Iterable
 from contextlib import ExitStack
-from typing import Any
+from typing import Any, Optional
 
 import torch
 from torch import nn
@@ -260,9 +260,16 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
 
         self._codec: CATCodecWorker = _get_codec_worker(self.device, self.audio_tokenizer_path)
 
-        # Per-request streaming state: request_id → ExitStack holding codec KV-cache context.
-        # Entries are created on the first chunk and removed when finished=True.
-        self._streaming_states: dict[str, ExitStack] = {}
+        # Per-request streaming state: request_id -> {module_index: _streaming_state}.
+        #
+        # The CAT codec stores streaming KV/cache buffers on shared decoder modules.
+        # Holding multiple decoder_module.streaming() contexts at the same time
+        # fails with "is already streaming!". To support async multi-request decode,
+        # keep each request's streaming states off-module between chunk calls and
+        # temporarily re-attach only the active request's state during _decode_frame.
+        self._streaming_states: dict[str, dict[int, Any]] = {}
+        self._active_request_id: Optional[str] = None
+        self._streaming_modules_cache: Optional[list] = None
 
         # Dummy logits processor / sampler required by vllm's model protocol
         self.logits_processor = LogitsProcessor(cfg.language_config.vocab_size)
@@ -272,22 +279,77 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
     #  Core decode logic
     # ══════════════════════════════════════════════════════════════════
 
+    def _get_all_streaming_modules(self) -> list:
+        """Return a stable ordered list of every StreamingModule in the codec decoder."""
+        if self._streaming_modules_cache is not None:
+            return self._streaming_modules_cache
+
+        modules: list = []
+        seen: set[int] = set()
+        for decoder_module in self._codec.codec.decoder:
+            if not (hasattr(decoder_module, "streaming") and callable(decoder_module.streaming)):
+                continue
+
+            # Build the codec module's cached streaming children list without
+            # mutating any streaming state.
+            if hasattr(decoder_module, "_apply_named_streaming"):
+                decoder_module._apply_named_streaming(lambda _name, _module: None)
+            cached_children = getattr(decoder_module, "_cached_children", None)
+            if cached_children is None:
+                continue
+
+            for _, module in cached_children:
+                if id(module) not in seen:
+                    seen.add(id(module))
+                    modules.append(module)
+
+        self._streaming_modules_cache = modules
+        return modules
+
     def _enter_streaming(self, request_id: str) -> None:
-        """Enter codec streaming mode for a new request, storing KV-cache state."""
+        """Allocate fresh codec streaming state for a new request, then suspend it."""
         if request_id in self._streaming_states:
             return
-        stack = ExitStack()
-        codec = self._codec.codec
-        for decoder_module in codec.decoder:
-            if hasattr(decoder_module, "streaming") and callable(decoder_module.streaming):
-                stack.enter_context(decoder_module.streaming(batch_size=1))
-        self._streaming_states[request_id] = stack
+        if self._active_request_id is not None:
+            self._suspend_active_streaming()
+
+        for decoder_module in self._codec.codec.decoder:
+            if hasattr(decoder_module, "_start_streaming"):
+                decoder_module._start_streaming(batch_size=1, exit_stack=ExitStack())
+
+        modules = self._get_all_streaming_modules()
+        states = {i: module._streaming_state for i, module in enumerate(modules)}
+
+        # Detach from shared modules so another request can allocate/activate its
+        # own streaming state without tripping the codec's single-active guard.
+        for module in modules:
+            module._streaming_state = None
+        self._streaming_states[request_id] = states
+
+    def _activate_streaming(self, request_id: str) -> None:
+        """Attach one request's saved streaming state to the shared codec modules."""
+        if self._active_request_id == request_id:
+            return
+        if self._active_request_id is not None:
+            self._suspend_active_streaming()
+
+        states = self._streaming_states[request_id]
+        modules = self._get_all_streaming_modules()
+        for i, module in enumerate(modules):
+            module._streaming_state = states.get(i)
+        self._active_request_id = request_id
+
+    def _suspend_active_streaming(self) -> None:
+        """Detach streaming states from codec modules without freeing KV/cache buffers."""
+        for module in self._get_all_streaming_modules():
+            module._streaming_state = None
+        self._active_request_id = None
 
     def _exit_streaming(self, request_id: str) -> None:
-        """Exit and discard the streaming state for a finished request."""
-        stack = self._streaming_states.pop(request_id, None)
-        if stack is not None:
-            stack.close()
+        """Discard per-request streaming state for a finished request."""
+        if self._active_request_id == request_id:
+            self._suspend_active_streaming()
+        self._streaming_states.pop(request_id, None)
 
     def on_requests_finished(self, request_ids) -> None:
         for request_id in request_ids:
@@ -296,7 +358,7 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
     def _decode_one_request(
         self,
         flat_codes: torch.Tensor,
-        request_id: str | None = None,
+        request_id: Optional[str] = None,
         is_finished: bool = False,
     ) -> torch.Tensor:
         """
@@ -330,13 +392,17 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
 
         try:
             if request_id is not None:
-                # Streaming path: maintain causal KV-cache across chunks.
-                self._enter_streaming(request_id)
+                # Streaming path: maintain per-request causal KV/cache across
+                # chunks while sharing one codec instance among concurrent requests.
+                if request_id not in self._streaming_states:
+                    self._enter_streaming(request_id)
+                self._activate_streaming(request_id)
                 codec = self._codec.codec
                 codes_3d = codes.unsqueeze(1).to(self.device)  # [n_vq, 1, T]
                 lengths = torch.tensor([codes_3d.shape[-1]], device=self.device, dtype=torch.long)
                 result = codec._decode_frame(codes_3d, lengths)
                 wav = result.audio[0, 0, : result.audio_lengths[0]].float().cpu()
+                self._suspend_active_streaming()
                 if is_finished:
                     self._exit_streaming(request_id)
             else:
@@ -346,6 +412,7 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
             return wav.to(self.device)
         except Exception as exc:
             logger.error("[MossTTS Decoder] Codec decode failed: %s", exc, exc_info=True)
+            self._suspend_active_streaming()
             if request_id and is_finished:
                 self._exit_streaming(request_id)
             return empty
@@ -405,6 +472,17 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         empty = torch.zeros(0, dtype=torch.float32, device=self.device)
 
         if code_tensor is None or code_tensor.numel() == 0:
+            # Even with no codes, a finished sentinel must close streaming state.
+            if runtime_additional_information:
+                for info in runtime_additional_information:
+                    if not isinstance(info, dict):
+                        continue
+                    req_id = info.get("request_id")
+                    fin = info.get("finished")
+                    if isinstance(fin, torch.Tensor):
+                        fin = bool(fin.item())
+                    if req_id and fin:
+                        self._exit_streaming(req_id)
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={"model_outputs": [empty]},
