@@ -1,36 +1,52 @@
 # Copyright 2025 OpenMOSS / vllm-omni contributors.
 #
 # Licensed under the Apache License, Version 2.0.
-#
-# Stage 0: AR stage for MOSS-TTS-Local.
-#
-# Architecture (mirrors MossTTSDelayModel from modeling_moss_tts.py):
-#
-#   ┌───────────────────────────────────────────────────────────┐
-#   │  Global: Qwen3-1.7B backbone (paged attn via vllm)       │
-#   │    input_ids → multi-channel embedding → Qwen3Model       │
-#   │    → hidden_states [L, D_global]                          │
-#   │                           │                               │
-#   │  Local (per decode step): │                               │
-#   │    global_hidden[step]    │                               │
-#   │        ↓ speech_embedding_to_local_mlp                    │
-#   │    for ch in 0..32:                                       │
-#   │        append to local_ctx  [B, ch, D_local]             │
-#   │        local_transformer forward                          │
-#   │        local_to_speech_mlp + norm + lm_head[ch]          │
-#   │        sample next_token[ch]                              │
-#   │        embed → next local input                           │
-#   │    → code_predictor_codes [B, 1, n_vq=32, 1]             │
-#   └───────────────────────────────────────────────────────────┘
-#
-# Weight key mapping (HF checkpoint → this module):
-#   model.language_model.*            → backbone.*
-#   model.embedding_list.{i}.weight   → embedding_list.{i}.weight
-#   local_transformer.*               → local_transformer.*
-#   speech_embedding_to_local_mlp.*   → speech_embedding_to_local_mlp.*
-#   local_to_speech_embedding_mlps.*  → local_to_speech_embedding_mlps.*
-#   layer_norm_before_lm_heads.*      → layer_norm_before_lm_heads.*
-#   lm_heads.*                        → lm_heads.*
+"""
+Stage 0 of MOSS-TTS-Local: text → 32-channel RVQ codes.
+
+This module documents Stage 0 in isolation: how the
+global Qwen3 backbone and the local transformer cooperate to produce one
+audio frame per decode step.
+
+Per-step architecture
+---------------------
+
+    ┌───────────────────────────────────────────────────────────┐
+    │  Global: Qwen3-1.7B backbone (paged attn via vllm)        │
+    │    input_ids → multi-channel embedding → Qwen3Model       │
+    │    → hidden_states [L, D_global]                          │
+    │                           │                               │
+    │  Local (per decode step): │                               │
+    │    global_hidden[step]    │                               │
+    │        ↓ speech_embedding_to_local_mlp                    │
+    │    for ch in 0..32:                                       │
+    │        append to local_ctx  [B, ch, D_local]              │
+    │        local_transformer forward                          │
+    │        local_to_speech_mlp + norm + lm_head[ch]           │
+    │        sample next_token[ch]                              │
+    │        embed → next local input                           │
+    │    → code_predictor_codes [B, 1, n_vq=32, 1]              │
+    └───────────────────────────────────────────────────────────┘
+
+The mode is gated by a per-request FSM (see `MossTTSLocalRequestState` and
+`_advance_state_with_text_token`).  Outside of audio mode the global backbone
+runs as a normal text LM; inside audio mode the local transformer is invoked
+to predict 32 RVQ codes per step, and the text head's logits are masked so
+vLLM's sampler can only pick `gen_slot` (continue audio) or `audio_end`
+(terminate).  The single output every consumer downstream cares about is
+`code_predictor_codes` of shape [B, 1, n_vq, 1].
+
+Weight key mapping (HF checkpoint → this module):
+    model.language_model.*            → backbone.*
+    model.embedding_list.{i}.weight   → embedding_list.{i}.weight
+    local_transformer.*               → local_transformer.*
+    speech_embedding_to_local_mlp.*   → speech_embedding_to_local_mlp.*
+    local_to_speech_embedding_mlps.*  → local_to_speech_embedding_mlps.*
+    layer_norm_before_lm_heads.*      → layer_norm_before_lm_heads.*
+    lm_heads.*                        → lm_heads.*
+
+The mapping is implemented in `MossTTSARStageModel.load_weights`.
+"""
 
 import copy
 import logging
@@ -130,9 +146,7 @@ class MossTTSLocalTransformerWrapper(nn.Module):
 class MossTTSLocalRequestState:
     """Per-request FSM tracking whether the model is currently emitting audio.
 
-    Mirrors `MossTTSDelayRequestState` from the delay stage but without the
-    delay-pattern bookkeeping (no `delayed_length`, no per-channel mask) since
-    the local architecture emits all n_vq codes together at every audio step.
+    All n_vq codes are emitted together at every audio step.
     """
 
     n_vq: int
@@ -191,6 +205,21 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         self.config = cfg
 
         # ── Scalar constants ────────────────────────────────────────────
+        # All values come from the HF model config so they can never drift
+        # away from the checkpoint they were trained with.  The numbers in
+        # the trailing comments are the verified values for the Phase-1
+        # MOSS-TTS-Local checkpoint and are shown for reader convenience —
+        # do NOT use them as fallbacks; let the cfg fail loudly if missing.
+        #
+        #   n_vq                 RVQ depth (32 codebooks per audio frame).
+        #   channels             1 (text) + n_vq audio channels = 33.
+        #   audio_vocab_size     codebook size; valid codes are 0..1023.
+        #   audio_pad_code       the (vocab_size)-th index = pad sentinel,
+        #                        embedded with padding_idx=audio_pad_code.
+        #   gen_slot_id          placeholder text token forced by the FSM
+        #                        every step the model is producing audio.
+        #   audio_end_id         text token that exits audio mode when
+        #                        sampled (after MIN_AUDIO_FRAMES).
         self.n_vq: int            = cfg.n_vq                              # 32
         self.channels: int        = 1 + self.n_vq                        # 33
         self.audio_vocab_size: int = cfg.audio_vocab_size                 # 1024
@@ -220,7 +249,6 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         # ── Global Qwen3 backbone ────────────────────────────────────────
         # Substitute the embedded Qwen3Config into a copy of VllmConfig so
         # vllm's Qwen3 model initialises with the correct dimensions.
-        # TODO: If VllmConfig becomes immutable, use vllm's public API instead.
         qwen3_vllm_config = copy.deepcopy(vllm_config)
         object.__setattr__(qwen3_vllm_config.model_config, "hf_config", lang_cfg)
 

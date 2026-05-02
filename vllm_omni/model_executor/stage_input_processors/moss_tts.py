@@ -1,29 +1,46 @@
 # Copyright 2025 OpenMOSS / vllm-omni contributors.
 #
 # Licensed under the Apache License, Version 2.0.
-#
-# Stage 0 → Stage 1 transition processor for MOSS-TTS-Local.
-#
-# Role
-# ----
-# At the end of Stage 0 (AR stage), each decode step produces a
-# code_predictor_codes tensor of shape [B, 1, n_vq, 1] = [B, 1, 32, 1].
-# This processor accumulates those per-step codes across the full generation,
-# then packages them as a flat token sequence for the Stage 1 (CAT codec).
-#
-# Flat format (row-major, matching _parse_flat_codes in moss_tts_decoder.py):
-#
-#   For a sequence of T audio frames, each with 32 RVQ codes:
-#   [code_t0_vq0, code_t0_vq1, …, code_t0_vq31,   ← frame 0
-#    code_t1_vq0, code_t1_vq1, …, code_t1_vq31,   ← frame 1
-#    …
-#    code_tT_vq0, …, code_tT_vq31]                 ← frame T
-#
-#   i.e. flat shape [T * n_vq]
-#
-# Two entry points (mirroring mimo_audio.py):
-#   llm2decoder()            — batch mode  (called once at end of generation)
-#   llm2decoder_async_chunk() — streaming  (called every N frames; future use)
+"""
+Stage 0 → Stage 1 bridge processor for MOSS-TTS-Local.
+
+Role
+----
+At the end of every Stage 0 decode step the AR stage produces a
+``code_predictor_codes`` tensor of shape [B, 1, n_vq, 1] = [B, 1, 32, 1].
+This module collects those tensors and reshapes them into the flat token
+sequence that Stage 1 (CAT codec) expects as its input prompt.
+
+Flat format (row-major / frame-first, matching ``_parse_flat_codes`` in
+``moss_tts_decoder.py``).  For T audio frames with 32 RVQ codes each:
+
+    [code_t0_vq0, code_t0_vq1, …, code_t0_vq31,   ← frame 0
+     code_t1_vq0, code_t1_vq1, …, code_t1_vq31,   ← frame 1
+     …
+     code_tT_vq0, …, code_tT_vq31]                ← frame T
+
+i.e. flat shape [T * n_vq].
+
+Two entry points (one per pipeline mode), each wired in via a different
+YAML key on the AR stage's engine_args:
+
+    llm2decoder              — batch / sync mode
+        Wired via ``custom_process_input_func`` on Stage 1.
+        Called once at the end of a full generation.  Reads
+        ``stage.engine_outputs`` from Stage 0 and emits one
+        ``OmniTokensPrompt`` per request.
+
+    llm2decoder_async_chunk  — streaming / async-chunk mode
+        Wired via ``custom_process_next_stage_input_func`` on Stage 0.
+        Called after every Stage-0 decode step.  Accumulates frames in the
+        SharedMemoryConnector's transfer manager and flushes
+        ``codec_chunk_frames`` worth of new frames whenever the buffer fills,
+        so Stage 1 can decode incrementally.
+
+Both functions return ``OmniTokensPrompt`` objects whose ``prompt_token_ids``
+are the flat code list — they do NOT consolidate codes across requests.
+Stage 1 receives one input per request.
+"""
 
 from __future__ import annotations
 
@@ -38,7 +55,12 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 
 logger = logging.getLogger(__name__)
 
-# Default chunk / context sizes for streaming (post-MVP).
+# Default chunk / context sizes used by ``llm2decoder_async_chunk`` if the
+# SharedMemoryConnector config doesn't override them.  In practice
+# moss_tts_async.yaml does set ``codec_chunk_frames: 3`` explicitly, so these
+# fall-back values match production.  ``_DEFAULT_CONTEXT_FRAMES`` is unused
+# by the no-delay variant (left context is always 0) and is kept here only
+# for parity with future delay-pattern variants.
 _DEFAULT_CHUNK_FRAMES   = 3
 _DEFAULT_CONTEXT_FRAMES = 3
 
@@ -100,7 +122,7 @@ def _make_finished_sentinel() -> dict[str, Any]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Batch mode  (mandatory for MVP)
+#  Batch mode
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def llm2decoder(
@@ -212,7 +234,7 @@ def llm2decoder(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Streaming / async-chunk mode  (post-MVP, wired but not fully active)
+#  Streaming / async-chunk mode
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def llm2decoder_async_chunk(
