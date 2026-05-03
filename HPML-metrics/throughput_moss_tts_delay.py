@@ -57,27 +57,15 @@ USER_INST_TEMPLATE = """\
 </user_inst>"""
 
 
+# make prompt based on Moss TTS template
 def build_tts_prompt(text, model_path):
-    tokenizer = AutoTokenizer.from_pretrained(
-        os.path.abspath(model_path), trust_remote_code=True
-    )
+    tokenizer = AutoTokenizer.from_pretrained(os.path.abspath(model_path), trust_remote_code=True)
 
-    content = (
-        USER_INST_TEMPLATE.replace("{reference}", "None")
-        .replace("{instruction}", "None")
-        .replace("{tokens}", "None")
-        .replace("{quality}", "None")
-        .replace("{sound_event}", "None")
-        .replace("{ambient_sound}", "None")
-        .replace("{language}", "None")
-        .replace("{text}", str(text))
-    )
+    content = USER_INST_TEMPLATE.format(reference="None", instruction="None",  tokens="None", 
+                                        quality="None", sound_event="None", ambient_sound="None", language="None", text=str(text))
+    
+    prompt = tokenizer.apply_chat_template([{"role": "user", "content": content}], tokenize=False, add_generation_prompt=True)
 
-    prompt = tokenizer.apply_chat_template(
-        [{"role": "user", "content": content}],
-        tokenize=False,
-        add_generation_prompt=True,
-    )
     return prompt + "<|audio_start|>"
 
 

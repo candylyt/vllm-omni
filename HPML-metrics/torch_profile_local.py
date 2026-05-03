@@ -58,15 +58,8 @@ USER_INST_TEMPLATE = """\
 def build_tts_prompt(text, model_path):
     tokenizer = AutoTokenizer.from_pretrained(os.path.abspath(model_path), trust_remote_code=True)
 
-    content = (USER_INST_TEMPLATE
-               .replace("{reference}", "None")
-               .replace("{instruction}", "None")
-               .replace("{tokens}", "None")
-               .replace("{quality}", "None")
-               .replace("{sound_event}", "None")
-               .replace("{ambient_sound}", "None")
-               .replace("{language}", "None")
-               .replace("{text}", str(text)))
+    content = USER_INST_TEMPLATE.format(reference="None", instruction="None",  tokens="None", 
+                                        quality="None", sound_event="None", ambient_sound="None", language="None", text=str(text))
     
     prompt = tokenizer.apply_chat_template([{"role": "user", "content": content}], tokenize=False, add_generation_prompt=True)
 
@@ -100,7 +93,7 @@ def main():
     p.add_argument("--init-sleep-seconds", type=int, default=30)
     p.add_argument("--max-ar-tokens", type=int, default=500)
     p.add_argument("--delay-iterations", type=int, default=0)
-    p.add_argument("--active-iterations", type=int, default=100000)
+    p.add_argument("--active-iterations", type=int, default=50)
     p.add_argument("--record-shapes", choices=["True", "False"], default="False")
     p.add_argument("--with-flops", choices=["True", "False"], default="False")
     p.add_argument("--with-mem", choices=["True", "False"], default="False")
