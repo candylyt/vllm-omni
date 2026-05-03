@@ -32,11 +32,11 @@ uv pip install setuptools_scm
 
 ## 4. Clone & Install vllm-omni
 ```bash
-git clone [https://github.com/candylyt/vllm-omni.git](https://github.com/candylyt/vllm-omni.git)
+git clone https://github.com/candylyt/vllm-omni.git
 cd vllm-omni
 git checkout moss-tts-local
 export REPO=$(pwd)
-
+ 
 uv pip install -e ${REPO} --no-build-isolation --no-cache-dir
 ```
 
