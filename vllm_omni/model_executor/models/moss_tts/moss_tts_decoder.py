@@ -61,6 +61,46 @@ _STREAMING_STATE_SCALAR_TYPES = (
 )
 
 
+class _BatchedScalarStreamingState:
+    """Preserve divergent per-request scalar fields inside batched codec state."""
+
+    __slots__ = ("values",)
+
+    def __init__(self, values: Iterable[Any]):
+        self.values = list(values)
+
+    def _single_value(self) -> Any:
+        first = self.values[0]
+        if all(value == first for value in self.values):
+            return first
+        raise TypeError("Cannot use divergent batched scalar streaming-state value as a single scalar")
+
+    def __iadd__(self, other: Any):
+        self.values = [value + other for value in self.values]
+        return self
+
+    def __add__(self, other: Any):
+        return self._single_value() + other
+
+    def __radd__(self, other: Any):
+        return other + self._single_value()
+
+    def __int__(self) -> int:
+        return int(self._single_value())
+
+    def __float__(self) -> float:
+        return float(self._single_value())
+
+    def __index__(self) -> int:
+        return int(self._single_value())
+
+    def __bool__(self) -> bool:
+        return bool(self._single_value())
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self.values!r})"
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CAT Codec worker (singleton per process / device)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -238,6 +278,14 @@ def _stack_streaming_state(states: list[Any]) -> Any:
         return None
 
     first = states[0]
+    if isinstance(first, _BatchedScalarStreamingState):
+        values = []
+        for state in states:
+            if not isinstance(state, _BatchedScalarStreamingState):
+                raise TypeError("Cannot stack mixed batched-scalar/non-batched-scalar streaming states")
+            values.extend(state.values)
+        return _BatchedScalarStreamingState(values)
+
     if first is None:
         if all(state is None for state in states):
             return None
@@ -289,7 +337,9 @@ def _stack_streaming_state(states: list[Any]) -> Any:
     if isinstance(first, _STREAMING_STATE_SCALAR_TYPES):
         if all(state == first for state in states):
             return first
-        raise TypeError("Cannot stack divergent scalar streaming-state values")
+        if any(not isinstance(state, type(first)) for state in states):
+            raise TypeError("Cannot stack scalar streaming-state values with different types")
+        return _BatchedScalarStreamingState(states)
 
     if hasattr(first, "__dict__"):
         keys = set(vars(first).keys())
@@ -307,6 +357,14 @@ def _split_streaming_state(state: Any, batch_size: int) -> list[Any]:
     """Split a batched codec streaming state into per-request states."""
     if state is None:
         return [None] * batch_size
+
+    if isinstance(state, _BatchedScalarStreamingState):
+        if len(state.values) != batch_size:
+            raise TypeError(
+                "Cannot split batched scalar streaming state: "
+                f"{len(state.values)} values does not match batch size {batch_size}"
+            )
+        return list(state.values)
 
     if isinstance(state, torch.Tensor):
         if state.ndim == 0:

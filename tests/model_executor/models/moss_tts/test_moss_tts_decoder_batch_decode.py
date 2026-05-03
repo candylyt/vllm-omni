@@ -113,6 +113,38 @@ def test_streaming_batch_decode_stacks_and_splits_request_states():
     assert module._streaming_state is None
 
 
+def test_streaming_batch_decode_preserves_divergent_scalar_counters():
+    module = SimpleNamespace(_streaming_state=None)
+
+    def decode_frame(codes: torch.Tensor, lengths: torch.Tensor):
+        assert module._streaming_state.offset_cpu.values == [3, 7]
+        module._streaming_state.offset_cpu += int(lengths.max().item())
+        module._streaming_state.cache = module._streaming_state.cache + 10
+        return _fake_decode_frame(codes, lengths)
+
+    model, codec = _minimal_decoder_model(decode_frame)
+    model._streaming_modules_cache = [module]
+    model._streaming_states = {
+        "r0": {0: SimpleNamespace(cache=torch.zeros(1, 2), offset_cpu=3)},
+        "r1": {0: SimpleNamespace(cache=torch.ones(1, 2), offset_cpu=7)},
+    }
+
+    out = MossTTSDecoderModel._batch_decode(
+        model,
+        [_flat_codes(2), _flat_codes(2, offset=100)],
+        request_ids=["r0", "r1"],
+        finished_flags=[False, False],
+    )
+
+    codec._decode_frame.assert_called_once()
+    assert len(out) == 2
+    assert model._streaming_states["r0"][0].offset_cpu == 5
+    assert model._streaming_states["r1"][0].offset_cpu == 9
+    assert torch.equal(model._streaming_states["r0"][0].cache, torch.full((1, 2), 10.0))
+    assert torch.equal(model._streaming_states["r1"][0].cache, torch.full((1, 2), 11.0))
+    assert module._streaming_state is None
+
+
 def test_streaming_state_stack_split_round_trip_nested_payload():
     states = [
         {"cache": torch.zeros(1, 2), "meta": [torch.ones(1, 1), True, torch.device("cpu")]},
@@ -130,6 +162,34 @@ def test_streaming_state_stack_split_round_trip_nested_payload():
     assert split[1]["meta"][1] is True
     assert split[0]["meta"][2] == torch.device("cpu")
     assert split[1]["meta"][2] == torch.device("cpu")
+
+
+def test_streaming_state_stack_split_round_trip_divergent_scalar_counter():
+    states = [
+        SimpleNamespace(cache=torch.zeros(1, 2), offset_cpu=3),
+        SimpleNamespace(cache=torch.ones(1, 2), offset_cpu=7),
+    ]
+
+    stacked = _stack_streaming_state(states)
+    stacked.offset_cpu += 2
+
+    split = _split_streaming_state(stacked, 2)
+    assert split[0].offset_cpu == 5
+    assert split[1].offset_cpu == 9
+    assert torch.equal(split[0].cache, states[0].cache)
+    assert torch.equal(split[1].cache, states[1].cache)
+
+
+def test_divergent_batched_scalar_raises_when_used_as_single_scalar():
+    states = [
+        SimpleNamespace(offset_cpu=3),
+        SimpleNamespace(offset_cpu=7),
+    ]
+
+    stacked = _stack_streaming_state(states)
+
+    with pytest.raises(TypeError, match="divergent batched scalar"):
+        _ = 1 + stacked.offset_cpu
 
 
 def test_streaming_state_stack_split_kv_cache_batch_dim_one():
