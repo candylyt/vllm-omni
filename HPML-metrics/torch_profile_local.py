@@ -1,14 +1,17 @@
 """
 Usage:
-  PYTHONPATH=${REPO} \
-  MOSS_AUDIO_TOKENIZER_PATH=${MOSS_AUDIO_TOKENIZER_PATH} \
-  CUDA_VISIBLE_DEVICES=0 \
-  python3 torch_profile_local.py \
+    PYTHONPATH=${REPO} \
+    MOSS_AUDIO_TOKENIZER_PATH=${MOSS_AUDIO_TOKENIZER_PATH} \
+    CUDA_VISIBLE_DEVICES=0 \
+    python3 torch_profile_local.py \
     --model       ${MOSS_TTS_LOCAL_PATH} \
     --repo        ${REPO} \
     --mode        async \
     --trace-dir   ./profiler_traces \
-    --samples     1
+    --samples     5 \
+    --warmup      2 \
+    --delay-iterations   20 \
+    --active-iterations  30
 
   # open res in https://ui.perfetto.dev
 """
