@@ -3,7 +3,7 @@ Usage:
   PYTHONPATH=${REPO} \
   MOSS_AUDIO_TOKENIZER_PATH=${MOSS_AUDIO_TOKENIZER_PATH} \
   CUDA_VISIBLE_DEVICES=0 \
-  python3 torch_profile_minimal.py \
+  python3 torch_profile_local.py \
     --model       ${MOSS_TTS_LOCAL_PATH} \
     --repo        ${REPO} \
     --mode        async \
