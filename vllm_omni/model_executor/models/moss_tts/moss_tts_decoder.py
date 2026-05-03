@@ -172,7 +172,7 @@ class CATCodecWorker:
         codes = codes.to(self.device)
         out = self.codec.decode(codes, chunk_duration=8)  # MossAudioTokenizerDecoderOutput
         wav = out.audio[0, 0]  # [T_audio]  float32
-        return wav.float().cpu()
+        return wav.float()
 
 
 # Module-level cache: (device_type, codec_path) → CATCodecWorker
@@ -270,6 +270,11 @@ def _split_per_request(
         return [ids[boundaries[i] : min(boundaries[i + 1], n)] for i in range(len(seq_token_counts))]
 
     return [ids]
+
+
+def _runtime_request_id(info: dict[str, Any]) -> str | None:
+    request_id = info.get("request_id") or info.get("req_id")
+    return str(request_id) if request_id is not None else None
 
 
 def _stack_streaming_state(states: list[Any]) -> Any:
@@ -597,7 +602,7 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
             if req_codes is None or req_codes.numel() == 0:
                 continue
             codes = _parse_flat_codes(req_codes, self.n_vq)
-            if codes is None or not codes.any():
+            if codes is None:
                 continue
             parsed_codes.append(codes)
             valid_indices.append(i)
@@ -628,6 +633,29 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         batch_size: int,
     ) -> list[torch.Tensor]:
         """Normalize codec decode outputs to a list of 1-D float32 tensors."""
+        looks_like_audio_lengths_pair = (
+            isinstance(decode_result, (tuple, list))
+            and len(decode_result) == 2
+            and all(isinstance(item, torch.Tensor) for item in decode_result)
+            and decode_result[0].ndim >= 2
+            and decode_result[1].ndim <= 1
+            and decode_result[1].numel() == batch_size
+        )
+        if (
+            isinstance(decode_result, (tuple, list))
+            and not looks_like_audio_lengths_pair
+            and len(decode_result) == batch_size
+            and all(isinstance(item, torch.Tensor) for item in decode_result)
+            and all(item.ndim <= 2 for item in decode_result)
+        ):
+            wavs = []
+            for item in decode_result:
+                wav = item
+                if wav.ndim > 1:
+                    wav = wav[0]
+                wavs.append(wav.to(self.device, dtype=torch.float32).reshape(-1))
+            return wavs
+
         audio = getattr(decode_result, "audio", None)
         audio_lengths = getattr(decode_result, "audio_lengths", None)
 
@@ -695,11 +723,6 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
                 self._exit_streaming(request_id)
             return empty
 
-        if not codes.any():
-            if request_id and is_finished:
-                self._exit_streaming(request_id)
-            return empty
-
         try:
             if request_id is not None:
                 # Streaming path: maintain per-request causal KV/cache across
@@ -742,6 +765,35 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
             return None
 
         codec = self._codec.codec
+        batch_decode = getattr(codec, "batch_decode", None)
+        if callable(batch_decode):
+            try:
+                if self._active_request_id is not None:
+                    self._suspend_active_streaming()
+                codes_btc = batch_codes.permute(1, 2, 0).contiguous()
+                padding_mask = (
+                    torch.arange(batch_codes.shape[-1], device=self.device)[None, :]
+                    < batch_lengths[:, None]
+                )
+                decode_result = batch_decode(codes_btc, padding_mask=padding_mask)
+                wavs = self._extract_audio_list(decode_result, len(valid_indices))
+                for slot, wav in zip(valid_indices, wavs):
+                    results[slot] = wav
+                if not self._logged_stateless_batch_decode:
+                    logger.info(
+                        "[MossTTS Decoder] Enabled public batched stateless CAT decode: batch=%d",
+                        len(valid_indices),
+                    )
+                    self._logged_stateless_batch_decode = True
+                return results
+            except Exception as exc:
+                logger.debug(
+                    "[MossTTS Decoder] Public batch_decode failed; trying _decode_frame. Error: %s",
+                    exc,
+                    exc_info=True,
+                )
+                self._suspend_active_streaming()
+
         decode_frame = getattr(codec, "_decode_frame", None)
         if not callable(decode_frame):
             self._batch_stateless_decode_failed = True
@@ -900,15 +952,16 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
                 for info in runtime_additional_information:
                     if not isinstance(info, dict):
                         continue
-                    req_id = info.get("request_id")
+                    req_id = _runtime_request_id(info)
                     fin = info.get("finished")
                     if isinstance(fin, torch.Tensor):
                         fin = bool(fin.item())
                     if req_id and fin:
                         self._exit_streaming(req_id)
+            n = len(runtime_additional_information) if runtime_additional_information else 1
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={"model_outputs": [empty]},
+                multimodal_outputs={"model_outputs": [empty] * n},
             )
 
         # Skip decode during CUDA graph capture
@@ -935,7 +988,7 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
             request_ids = []
             finished_flags = []
             for info in runtime_additional_information:
-                request_ids.append(info.get("request_id") if isinstance(info, dict) else None)
+                request_ids.append(_runtime_request_id(info) if isinstance(info, dict) else None)
                 fin = info.get("finished") if isinstance(info, dict) else None
                 if isinstance(fin, torch.Tensor):
                     fin = bool(fin.item())

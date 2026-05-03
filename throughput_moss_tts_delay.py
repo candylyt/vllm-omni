@@ -58,8 +58,9 @@ USER_INST_TEMPLATE = """\
 
 
 def build_tts_prompt(text, model_path):
+    model_ref = os.path.abspath(model_path) if os.path.exists(model_path) else model_path
     tokenizer = AutoTokenizer.from_pretrained(
-        os.path.abspath(model_path), trust_remote_code=True
+        model_ref, trust_remote_code=True
     )
 
     content = (

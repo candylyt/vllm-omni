@@ -95,9 +95,15 @@ def _codes_to_flat_list(codes: Any, n_vq: int) -> list[int] | None:
     return codes.tolist()
 
 
-def _make_finished_sentinel() -> dict[str, Any]:
+def _make_finished_sentinel(request_id: str | None = None) -> dict[str, Any]:
     """Minimal payload signalling Stage 1 to end the request."""
-    return {"code_predictor_codes": [], "finished": torch.tensor(True, dtype=torch.bool)}
+    payload: dict[str, Any] = {
+        "code_predictor_codes": [],
+        "finished": torch.tensor(True, dtype=torch.bool),
+    }
+    if request_id is not None:
+        payload["request_id"] = request_id
+    return payload
 
 
 def _has_no_codes(codes: Any) -> bool:
@@ -433,6 +439,7 @@ def llm2decoder_async_chunk(
         "code_flat_numel": numel,
         "codec_chunk_frames": chunk_size,
         "left_context_size": 0,  # MOSS has no delay pattern → no left context
+        "request_id": request_id,
         "finished": torch.tensor(is_finished, dtype=torch.bool),
     }
 
@@ -444,11 +451,11 @@ def _flush_remaining(
 ) -> dict[str, Any]:
     """Flush any leftover codes when the request finishes mid-chunk."""
     if request_id is None:
-        return _make_finished_sentinel()
+        return _make_finished_sentinel(request_id)
 
     accumulated = transfer_manager.code_prompt_token_ids.get(request_id, [])
     if not accumulated:
-        return _make_finished_sentinel()
+        return _make_finished_sentinel(request_id)
 
     flat = [code for frame in accumulated for code in frame]
     numel = len(flat)
@@ -550,7 +557,7 @@ def llm2decoder_delay_async_chunk(
 
     if n_steps == 0:
         if is_finished:
-            return _make_finished_sentinel()
+            return _make_finished_sentinel(request_id)
         return None
 
     # ── De-delay all accumulated rows → valid frame-major codes ──────────
@@ -566,12 +573,12 @@ def llm2decoder_delay_async_chunk(
             row_tensors.append(entry.to(torch.long).reshape(-1))
     if not row_tensors:
         if is_finished:
-            return _make_finished_sentinel()
+            return _make_finished_sentinel(request_id)
         return None
     row_tensors = [r for r in row_tensors if r.numel() == row_tensors[0].numel()]
     if not row_tensors:
         if is_finished:
-            return _make_finished_sentinel()
+            return _make_finished_sentinel(request_id)
         return None
     _pad_codes = getattr(transfer_manager, "_moss_tts_delay_audio_pad_code", {}) or {}
     audio_pad_code = int(_pad_codes.get(request_id, _DEFAULT_AUDIO_PAD_CODE))
@@ -593,7 +600,7 @@ def llm2decoder_delay_async_chunk(
             _delay_sent.pop(request_id, None)
             if hasattr(transfer_manager, "_moss_tts_delay_audio_pad_code"):
                 transfer_manager._moss_tts_delay_audio_pad_code.pop(request_id, None)
-            return _make_finished_sentinel()
+            return _make_finished_sentinel(request_id)
         return None
 
     if not is_finished and n_new < chunk_size:

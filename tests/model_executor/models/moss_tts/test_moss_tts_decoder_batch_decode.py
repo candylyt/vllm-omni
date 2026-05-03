@@ -82,6 +82,83 @@ def test_stateless_batch_decode_uses_one_codec_forward_for_multiple_requests():
     model._codec.decode.assert_not_called()
 
 
+def test_forward_empty_runtime_info_returns_one_empty_per_request():
+    model, _ = _minimal_decoder_model(_fake_decode_frame)
+
+    out = MossTTSDecoderModel.forward(
+        model,
+        input_ids=torch.empty(0, dtype=torch.long),
+        runtime_additional_information=[
+            {"req_id": "r0", "finished": torch.tensor(False, dtype=torch.bool)},
+            {"req_id": "r1", "finished": torch.tensor(False, dtype=torch.bool)},
+        ],
+    )
+
+    audios = out.multimodal_outputs["model_outputs"]
+    assert len(audios) == 2
+    assert all(audio.numel() == 0 for audio in audios)
+
+
+def test_forward_uses_req_id_fallback_for_finished_cleanup():
+    model, _ = _minimal_decoder_model(_fake_decode_frame)
+    model._streaming_states = {"rid": {0: {"cache": torch.zeros(1, 2)}}}
+
+    MossTTSDecoderModel.forward(
+        model,
+        input_ids=torch.empty(0, dtype=torch.long),
+        runtime_additional_information=[
+            {"req_id": "rid", "finished": torch.tensor(True, dtype=torch.bool)},
+        ],
+    )
+
+    assert "rid" not in model._streaming_states
+
+
+def test_all_zero_codes_are_decoded_not_dropped():
+    model, codec = _minimal_decoder_model(_fake_decode_frame)
+    inputs = [
+        torch.zeros(2 * _N_VQ, dtype=torch.long),
+        _flat_codes(2, offset=100),
+    ]
+
+    out = MossTTSDecoderModel._batch_decode(model, inputs)
+
+    codec._decode_frame.assert_called_once()
+    packed_codes, lengths = codec._decode_frame.call_args[0]
+    assert torch.equal(packed_codes[:, 0, :], torch.zeros(_N_VQ, 2, dtype=torch.long))
+    assert lengths.tolist() == [2, 2]
+    assert len(out) == 2
+    assert out[0].shape == (2 * _SAMPLES_PER_FRAME,)
+    assert out[1].shape == (2 * _SAMPLES_PER_FRAME,)
+
+
+def test_stateless_batch_decode_prefers_public_batch_decode():
+    model, codec = _minimal_decoder_model(_fake_decode_frame)
+
+    def batch_decode(codes_btc: torch.Tensor, padding_mask: torch.Tensor | None = None):
+        assert codes_btc.shape == (2, 4, _N_VQ)
+        assert padding_mask is not None
+        assert padding_mask.tolist() == [
+            [True, True, False, False],
+            [True, True, True, True],
+        ]
+        return [
+            torch.full((2 * _SAMPLES_PER_FRAME,), 1.0),
+            torch.full((4 * _SAMPLES_PER_FRAME,), 2.0),
+        ]
+
+    codec.batch_decode = Mock(side_effect=batch_decode)
+    inputs = [_flat_codes(2), _flat_codes(4, offset=100)]
+
+    out = MossTTSDecoderModel._batch_decode(model, inputs)
+
+    codec.batch_decode.assert_called_once()
+    codec._decode_frame.assert_not_called()
+    assert len(out) == 2
+    assert torch.equal(out[0], torch.full((2 * _SAMPLES_PER_FRAME,), 1.0))
+    assert torch.equal(out[1], torch.full((4 * _SAMPLES_PER_FRAME,), 2.0))
+
+
 def test_streaming_batch_decode_stacks_and_splits_request_states():
     module = SimpleNamespace(_streaming_state=None)
 
