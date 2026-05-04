@@ -11,9 +11,9 @@ Usage:
     --output-dir ./throughput_results_vllm_local
 """
 
+import wandb
 import argparse
 import copy
-import json
 import os
 import tempfile
 import time
@@ -30,11 +30,14 @@ from vllm_omni.entrypoints.omni import Omni
 from uni_functions import build_tts_prompt, get_stop_ids
 
 
+
+
 FIXED_TEXT  = "The weather is so nice today and the birds are singing in the trees."
 BATCH_SIZES = [1, 4, 8, 16, 64, 128, 256]
 N_REPEATS   = 1
 MAX_AR_TOKENS = 200
 INIT_SLEEP_S  = 30
+
 
 #generate yaml config for models to set max num seqs which is batch size and also can set gpu mem and max batched tokens
 def make_yaml(base_yaml_path, max_num_seqs, gpu_mem_stage0=None, gpu_mem_stage1=None, max_num_batched_tokens=None):
@@ -74,12 +77,12 @@ def make_yaml(base_yaml_path, max_num_seqs, gpu_mem_stage0=None, gpu_mem_stage1=
 
 
 
-def run_batch(model, repo, mode, bs, prompt, ar_params, decoder_params, init_sleep, output_dir, gpu_mem_stage0=None, gpu_mem_stage1=None, max_num_batched_tokens=None):
+def run_batch(model, repo, mode, bs, prompt, ar_params, decoder_params, init_sleep, gpu_mem_stage0=None, gpu_mem_stage1=None, max_num_batched_tokens=None):
     yaml = "moss_tts_async.yaml" if mode == "async" else "moss_tts.yaml"
     baseYAML = os.path.join(repo, f"vllm_omni/model_executor/stage_configs/{yaml}")
     pathYAML = make_yaml(baseYAML, max_num_seqs=bs, gpu_mem_stage0=gpu_mem_stage0, gpu_mem_stage1=gpu_mem_stage1, max_num_batched_tokens=max_num_batched_tokens)
 
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
     omni = Omni(model=model, stage_configs_path=pathYAML, init_sleep_seconds=init_sleep)
     prompts = [copy.deepcopy({"prompt": prompt}) for _ in range(bs)]
 
@@ -88,7 +91,7 @@ def run_batch(model, repo, mode, bs, prompt, ar_params, decoder_params, init_sle
     wall = time.perf_counter() - t0
 
     audioTotal = 0.0
-    idx = 0
+
 
     # calc total audio duration and save wavs for all samples in the batch
     for stage in omniOut:
@@ -108,8 +111,6 @@ def run_batch(model, repo, mode, bs, prompt, ar_params, decoder_params, init_sle
         # compute audio duration and accumulate total audio duration for the batch. 24000 is the sample rate for moss
         audioTotal += len(audioNP) / 24000
 
-        sf.write(os.path.join(output_dir, f"sample_{idx:03d}.wav"), audioNP, samplerate=24000)
-        idx += 1
 
     # cleanup the current omni instance and yaml file to free GPU memory before the next batch
     del omni
@@ -121,8 +122,12 @@ def run_batch(model, repo, mode, bs, prompt, ar_params, decoder_params, init_sle
 
 
 def run_benchmark(args):
-    out = Path(args.output_dir)
-    out.mkdir(parents=True, exist_ok=True)
+
+    #initialize the wandbrun
+    wandbRun = wandb.init(project="hpml-final-project", name= "vllm-local-throughput", 
+                        config={"model": "vllm-local", "fixed_text": FIXED_TEXT,  "max_ar_tokens": MAX_AR_TOKENS,
+                                "batch_sizes": BATCH_SIZES,
+                                "n_repeats": N_REPEATS})
 
     # build prompts and sampling params
     prompt = build_tts_prompt(FIXED_TEXT, args.model)
@@ -134,11 +139,11 @@ def run_benchmark(args):
     print(f"  Mode: {args.mode.upper()}")
     print(f"  Text: \"{FIXED_TEXT[:55]}...\"")
     print("\n\n")
-    print(f"  {'BS':>4}  {'wall(s)':>10}  {'audio(s)':>10}  {'tput(a/s)':>10}  {'speedup':>8}  {'status':>8}")
+    print(f"  {'BS':>4}  {'wall(s)':>10}  {'audio(s)':>10}  {'tput(a/s)':>10}  {'speedup':>8}")
     print(f"  {'─'*4}  {'─'*10}  {'─'*10}  {'─'*10}  {'─'*8}  {'─'*8}")
 
     # for each batch size and num of repeats run the benchmark and collect results for wall time, total audio duration, and throughput (audio duration / wall time)
-    res = []
+
     tp0 = None
 
     for bs in BATCH_SIZES:
@@ -146,7 +151,7 @@ def run_benchmark(args):
 
         for _ in range(N_REPEATS):
             wall, audio = run_batch(model=args.model, repo=args.repo, mode=args.mode, bs=bs, prompt=prompt, ar_params=ar_params, decoder_params=decoder_params,
-                                    init_sleep=args.init_sleep_seconds, output_dir=str(out / f"raw_bs{bs}"), gpu_mem_stage0=args.gpu_mem_stage0, gpu_mem_stage1=args.gpu_mem_stage1, max_num_batched_tokens=args.max_num_batched_tokens)
+                                    init_sleep=args.init_sleep_seconds, gpu_mem_stage0=args.gpu_mem_stage0, gpu_mem_stage1=args.gpu_mem_stage1, max_num_batched_tokens=args.max_num_batched_tokens)
 
             tp = audio / wall if wall > 0 else 0
             walls.append(wall); audios.append(audio); tps.append(tp)
@@ -161,22 +166,19 @@ def run_benchmark(args):
 
         speedup = tp / tp0 if tp0 > 0 else 1.0
 
-        res.append({"bs": bs, "wall_s": meanWall, "audio_s": meanAudio, "throughput_audio_per_s": tp, "speedup": speedup})
-        
+        wandbRun.log({"bs": bs, "wall_s": meanWall, "audio_s": meanAudio, "throughput_audio_per_s": tp, "speedup": speedup})
+
         print(f"{bs:>4} {meanWall:>10.2f} {meanAudio:>10.2f} {tp:>10.3f} {speedup:>7.2f}x")
 
-    # save results to json file
-    with open(out / "tp_results.json", "w") as f:
-        json.dump({"mode": args.mode, "model": "vllm-local", "fixed_text": FIXED_TEXT, "max_ar_tokens": MAX_AR_TOKENS,"results": res}, f, indent=2)
 
-    return res
+    wandbRun.finish()
+
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True)
     p.add_argument("--repo", required=True)
     p.add_argument("--mode", default="async", choices=["async", "sync"])
-    p.add_argument("--output-dir", default="./throughput_results_vllm_local")
     p.add_argument("--init-sleep-seconds", type=int, default=INIT_SLEEP_S)
     p.add_argument("--batch-sizes", nargs="+", type=int, default=[1, 2, 4])
     p.add_argument("--gpu-mem-stage0", type=float, default=None)
@@ -185,6 +187,8 @@ def main():
     args = p.parse_args()
     
     global BATCH_SIZES
+
+
 
     BATCH_SIZES = args.batch_sizes
     os.environ["VLLM_LOGGING_LEVEL"] = os.environ.get("VLLM_LOGGING_LEVEL", "WARNING")

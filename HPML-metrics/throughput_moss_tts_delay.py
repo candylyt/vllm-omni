@@ -10,6 +10,7 @@ Usage:
     --repo   ${REPO} \
     --output-dir ./throughput_results_vllm_delay
 """
+import wandb
 
 import argparse
 import copy
@@ -179,6 +180,18 @@ def run_benchmark(args):
         detokenize=False,
     )
 
+    wandbRun = wandb.init(
+        project="hpml-final-project",
+        name=f"moss-tts-delay-{args.mode}-throughput",
+        config={
+            "model": "moss-tts-delay",
+            "mode": args.mode,
+            "fixed_text": FIXED_TEXT,
+            "max_ar_tokens": MAX_AR_TOKENS,
+            "max_decoder_tokens": MAX_DECODER_TOKENS,
+            "batch_sizes": BATCH_SIZES,
+            "n_repeats": N_REPEATS})
+
     print(f"  Model: MOSS-TTS-DELAY")
     print(f"  Mode: {args.mode.upper()}")
     print(f"  Text: \"{FIXED_TEXT[:55]}...\"")
@@ -235,20 +248,9 @@ def run_benchmark(args):
         )
 
         print(f"{bs:>4} {mean_wall:>10.2f} {mean_audio:>10.2f} {tp:>10.3f} {speedup:>7.2f}x")
+        wandbRun.log({"batch_size": bs, "wall_s": mean_wall, "audio_s": mean_audio, "throughput_audio_per_s": tp, "speedup": speedup})
 
-    with open(out / "tp_results.json", "w") as f:
-        json.dump(
-            {
-                "mode": args.mode,
-                "model": "vllm-delay",
-                "fixed_text": FIXED_TEXT,
-                "max_ar_tokens": MAX_AR_TOKENS,
-                "max_decoder_tokens": MAX_DECODER_TOKENS,
-                "results": res,
-            },
-            f,
-            indent=2,
-        )
+    wandbRun.finish()
 
     return res
 

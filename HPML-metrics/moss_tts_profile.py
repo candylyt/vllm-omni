@@ -22,6 +22,7 @@ Usage:
     --max-words   60 \
     --output-dir  ./profiling_results
 """
+import wandb
 
 import argparse
 import json
@@ -157,6 +158,9 @@ def profile_mode(mode, sentences, model, repo, output_base, init_sleep, mtype):
     ar_stop_ids = get_stop_ids(model)
     ar_params = None
 
+    wandbRun = wandb.init(project="hpml-final-project", name= f"vllm-local-inference-profile-{mode}", 
+                          config={"model": model, "mode": mode})
+
     # set sampling params for AR stage for model
     if mtype == "delay":
         ar_params = SamplingParams(temperature=1.5, top_p=1.0, top_k=50, max_tokens=900, seed=42, repetition_penalty=1.0)
@@ -169,7 +173,7 @@ def profile_mode(mode, sentences, model, repo, output_base, init_sleep, mtype):
     omni.model = model
 
     # collect res for each sample
-    res = []
+
     n = len(sentences)
 
     for i, text in enumerate(sentences):
@@ -180,12 +184,12 @@ def profile_mode(mode, sentences, model, repo, output_base, init_sleep, mtype):
 
         if run["ok"]:
             print(f"RTF={run['rtf']:.3f}  dur={run['audio_dur_s']:.2f}s fcl={run['first_chunk_latency_s']:.2f}s")
+            wandbRun.log({"text": text, "rtf": run["rtf"], "audio_dur_s": run["audio_dur_s"], "first_chunk_latency_s": run["first_chunk_latency_s"], "num_chunks": run["num_chunks"]})
         else:
             print(f"Oopsies!  {run['error'][:60]}")
 
-        res.append(run)
-
-    return res
+    
+    wandbRun.finish()
 
 def main():
     p = argparse.ArgumentParser(description="Profile MOSS-TTS via Omni")
@@ -208,30 +212,9 @@ def main():
 
     sentences = get_wikitext_sentences(args.min_words, args.max_words, args.n)
 
-    resTotal = {}
-
     for mode in args.modes:
-        results = profile_mode(mode=mode, sentences=sentences, model=args.model,  repo=args.repo, output_base=out, init_sleep=args.init_sleep_seconds, mtype=args.model_type)
-
-        resTotal[mode] = results
-        raw_path = out / f"results_{mode}.json"
-
-        with open(raw_path, "w") as f:
-            json.dump(results, f, indent=2)
-
-    summary = {mode: {"mode": mode,
-                      "n": len(res),
-                      "rtf": float(np.mean([r["rtf"] for r in res])),
-                      "total_time_s": float(np.mean([r["total_time_s"] for r in res])),
-                      "first_chunk_latency_s": float(np.mean([r["first_chunk_latency_s"] for r in res])),
-                      "audio_dur_s": float(np.mean([r["audio_dur_s"] for r in res])),
-                      "num_chunks": float(np.mean([r["num_chunks"] for r in res]))} 
-                    for mode, res in resTotal.items()}
-
-    with open(out / "summary.json", "w") as f:
-        json.dump(summary, f, indent=2)
-
-    print(json.dumps(summary, indent=2))
+        profile_mode(mode=mode, sentences=sentences, model=args.model,  
+                     repo=args.repo, output_base=out, init_sleep=args.init_sleep_seconds, mtype=args.model_type)
 
 
 if __name__ == "__main__":
