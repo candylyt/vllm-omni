@@ -97,7 +97,7 @@ def main():
     p.add_argument("--record-shapes", choices=["True", "False"], default="False")
     p.add_argument("--with-flops", choices=["True", "False"], default="False")
     p.add_argument("--with-mem", choices=["True", "False"], default="False")
-    p.add_argument("--use-gzip", choices=["True", "False"], default="False")
+    p.add_argument("--use-gzip", choices=["True", "False"], default="True")
     p.add_argument("--with-stack", choices=["True", "False"], default="False")
     p.add_argument("--warmup", type=int, default=1)
     p.add_argument("--samples", type=int, default=None)
