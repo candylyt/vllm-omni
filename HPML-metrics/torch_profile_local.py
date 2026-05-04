@@ -8,10 +8,10 @@ Usage:
     --repo        ${REPO} \
     --mode        async \
     --trace-dir   ./profiler_traces \
-    --samples     5 \
+    --samples     3 \
     --warmup      2 \
-    --delay-iterations   20 \
-    --active-iterations  30
+    --delay-iterations   2 \
+    --active-iterations  5
 
   # open res in https://ui.perfetto.dev
 """
