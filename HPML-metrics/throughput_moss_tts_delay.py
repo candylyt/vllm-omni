@@ -124,29 +124,27 @@ def run_batch(
     prompts = [copy.deepcopy({"prompt": prompt}) for _ in range(bs)]
 
     t0 = time.perf_counter()
-    omni_out = omni.generate(prompts, [ar_params, decoder_params])
+    omniOut = omni.generate(prompts, [ar_params, decoder_params])
     wall = time.perf_counter() - t0
 
-    audio_total = 0.0
+    audioDur = 0.0
     idx = 0
 
-    for stage in omni_out:
+    for stage in omniOut:
         if stage.final_output_type != "audio":
             continue
 
-        audio_tensor = stage.request_output.outputs[0].multimodal_output["audio"]
-        if audio_tensor is None:
-            continue
+        audioTensor = stage.request_output.outputs[0].multimodal_output["audio"]
 
-        if isinstance(audio_tensor, list):
-            audio_tensor = torch.cat(audio_tensor, dim=0)
+        if isinstance(audioTensor, list):
+            audioTensor = torch.cat(audioTensor, dim=0)
 
-        audio_np = audio_tensor.float().detach().cpu().numpy().flatten()
-        audio_total += len(audio_np) / 24000
+        audioNP = audioTensor.float().detach().cpu().numpy().flatten()
+        audioDur += len(audioNP) / 24000
 
         sf.write(
             os.path.join(output_dir, f"sample_{idx:03d}.wav"),
-            audio_np,
+            audioNP,
             samplerate=24000,
         )
         idx += 1
@@ -155,7 +153,7 @@ def run_batch(
     os.unlink(path_yaml)
     torch.cuda.empty_cache()
 
-    return wall, audio_total
+    return wall, audioDur
 
 
 def run_benchmark(args):
