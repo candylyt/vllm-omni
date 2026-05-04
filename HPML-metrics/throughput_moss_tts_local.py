@@ -153,7 +153,7 @@ def run_benchmark(args):
             wall, audio = run_batch(model=args.model, repo=args.repo, mode=args.mode, bs=bs, prompt=prompt, ar_params=ar_params, decoder_params=decoder_params,
                                     init_sleep=args.init_sleep_seconds, gpu_mem_stage0=args.gpu_mem_stage0, gpu_mem_stage1=args.gpu_mem_stage1, max_num_batched_tokens=args.max_num_batched_tokens)
 
-            tp = audio / wall if wall > 0 else 0
+            tp = audio / wall
             walls.append(wall); audios.append(audio); tps.append(tp)
 
         meanWall = float(np.mean(walls))

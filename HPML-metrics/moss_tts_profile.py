@@ -103,7 +103,7 @@ def run_one_sample(omni, ar_params, decoder_params, text, first_chunk_dir, outpu
 
     # compute audio duration and RTF. 24000 is the sample rate for moss
     audioDur = len(audioNP) / 24000
-    rtf = totalTime / audioDur if audioDur > 0 else float("inf")
+    rtf = totalTime / audioDur
 
     wavPath = os.path.join(output_dir, f"sample_{sample_idx:03d}.wav")
     sf.write(wavPath, audioNP, samplerate=24000)
