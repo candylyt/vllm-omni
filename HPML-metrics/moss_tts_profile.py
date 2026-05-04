@@ -80,8 +80,9 @@ def run_one_sample(omni, ar_params, decoder_params, text, first_chunk_dir, outpu
         if stage.final_output_type != "audio":
             continue
 
-        audioTensor = stage.request_output.outputs[0].multimodal_output["audio"]
-        
+        output = stage.request_output
+        request_id = output.request_id
+        audioTensor = output.outputs[0].multimodal_output["audio"]
         numChunks = 1
 
         if isinstance(audioTensor, list):
