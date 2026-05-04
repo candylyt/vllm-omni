@@ -26,6 +26,7 @@ import yaml
 from transformers import AutoTokenizer
 from vllm import SamplingParams
 from vllm_omni.entrypoints.omni import Omni
+from uni_functions import build_tts_prompt
 
 
 FIXED_TEXT = "The weather is so nice today and the birds are singing in the trees."
@@ -34,39 +35,6 @@ N_REPEATS = 1
 MAX_AR_TOKENS = 900
 MAX_DECODER_TOKENS = 32768
 INIT_SLEEP_S = 30
-
-
-USER_INST_TEMPLATE = """\
-<user_inst>
-- Reference(s):
-{reference}
-- Instruction:
-{instruction}
-- Tokens:
-{tokens}
-- Quality:
-{quality}
-- Sound Event:
-{sound_event}
-- Ambient Sound:
-{ambient_sound}
-- Language:
-{language}
-- Text:
-{text}
-</user_inst>"""
-
-
-# make prompt based on Moss TTS template
-def build_tts_prompt(text, model_path):
-    tokenizer = AutoTokenizer.from_pretrained(os.path.abspath(model_path), trust_remote_code=True)
-
-    content = USER_INST_TEMPLATE.format(reference="None", instruction="None",  tokens="None", 
-                                        quality="None", sound_event="None", ambient_sound="None", language="None", text=str(text))
-    
-    prompt = tokenizer.apply_chat_template([{"role": "user", "content": content}], tokenize=False, add_generation_prompt=True)
-
-    return prompt + "<|audio_start|>"
 
 
 def make_yaml(

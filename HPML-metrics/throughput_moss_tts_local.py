@@ -27,6 +27,7 @@ from vllm import SamplingParams
 from transformers import AutoTokenizer, AutoConfig
 from vllm import SamplingParams
 from vllm_omni.entrypoints.omni import Omni
+from uni_functions import build_tts_prompt, get_stop_ids
 
 
 FIXED_TEXT  = "The weather is so nice today and the birds are singing in the trees."
@@ -34,57 +35,6 @@ BATCH_SIZES = [1, 4, 8, 16, 64, 128, 256]
 N_REPEATS   = 1
 MAX_AR_TOKENS = 200
 INIT_SLEEP_S  = 30
-
-
-USER_INST_TEMPLATE = """\
-<user_inst>
-- Reference(s):
-{reference}
-- Instruction:
-{instruction}
-- Tokens:
-{tokens}
-- Quality:
-{quality}
-- Sound Event:
-{sound_event}
-- Ambient Sound:
-{ambient_sound}
-- Language:
-{language}
-- Text:
-{text}
-</user_inst>"""
-
-# make prompt based on Moss TTS template
-def build_tts_prompt(text, model_path):
-    tokenizer = AutoTokenizer.from_pretrained(os.path.abspath(model_path), trust_remote_code=True)
-
-    content = USER_INST_TEMPLATE.format(reference="None", instruction="None",  tokens="None", 
-                                        quality="None", sound_event="None", ambient_sound="None", language="None", text=str(text))
-    
-    prompt = tokenizer.apply_chat_template([{"role": "user", "content": content}], tokenize=False, add_generation_prompt=True)
-
-    return prompt + "<|audio_start|>"
-
-# get stop ids for decoding from model config. audio end token and/or eos token
-def resolve_stop_ids(model_path):
-    cfg = AutoConfig.from_pretrained(os.path.abspath(model_path), trust_remote_code=True)
-    
-    audio_end_id = getattr(cfg, "audio_end_token_id", None)
-    eos_id = getattr(cfg, "eos_token_id", None)
-    
-    if isinstance(eos_id, list):
-        eos_ids = eos_id
-        
-    elif eos_id is not None:
-        eos_ids = [eos_id]
-
-    else:
-        eos_ids = []
-
-    return list(dict.fromkeys(([audio_end_id] if audio_end_id is not None else []) + eos_ids))
-
 
 #generate yaml config for models to set max num seqs which is batch size and also can set gpu mem and max batched tokens
 def make_yaml(base_yaml_path, max_num_seqs, gpu_mem_stage0=None, gpu_mem_stage1=None, max_num_batched_tokens=None):
@@ -176,7 +126,7 @@ def run_benchmark(args):
 
     # build prompts and sampling params
     prompt = build_tts_prompt(FIXED_TEXT, args.model)
-    ar_stop_ids = resolve_stop_ids(args.model)
+    ar_stop_ids = get_stop_ids(args.model)
 
     ar_params = SamplingParams(temperature=0.6, top_p=0.95, top_k=50, max_tokens=MAX_AR_TOKENS, seed=42, stop_token_ids=ar_stop_ids if ar_stop_ids else None)
     decoder_params = SamplingParams(temperature=0.0, top_p=1.0, top_k=-1, max_tokens=18192, seed=42, detokenize=False)
