@@ -341,7 +341,7 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         is_finished : bool — if True, streaming state is released after this call
         Returns     : [samples]   float32  (empty tensor if codes are invalid)
         """
-        empty = torch.zeros(0, dtype=torch.float32, device=self.device)
+        empty = torch.zeros(0, dtype=torch.float32)
 
         with record_function("stage1/decode_one_request"), _TIMER.gpu("stage1/decode_one_request"):
             if flat_codes is None or flat_codes.numel() == 0:
@@ -380,7 +380,7 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
 
                 if wav is not None and wav.numel() > 0:
                     self._record_first_chunk(request_id)
-                return wav.to(self.device)
+                return wav
             except Exception as exc:
                 logger.error("[MossTTS Decoder] Codec decode failed: %s", exc, exc_info=True)
                 if request_id and is_finished:
@@ -395,7 +395,7 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         finished_flags: Optional[list[bool]] = None,
     ) -> list[torch.Tensor]:
         """Decode multiple requests, using per-request streaming state when available."""
-        empty = torch.zeros(0, dtype=torch.float32, device=self.device)
+        empty = torch.zeros(0, dtype=torch.float32)
         results: list[torch.Tensor] = []
         for i, req_codes in enumerate(request_codes_list):
             req_id = request_ids[i] if request_ids else None
@@ -424,7 +424,7 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
                 )
 
             code_tensor = codes if codes is not None else input_ids
-            empty       = torch.zeros(0, dtype=torch.float32, device=self.device)
+            empty       = torch.zeros(0, dtype=torch.float32)
 
             with record_function("stage1/extract_codes"), _TIMER.cpu("stage1/extract_codes"):
                 # Async-chunk path: when input_ids is empty/None but codes were
@@ -573,7 +573,7 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
     def make_omni_output(self, model_output: Any, **kwargs) -> OmniOutput:
         if isinstance(model_output, OmniOutput):
             return model_output
-        empty = torch.zeros(0, dtype=torch.float32, device=self.device)
+        empty = torch.zeros(0, dtype=torch.float32)
         if model_output is None:
             return OmniOutput(
                 text_hidden_states=None,
