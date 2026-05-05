@@ -108,6 +108,21 @@ class MossTTSLocalTransformerWrapper(nn.Module):
     weight shapes match the original checkpoint exactly.  The local transformer
     has NO positional embeddings and NO token embeddings — it only processes
     input_embeds of shape (B, t, local_hidden_size).
+
+    KV-cache support
+    ----------------
+    Forward accepts an optional ``past_key_values`` argument and an optional
+    ``use_cache`` flag.  When either is set, the wrapper threads them through
+    to the underlying HF model and returns ``(hidden_states, past_key_values)``
+    so callers can reuse the K/V across successive single-token forwards.
+    When neither is set, the wrapper preserves the original behaviour and
+    returns ``(hidden_states, None)`` — call sites that don't care about the
+    cache can simply ignore the second element.
+
+    The HF MossTTSLocalTransformer is loaded via trust_remote_code, so we
+    detect whether its forward signature supports the cache kwargs at init
+    time and store the result on ``self.supports_kv_cache``.  Older variants
+    that lack the kwargs fall back to the recompute path automatically.
     """
 
     def __init__(self, local_qwen3_config, model_path: str | None = None):
@@ -129,13 +144,66 @@ class MossTTSLocalTransformerWrapper(nn.Module):
             )
         self.transformer = MossTTSLocalTransformer(local_qwen3_config)
 
-    def forward(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
+        # One-time capability probe: does the underlying transformer's forward
+        # accept past_key_values + use_cache?  Modern HF Qwen3-style models do;
+        # if not, _local_forward will fall back to the legacy recompute path.
+        import inspect
+        try:
+            sig_params = inspect.signature(self.transformer.forward).parameters
+            self.supports_kv_cache: bool = (
+                "past_key_values" in sig_params and "use_cache" in sig_params
+            )
+        except (TypeError, ValueError):
+            self.supports_kv_cache = False
+
+        if self.supports_kv_cache:
+            logger.info(
+                "[MossTTS Local] Local transformer supports KV cache — "
+                "incremental decoding enabled."
+            )
+        else:
+            logger.warning(
+                "[MossTTS Local] Local transformer forward does not accept "
+                "past_key_values/use_cache; falling back to recompute path."
+            )
+
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        past_key_values: Any = None,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, Any]:
         """
-        inputs_embeds : (B, t, local_hidden)   t grows from 1 to n_vq+1
-        Returns       : (B, t, local_hidden)
+        Run one forward pass through the local transformer.
+
+        Two calling conventions:
+
+        * Recompute (legacy)
+            ``forward(inputs_embeds=[B, t, D])`` with t ≥ 1.
+            Returns ``(hidden_states[B, t, D], None)``.
+
+        * Incremental (KV cache)
+            ``forward(inputs_embeds=[B, 1, D], past_key_values=prev_kv,
+                      use_cache=True)``.
+            Returns ``(hidden_states[B, 1, D], new_past_key_values)`` where
+            ``new_past_key_values`` is the cache after appending this token.
+
+        If the underlying HF model does not advertise cache support
+        (``self.supports_kv_cache is False``) the cache kwargs are silently
+        dropped and the call behaves like the recompute path — callers can
+        always pass them and the second tuple element will simply be ``None``.
         """
+        want_cache = use_cache or past_key_values is not None
+        if want_cache and self.supports_kv_cache:
+            out = self.transformer(
+                input_ids=None,
+                inputs_embeds=inputs_embeds,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            return out.last_hidden_state, out.past_key_values
         out = self.transformer(input_ids=None, inputs_embeds=inputs_embeds)
-        return out.last_hidden_state
+        return out.last_hidden_state, None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -535,6 +603,22 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         an internal sample on channel 0. This keeps the local transformer's
         per-channel context in sync with what the next decode step will see.
 
+        KV-cache fast path
+        ------------------
+        When the wrapped transformer advertises ``supports_kv_cache=True``
+        (the common case on modern HF Qwen3-based remote code), we feed only
+        the new token at each iteration and let the transformer's incremental
+        cache hold prior K/V.  This collapses the per-frame attention cost
+        from O(channels²) to O(channels): for n_vq=32, ~17× fewer attended
+        token-positions across the 33-channel loop.  When the wrapper falls
+        back to recompute, the original growing-context path is taken so
+        behaviour is preserved exactly.
+
+        The KV cache is local to one frame (one ``_local_forward`` call) and
+        is discarded on return — there is no inter-frame dependency for the
+        local transformer; the global Qwen3 backbone provides cross-frame
+        context.
+
         Returns
         -------
         audio_codes : Tensor [B, n_vq]   (long)  predicted RVQ codes
@@ -547,20 +631,35 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
 
         # Project global hidden state → first local transformer input
         current_proj = self.speech_embedding_to_local_mlp(global_hidden)  # [B, local_D]
-        local_ctx    = torch.zeros(B, 0, local_dim, device=dev, dtype=dtype)
+
+        use_cache_path = self.local_transformer.supports_kv_cache
+        # Cache-mode state: incremental K/V across the 33-channel loop.
+        past_kv: Any = None
+        # Recompute-mode state: growing local context (only used in fallback).
+        local_ctx: torch.Tensor | None = (
+            None
+            if use_cache_path
+            else torch.zeros(B, 0, local_dim, device=dev, dtype=dtype)
+        )
 
         audio_codes: list[torch.Tensor] = []
         text_logits: torch.Tensor | None = None
 
         for ch in range(self.channels):   # ch = 0 (text), 1..32 (audio)
-            # Grow local context by one token
-            local_ctx = torch.cat(
-                [local_ctx, current_proj.unsqueeze(1)], dim=1
-            )  # [B, ch+1, local_D]
-
-            # Local transformer forward (no positional embeddings, no KV cache)
-            local_out = self.local_transformer(local_ctx)   # [B, ch+1, local_D]
-            last_h    = local_out[:, -1, :]                 # [B, local_D]
+            if use_cache_path:
+                # Incremental path: feed only the new token, reuse past K/V.
+                new_input = current_proj.unsqueeze(1)              # [B, 1, local_D]
+                local_out, past_kv = self.local_transformer(
+                    new_input, past_key_values=past_kv, use_cache=True,
+                )                                                  # [B, 1, local_D]
+                last_h = local_out[:, 0, :]                        # [B, local_D]
+            else:
+                # Legacy recompute path: full re-forward over growing context.
+                local_ctx = torch.cat(
+                    [local_ctx, current_proj.unsqueeze(1)], dim=1
+                )                                                  # [B, ch+1, local_D]
+                local_out, _ = self.local_transformer(local_ctx)   # [B, ch+1, local_D]
+                last_h = local_out[:, -1, :]                       # [B, local_D]
 
             # Per-channel projection + norm + LM head → logits
             proj_out = self.local_to_speech_embedding_mlps[ch](last_h)  # [B, D_global]
