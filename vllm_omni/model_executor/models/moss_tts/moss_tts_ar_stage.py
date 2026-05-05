@@ -173,18 +173,28 @@ class MossTTSLocalTransformerWrapper(nn.Module):
             self._has_position_ids = False
             self._has_cache_position = False
 
-        # Env-var kill switch.  Set MOSS_TTS_LOCAL_KV_CACHE=0 to force the
-        # legacy recompute path even when the model advertises cache support.
-        # Useful while debugging correctness regressions.
+        # Env-var opt-in.  KV cache is OFF by default after we discovered
+        # that the custom MossTTSLocalTransformer's forward produces
+        # different outputs when use_cache=True even on the first call —
+        # the kwargs are accepted but the semantics diverge from the plain
+        # path.  Set MOSS_TTS_LOCAL_KV_CACHE=1 to enable, but only after
+        # the init-time probe (below) confirms equivalence.
         import os
-        kv_env = os.environ.get("MOSS_TTS_LOCAL_KV_CACHE", "1")
-        kv_disabled_by_env = kv_env == "0"
-        if kv_disabled_by_env and self.supports_kv_cache:
-            logger.warning(
-                "[MossTTS Local] KV cache forcibly DISABLED via "
-                "MOSS_TTS_LOCAL_KV_CACHE=0 — using legacy recompute path."
+        kv_env = os.environ.get("MOSS_TTS_LOCAL_KV_CACHE", "0")  # default OFF
+        kv_enabled_by_env = kv_env == "1"
+        if not kv_enabled_by_env and self.supports_kv_cache:
+            logger.info(
+                "[MossTTS Local] KV cache available but DISABLED by default — "
+                "set MOSS_TTS_LOCAL_KV_CACHE=1 to enable.  Run the init-time "
+                "probe (logged below) to verify equivalence first."
             )
             self.supports_kv_cache = False
+        elif kv_enabled_by_env and not self.supports_kv_cache:
+            logger.warning(
+                "[MossTTS Local] MOSS_TTS_LOCAL_KV_CACHE=1 but the model's "
+                "forward does not accept past_key_values/use_cache — staying "
+                "on legacy recompute path."
+            )
 
         # Verify mode: when MOSS_TTS_LOCAL_KV_CACHE_VERIFY=1, _local_forward
         # runs both paths on the same input and warns if outputs diverge
@@ -196,18 +206,140 @@ class MossTTSLocalTransformerWrapper(nn.Module):
 
         if self.supports_kv_cache:
             logger.info(
-                "[MossTTS Local] Local transformer supports KV cache — "
-                "incremental decoding enabled.  position_ids=%s, "
+                "[MossTTS Local] KV cache enabled.  position_ids=%s, "
                 "cache_position=%s, verify=%s",
                 self._has_position_ids,
                 self._has_cache_position,
                 self._verify_kv_cache,
             )
-        else:
+
+        # Always run the equivalence probe at init — both to inform the user
+        # whether enabling the cache would be safe, and to surface the issue
+        # early if they have it enabled.
+        self._probe_kv_cache_equivalence()
+
+    @torch.no_grad()
+    def _probe_kv_cache_equivalence(self) -> None:
+        """Test several kwarg combinations against a plain forward call.
+
+        Goal: find a set of kwargs where calling the local transformer with
+        ``inputs_embeds=[B, 1, D]`` plus the kwargs returns the same hidden
+        state as calling it with ``inputs_embeds=[B, 1, D]`` alone.  If at
+        least one combination matches to within float tolerance, the KV
+        cache path can be made equivalent to recompute and is safe to use.
+        If every combination diverges, the model fundamentally produces
+        different outputs under cache mode — the optimization can't be
+        fixed at the wrapper level and would require changes inside the
+        custom remote-code transformer itself.
+
+        Runs once at engine init.  Cheap (~milliseconds on a tiny synthetic
+        input) and always logged so the user has a definitive answer.
+        """
+        if not self._has_past_kv and not self._has_use_cache:
+            return  # Model can't accept any cache kwargs — nothing to probe
+
+        try:
+            params = list(self.transformer.parameters())
+            if not params:
+                logger.info("[MossTTS Local] KV-cache probe skipped (no params).")
+                return
+            device = params[0].device
+            dtype = params[0].dtype
+
+            # Hidden size from the local config.
+            D = getattr(
+                self.transformer.config, "hidden_size",
+                getattr(self.transformer.config, "local_hidden_size", None),
+            )
+            if D is None:
+                logger.info("[MossTTS Local] KV-cache probe skipped (hidden_size unknown).")
+                return
+
+            B, t = 1, 1
+            torch.manual_seed(0)
+            test_input = torch.randn(B, t, D, device=device, dtype=dtype)
+
+            # Reference: plain forward, no cache kwargs at all.
+            ref = self.transformer(
+                input_ids=None, inputs_embeds=test_input
+            ).last_hidden_state
+
+            # Helper to build a kwargs dict given which extras to include.
+            def build(use_cache: bool, with_past: bool,
+                      with_position_ids: bool, with_cache_position: bool) -> dict:
+                kw: dict[str, Any] = {}
+                if with_past and self._has_past_kv:
+                    kw["past_key_values"] = None
+                if use_cache and self._has_use_cache:
+                    kw["use_cache"] = True
+                if with_position_ids and self._has_position_ids:
+                    kw["position_ids"] = torch.zeros(B, t, device=device, dtype=torch.long)
+                if with_cache_position and self._has_cache_position:
+                    kw["cache_position"] = torch.zeros(t, device=device, dtype=torch.long)
+                return kw
+
+            # Probe matrix: each entry is (label, kwargs).  The first one
+            # exactly matches the no-cache reference (so should always be
+            # zero).  Each subsequent variant adds one cache-related kwarg.
+            variants = [
+                ("baseline (no cache args)", {}),
+                ("use_cache only",
+                    build(use_cache=True, with_past=False,
+                          with_position_ids=False, with_cache_position=False)),
+                ("past_key_values=None only",
+                    build(use_cache=False, with_past=True,
+                          with_position_ids=False, with_cache_position=False)),
+                ("past_key_values + use_cache",
+                    build(use_cache=True, with_past=True,
+                          with_position_ids=False, with_cache_position=False)),
+                ("+ position_ids",
+                    build(use_cache=True, with_past=True,
+                          with_position_ids=True, with_cache_position=False)),
+                ("+ cache_position",
+                    build(use_cache=True, with_past=True,
+                          with_position_ids=False, with_cache_position=True)),
+                ("+ both positions",
+                    build(use_cache=True, with_past=True,
+                          with_position_ids=True, with_cache_position=True)),
+            ]
+
+            logger.info(
+                "[MossTTS Local] KV-cache equivalence probe "
+                "(max_abs vs plain forward(inputs_embeds)):"
+            )
+            best_label = None
+            best_max_abs = float("inf")
+            for label, kw in variants:
+                try:
+                    out = self.transformer(
+                        input_ids=None, inputs_embeds=test_input, **kw
+                    ).last_hidden_state
+                    max_abs = (out - ref).abs().max().item()
+                    logger.info(
+                        "[MossTTS Local]   variant=%-30s max_abs=%.6e", label, max_abs
+                    )
+                    if max_abs < best_max_abs:
+                        best_max_abs = max_abs
+                        best_label = label
+                except Exception as e:
+                    logger.info(
+                        "[MossTTS Local]   variant=%-30s FAILED: %s", label, e
+                    )
+
+            verdict = (
+                "PASS — KV cache can be made equivalent (safe to enable)"
+                if best_max_abs < 1e-3
+                else "FAIL — no kwarg combination matches the plain forward; "
+                     "do NOT enable KV cache without modifying the local model"
+            )
+            logger.info(
+                "[MossTTS Local] KV-cache probe verdict: %s "
+                "(best=%s, max_abs=%.6e)",
+                verdict, best_label, best_max_abs,
+            )
+        except Exception as e:
             logger.warning(
-                "[MossTTS Local] Local transformer forward does not accept "
-                "past_key_values/use_cache (or KV cache disabled by env); "
-                "falling back to recompute path."
+                "[MossTTS Local] KV-cache probe could not run: %s", e
             )
 
     @staticmethod
