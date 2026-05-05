@@ -58,6 +58,7 @@ from typing import Any, Optional
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.profiler import record_function
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models import SupportsPP
@@ -66,7 +67,12 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.model_executor.models.moss_tts._stage0_timing import get_timer
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+
+# Per-process Stage-0 timer.  No-op unless MOSS_TTS_TIMING=1 is set in env.
+# See _stage0_timing.py for the helper API and report format.
+_TIMER = get_timer()
 
 logger = logging.getLogger(__name__)
 
@@ -646,54 +652,62 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         text_logits: torch.Tensor | None = None
 
         for ch in range(self.channels):   # ch = 0 (text), 1..32 (audio)
-            if use_cache_path:
-                # Incremental path: feed only the new token, reuse past K/V.
-                new_input = current_proj.unsqueeze(1)              # [B, 1, local_D]
-                local_out, past_kv = self.local_transformer(
-                    new_input, past_key_values=past_kv, use_cache=True,
-                )                                                  # [B, 1, local_D]
-                last_h = local_out[:, 0, :]                        # [B, local_D]
-            else:
-                # Legacy recompute path: full re-forward over growing context.
-                local_ctx = torch.cat(
-                    [local_ctx, current_proj.unsqueeze(1)], dim=1
-                )                                                  # [B, ch+1, local_D]
-                local_out, _ = self.local_transformer(local_ctx)   # [B, ch+1, local_D]
-                last_h = local_out[:, -1, :]                       # [B, local_D]
+            with record_function(f"local/ch_{ch:02d}_transformer"), \
+                 _TIMER.gpu("local/transformer_per_ch"):
+                if use_cache_path:
+                    # Incremental path: feed only the new token, reuse past K/V.
+                    new_input = current_proj.unsqueeze(1)              # [B, 1, local_D]
+                    local_out, past_kv = self.local_transformer(
+                        new_input, past_key_values=past_kv, use_cache=True,
+                    )                                                  # [B, 1, local_D]
+                    last_h = local_out[:, 0, :]                        # [B, local_D]
+                else:
+                    # Legacy recompute path: full re-forward over growing context.
+                    local_ctx = torch.cat(
+                        [local_ctx, current_proj.unsqueeze(1)], dim=1
+                    )                                                  # [B, ch+1, local_D]
+                    local_out, _ = self.local_transformer(local_ctx)   # [B, ch+1, local_D]
+                    last_h = local_out[:, -1, :]                       # [B, local_D]
 
             # Per-channel projection + norm + LM head → logits
-            proj_out = self.local_to_speech_embedding_mlps[ch](last_h)  # [B, D_global]
-            normed   = self.layer_norm_before_lm_heads[ch](proj_out)     # [B, D_global]
-            logits   = self.lm_heads[ch](normed)                         # [B, V]
+            with record_function(f"local/ch_{ch:02d}_head"), \
+                 _TIMER.gpu("local/proj_norm_head_per_ch"):
+                proj_out = self.local_to_speech_embedding_mlps[ch](last_h)  # [B, D_global]
+                normed   = self.layer_norm_before_lm_heads[ch](proj_out)     # [B, D_global]
+                logits   = self.lm_heads[ch](normed)                         # [B, V]
 
-            if ch == 0:
-                # Capture channel-0 logits for vllm's sampler. Defer the
-                # actual sampling to `compute_logits` so the user's
-                # SamplingParams (temp/top-k/top-p, masking) take effect.
-                # Use the forced text token (gen_slot) to drive the next
-                # local step's input — matches what vllm will append to the
-                # global stream after sampling.
-                text_logits = logits
-                next_token = torch.full(
-                    (B,), forced_text_token_id, dtype=torch.long, device=dev,
-                )
-            else:
-                # Audio channel: prevent the pad code from being sampled.
-                logits[:, self.audio_pad_code] = float("-inf")
-                if temperature > 0.0:
-                    logits = logits / temperature
-                    if top_k > 0:
-                        top_k_vals = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1).values
-                        logits[logits < top_k_vals[..., -1:]] = float("-inf")
-                    probs      = torch.softmax(logits, dim=-1)
-                    next_token = torch.multinomial(probs, num_samples=1).squeeze(1)  # [B]
+            with record_function(f"local/ch_{ch:02d}_sample"), \
+                 _TIMER.gpu("local/sample_per_ch"):
+                if ch == 0:
+                    # Capture channel-0 logits for vllm's sampler. Defer the
+                    # actual sampling to `compute_logits` so the user's
+                    # SamplingParams (temp/top-k/top-p, masking) take effect.
+                    # Use the forced text token (gen_slot) to drive the next
+                    # local step's input — matches what vllm will append to the
+                    # global stream after sampling.
+                    text_logits = logits
+                    next_token = torch.full(
+                        (B,), forced_text_token_id, dtype=torch.long, device=dev,
+                    )
                 else:
-                    next_token = logits.argmax(dim=-1)  # [B]
-                audio_codes.append(next_token)
+                    # Audio channel: prevent the pad code from being sampled.
+                    logits[:, self.audio_pad_code] = float("-inf")
+                    if temperature > 0.0:
+                        logits = logits / temperature
+                        if top_k > 0:
+                            top_k_vals = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1).values
+                            logits[logits < top_k_vals[..., -1:]] = float("-inf")
+                        probs      = torch.softmax(logits, dim=-1)
+                        next_token = torch.multinomial(probs, num_samples=1).squeeze(1)  # [B]
+                    else:
+                        next_token = logits.argmax(dim=-1)  # [B]
+                    audio_codes.append(next_token)
 
             # Re-embed sampled token → next local step's input
-            emb          = self.embedding_list[ch](next_token)             # [B, D_global]
-            current_proj = self.speech_embedding_to_local_mlp(emb)        # [B, local_D]
+            with record_function(f"local/ch_{ch:02d}_embed"), \
+                 _TIMER.gpu("local/embed_next_per_ch"):
+                emb          = self.embedding_list[ch](next_token)             # [B, D_global]
+                current_proj = self.speech_embedding_to_local_mlp(emb)        # [B, local_D]
 
         # Stack: [B, n_vq]
         if audio_codes:
@@ -753,6 +767,8 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         self._request_states.clear()
         self._last_request_ids = []
         self._last_seq_lens = []
+        # Drop warmup samples so the post-warmup report is clean.
+        _TIMER.reset()
 
     # ══════════════════════════════════════════════════════════════════
     #  Forward
@@ -768,94 +784,104 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         inputs_embeds: Optional[torch.Tensor]          = None,
         **kwargs,
     ) -> OmniOutput:
-        # ── 0. Derive per-request schedule info from vLLM forward context ─
-        request_ids, seq_lens_per_req, decode_positions = self._extract_request_info(
-            kwargs.get("runtime_additional_information"),
-        )
+        with record_function("stage0/forward"), _TIMER.gpu("stage0/forward_total"):
+            # ── 0. Derive per-request schedule info from vLLM forward context ─
+            with record_function("stage0/extract_info"), _TIMER.cpu("stage0/extract_info"):
+                request_ids, seq_lens_per_req, decode_positions = self._extract_request_info(
+                    kwargs.get("runtime_additional_information"),
+                )
 
-        # Reset per-step text-logit cache. Populated below by `_local_forward`
-        # for any audio-mode decode positions, then consumed by `compute_logits`.
-        self._pending_text_logits = {}
+            # Reset per-step text-logit cache. Populated below by `_local_forward`
+            # for any audio-mode decode positions, then consumed by `compute_logits`.
+            self._pending_text_logits = {}
 
-        # ── 1. Per-request FSM bookkeeping ────────────────────────────
-        decode_states: list[MossTTSLocalRequestState] = []
-        if request_ids and seq_lens_per_req and input_ids is not None:
-            decode_positions, decode_states = self._prepare_request_states(
-                input_ids=input_ids,
-                request_ids=request_ids,
-                seq_lens=seq_lens_per_req,
+            # ── 1. Per-request FSM bookkeeping ────────────────────────────
+            with record_function("stage0/fsm_prep"), _TIMER.cpu("stage0/fsm_prep"):
+                decode_states: list[MossTTSLocalRequestState] = []
+                if request_ids and seq_lens_per_req and input_ids is not None:
+                    decode_positions, decode_states = self._prepare_request_states(
+                        input_ids=input_ids,
+                        request_ids=request_ids,
+                        seq_lens=seq_lens_per_req,
+                    )
+
+            # ── 2. Build embeddings (multi-channel) ───────────────────────
+            with record_function("stage0/embed"), _TIMER.gpu("stage0/embed"):
+                if inputs_embeds is None and input_ids is not None:
+                    inputs_embeds = self.embed_input_ids(
+                        input_ids,
+                        multimodal_embeddings=kwargs.get("multimodal_embeddings"),
+                        request_ids=request_ids if request_ids else None,
+                        seq_lens=seq_lens_per_req if seq_lens_per_req else None,
+                    )
+
+            # ── 3. Global Qwen3 backbone ──────────────────────────────────
+            with record_function("stage0/backbone"), _TIMER.gpu("stage0/backbone"):
+                hidden_states = self.backbone(
+                    input_ids=None,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                )  # [L, D_global]
+
+            # ── 4. Local transformer — only for decode steps in audio mode ─
+            # Outside of audio mode the local transformer's output is garbage
+            # for our purposes (downstream Stage 1 would treat it as audio codes).
+            # Restrict execution to FSM positions that are currently `is_audio`.
+            multimodal_outputs: dict[str, Any] = {}
+
+            if decode_positions and decode_states and not torch.cuda.is_current_stream_capturing():
+                audio_mask = [s.is_audio for s in decode_states]
+                audio_positions = [
+                    p for p, m in zip(decode_positions, audio_mask) if m
+                ]
+                audio_states = [s for s, m in zip(decode_states, audio_mask) if m]
+                decode_request_ids = [
+                    r for r, sl in zip(request_ids, seq_lens_per_req) if sl == 1
+                ]
+                audio_request_ids = [
+                    r for r, m in zip(decode_request_ids, audio_mask) if m
+                ]
+
+                if audio_positions:
+                    pos_t = torch.tensor(audio_positions, device=hidden_states.device)
+                    decode_hidden = hidden_states[pos_t]  # [B_audio, D_global]
+
+                    with record_function("stage0/local_forward"), _TIMER.gpu("stage0/local_forward"):
+                        codes, text_logits = self._local_forward(
+                            decode_hidden,
+                            forced_text_token_id=self.gen_slot_id,
+                            temperature=kwargs.get("audio_temperature", 1.0),
+                            top_k=kwargs.get("audio_top_k", 50),
+                            top_p=kwargs.get("audio_top_p", 0.95),
+                        )  # [B_audio, n_vq], [B_audio, V_text]
+
+                    with record_function("stage0/store_codes"), _TIMER.gpu("stage0/store_codes"):
+                        # Cache codes per-request for the NEXT decode step's
+                        # multi-channel embedding contribution.  Note: this
+                        # currently performs a GPU→CPU sync per request (see
+                        # store_next_audio_row); look for the spike in this
+                        # phase to confirm the known overhead.
+                        for state, row in zip(audio_states, codes):
+                            state.store_next_audio_row(row)
+
+                        # Cache channel-0 text logits so `compute_logits` can return
+                        # the local-pipeline-processed distribution rather than
+                        # reapplying lm_heads[0] to the raw global hidden state.
+                        for req_id, tl in zip(audio_request_ids, text_logits):
+                            self._pending_text_logits[req_id] = tl
+
+                    # Shape convention: [B_audio, 1, n_vq, 1]
+                    B = codes.shape[0]
+                    multimodal_outputs = {
+                        "code_predictor_codes": codes.reshape(B, 1, self.n_vq, 1),
+                        "audio_pad_code": self.audio_pad_code,
+                    }
+
+            return OmniOutput(
+                text_hidden_states=hidden_states,
+                multimodal_outputs=multimodal_outputs,
             )
-
-        # ── 2. Build embeddings (multi-channel) ───────────────────────
-        if inputs_embeds is None and input_ids is not None:
-            inputs_embeds = self.embed_input_ids(
-                input_ids,
-                multimodal_embeddings=kwargs.get("multimodal_embeddings"),
-                request_ids=request_ids if request_ids else None,
-                seq_lens=seq_lens_per_req if seq_lens_per_req else None,
-            )
-
-        # ── 3. Global Qwen3 backbone ──────────────────────────────────
-        hidden_states = self.backbone(
-            input_ids=None,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-        )  # [L, D_global]
-
-        # ── 4. Local transformer — only for decode steps in audio mode ─
-        # Outside of audio mode the local transformer's output is garbage
-        # for our purposes (downstream Stage 1 would treat it as audio codes).
-        # Restrict execution to FSM positions that are currently `is_audio`.
-        multimodal_outputs: dict[str, Any] = {}
-
-        if decode_positions and decode_states and not torch.cuda.is_current_stream_capturing():
-            audio_mask = [s.is_audio for s in decode_states]
-            audio_positions = [
-                p for p, m in zip(decode_positions, audio_mask) if m
-            ]
-            audio_states = [s for s, m in zip(decode_states, audio_mask) if m]
-            decode_request_ids = [
-                r for r, sl in zip(request_ids, seq_lens_per_req) if sl == 1
-            ]
-            audio_request_ids = [
-                r for r, m in zip(decode_request_ids, audio_mask) if m
-            ]
-
-            if audio_positions:
-                pos_t = torch.tensor(audio_positions, device=hidden_states.device)
-                decode_hidden = hidden_states[pos_t]  # [B_audio, D_global]
-
-                codes, text_logits = self._local_forward(
-                    decode_hidden,
-                    forced_text_token_id=self.gen_slot_id,
-                    temperature=kwargs.get("audio_temperature", 1.0),
-                    top_k=kwargs.get("audio_top_k", 50),
-                    top_p=kwargs.get("audio_top_p", 0.95),
-                )  # [B_audio, n_vq], [B_audio, V_text]
-
-                # Cache codes per-request for the NEXT decode step's
-                # multi-channel embedding contribution.
-                for state, row in zip(audio_states, codes):
-                    state.store_next_audio_row(row)
-
-                # Cache channel-0 text logits so `compute_logits` can return
-                # the local-pipeline-processed distribution rather than
-                # reapplying lm_heads[0] to the raw global hidden state.
-                for req_id, tl in zip(audio_request_ids, text_logits):
-                    self._pending_text_logits[req_id] = tl
-
-                # Shape convention: [B_audio, 1, n_vq, 1]
-                B = codes.shape[0]
-                multimodal_outputs = {
-                    "code_predictor_codes": codes.reshape(B, 1, self.n_vq, 1),
-                    "audio_pad_code": self.audio_pad_code,
-                }
-
-        return OmniOutput(
-            text_hidden_states=hidden_states,
-            multimodal_outputs=multimodal_outputs,
-        )
 
     # ══════════════════════════════════════════════════════════════════
     #  vllm model protocol
@@ -899,43 +925,44 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
             "continue" and "stop" using the corrected logits.
           - Outside audio mode → mask audio-control tokens.
         """
-        logits = self.lm_heads[0](hidden_states)   # [L, vocab_size]
-        if not self._last_request_ids:
-            return logits
+        with record_function("stage0/compute_logits"), _TIMER.gpu("stage0/compute_logits"):
+            logits = self.lm_heads[0](hidden_states)   # [L, vocab_size]
+            if not self._last_request_ids:
+                return logits
 
-        neg_inf = float("-inf")
-        for row_idx, request_id in enumerate(self._last_request_ids):
-            if row_idx >= logits.shape[0]:
-                break
-            state = self._request_states.get(request_id)
-            if state is None:
-                continue
+            neg_inf = float("-inf")
+            for row_idx, request_id in enumerate(self._last_request_ids):
+                if row_idx >= logits.shape[0]:
+                    break
+                state = self._request_states.get(request_id)
+                if state is None:
+                    continue
 
-            # Substitute local-pipeline text logits when available.
-            cached_tl = self._pending_text_logits.get(request_id)
-            if cached_tl is not None:
-                logits[row_idx] = cached_tl.to(logits.dtype)
+                # Substitute local-pipeline text logits when available.
+                cached_tl = self._pending_text_logits.get(request_id)
+                if cached_tl is not None:
+                    logits[row_idx] = cached_tl.to(logits.dtype)
 
-            row = logits[row_idx]
+                row = logits[row_idx]
 
-            if state.is_audio:
-                if state.audio_steps_generated < self.MIN_AUDIO_FRAMES:
-                    keep = row[self.gen_slot_id].clone()
-                    row.fill_(neg_inf)
-                    row[self.gen_slot_id] = keep
+                if state.is_audio:
+                    if state.audio_steps_generated < self.MIN_AUDIO_FRAMES:
+                        keep = row[self.gen_slot_id].clone()
+                        row.fill_(neg_inf)
+                        row[self.gen_slot_id] = keep
+                    else:
+                        gen_keep = row[self.gen_slot_id].clone()
+                        end_keep = row[self.audio_end_id].clone()
+                        row.fill_(neg_inf)
+                        row[self.gen_slot_id]  = gen_keep
+                        row[self.audio_end_id] = end_keep
                 else:
-                    gen_keep = row[self.gen_slot_id].clone()
-                    end_keep = row[self.audio_end_id].clone()
-                    row.fill_(neg_inf)
-                    row[self.gen_slot_id]  = gen_keep
-                    row[self.audio_end_id] = end_keep
-            else:
-                if self.pad_token_id >= 0:
-                    row[self.pad_token_id] = neg_inf
-                row[self.gen_slot_id]  = neg_inf
-                row[self.audio_end_id] = neg_inf
+                    if self.pad_token_id >= 0:
+                        row[self.pad_token_id] = neg_inf
+                    row[self.gen_slot_id]  = neg_inf
+                    row[self.audio_end_id] = neg_inf
 
-        return logits
+            return logits
 
     def sample(
         self,
