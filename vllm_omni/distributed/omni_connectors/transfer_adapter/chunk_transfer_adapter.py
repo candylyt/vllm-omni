@@ -281,6 +281,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.request_payload.pop(external_req_id, None)
         self.code_prompt_token_ids.pop(external_req_id, None)
 
+        # Some async processors keep bounded per-request state outside the
+        # generic code_prompt_token_ids buffer.
+        for attr in (
+            "_moss_tts_delay_async_states",
+            "_moss_tts_delay_audio_pad_code",
+            "_delay_frames_sent",
+        ):
+            cache = getattr(self, attr, None)
+            if isinstance(cache, dict):
+                cache.pop(external_req_id, None)
+
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:
             cached_ic.pop(external_req_id, None)

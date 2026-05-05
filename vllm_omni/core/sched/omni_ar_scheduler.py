@@ -26,6 +26,10 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 
 logger = init_logger(__name__)
 
+_MOSS_TTS_DELAY_ASYNC_PROCESSOR = (
+    "vllm_omni.model_executor.stage_input_processors.moss_tts.llm2decoder_delay_async_chunk"
+)
+
 
 @dataclass
 class KVCacheTransferData:
@@ -68,6 +72,10 @@ class OmniARScheduler(VLLMScheduler):
         self.chunk_transfer_adapter = None
         if getattr(model_config, "async_chunk", False):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
+        self._suppress_pooling_output_to_client = (
+            getattr(model_config, "custom_process_next_stage_input_func", None)
+            == _MOSS_TTS_DELAY_ASYNC_PROCESSOR
+        )
 
     def _get_kv_transfer_criteria(self) -> dict | None:
         # Note: vllm_config is available in Scheduler after super().__init__
@@ -351,7 +359,18 @@ class OmniARScheduler(VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids or pooler_output is not None or kv_transfer_params or stopped:
+            client_pooler_output = None if self._suppress_pooling_output_to_client else pooler_output
+            should_transfer_chunk = self.chunk_transfer_adapter is not None and (
+                pooler_output is not None or stopped
+            )
+            should_emit_output = (
+                bool(new_token_ids)
+                or client_pooler_output is not None
+                or bool(kv_transfer_params)
+                or stopped
+            )
+
+            if should_emit_output:
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(
@@ -360,7 +379,7 @@ class OmniARScheduler(VLLMScheduler):
                         finish_reason=finish_reason,
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
-                        pooling_output=pooler_output,
+                        pooling_output=client_pooler_output,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
                         kv_transfer_params=kv_transfer_params,
@@ -371,9 +390,9 @@ class OmniARScheduler(VLLMScheduler):
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )
-                if self.chunk_transfer_adapter is not None:
-                    self.chunk_transfer_adapter.save_async(pooler_output, request)
-            else:
+            if should_transfer_chunk:
+                self.chunk_transfer_adapter.save_async(pooler_output, request)
+            if not should_emit_output:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
 

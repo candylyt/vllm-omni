@@ -37,10 +37,13 @@ def _make_request_output(codes, *, audio_pad_code=1024, request_id="rid"):
     )
 
 
-def _make_transfer_manager(*, chunk_frames=2):
+def _make_transfer_manager(*, chunk_frames=2, initial_chunk_frames=None):
+    extra = {"codec_chunk_frames": chunk_frames}
+    if initial_chunk_frames is not None:
+        extra["initial_codec_chunk_frames"] = initial_chunk_frames
     return SimpleNamespace(
         code_prompt_token_ids=defaultdict(list),
-        connector=SimpleNamespace(config={"extra": {"codec_chunk_frames": chunk_frames}}),
+        connector=SimpleNamespace(config={"extra": extra}),
     )
 
 
@@ -166,6 +169,10 @@ def test_llm2decoder_delay_async_chunk_flushes_only_new_dedelayed_frames():
     assert payloads[3]["code_flat_numel"] == 6
     assert payloads[3]["finished"] == torch.tensor(False, dtype=torch.bool)
     assert payloads[4] is None
+    state = tm._moss_tts_delay_async_states["rid"]
+    assert state.next_emit_frame == 3
+    assert [row.tolist() for row in state.pending_chunk] == [[30, 31, 32]]
+    assert state.restored_rows == {}
 
     final_payload = llm2decoder_delay_async_chunk(
         tm,
@@ -179,6 +186,7 @@ def test_llm2decoder_delay_async_chunk_flushes_only_new_dedelayed_frames():
     assert final_payload["request_id"] == "rid"
     assert final_payload["finished"] == torch.tensor(True, dtype=torch.bool)
     assert getattr(tm, "_delay_frames_sent", {}) == {}
+    assert getattr(tm, "_moss_tts_delay_async_states", {}) == {}
     assert getattr(tm, "_moss_tts_delay_audio_pad_code", {}) == {}
 
 
@@ -217,6 +225,82 @@ def test_llm2decoder_delay_async_final_sentinel_includes_request_id_with_no_rema
     assert final_payload["code_predictor_codes"] == []
     assert final_payload["request_id"] == "rid"
     assert final_payload["finished"] == torch.tensor(True, dtype=torch.bool)
+
+
+def test_llm2decoder_delay_async_skips_stale_incomplete_frames():
+    pad = 99
+    tm = _make_transfer_manager(chunk_frames=1)
+    req = _make_request("rid")
+
+    payloads = []
+    for row in [
+        [10, pad, pad],
+        [20, pad, pad],
+        [30, 21, 12],
+        [pad, 31, 22],
+    ]:
+        payloads.append(
+            llm2decoder_delay_async_chunk(
+                tm,
+                {"code_predictor_codes": torch.tensor(row), "audio_pad_code": pad},
+                req,
+                is_finished=False,
+            )
+        )
+
+    assert payloads[:3] == [None, None, None]
+    assert payloads[3] is not None
+    assert payloads[3]["code_predictor_codes"] == [20, 21, 22]
+    state = tm._moss_tts_delay_async_states["rid"]
+    assert state.next_emit_frame == 2
+    assert 0 not in state.restored_rows
+
+
+def test_llm2decoder_delay_async_uses_small_initial_then_larger_chunks():
+    pad = 99
+    tm = _make_transfer_manager(chunk_frames=4, initial_chunk_frames=1)
+    req = _make_request("rid")
+    delay_rows = [
+        [10, pad, pad],
+        [20, 11, pad],
+        [30, 21, 12],
+        [40, 31, 22],
+        [50, 41, 32],
+        [pad, 51, 42],
+        [pad, pad, 52],
+    ]
+
+    payloads = [
+        llm2decoder_delay_async_chunk(
+            tm,
+            {"code_predictor_codes": torch.tensor(row), "audio_pad_code": pad},
+            req,
+            is_finished=False,
+        )
+        for row in delay_rows
+    ]
+
+    assert payloads[:2] == [None, None]
+    assert payloads[2] is not None
+    assert payloads[2]["code_predictor_codes"] == [10, 11, 12]
+    assert payloads[2]["codec_chunk_frames"] == 1
+    assert payloads[3:6] == [None, None, None]
+    assert payloads[6] is not None
+    assert payloads[6]["codec_chunk_frames"] == 4
+    assert payloads[6]["code_predictor_codes"] == [
+        20,
+        21,
+        22,
+        30,
+        31,
+        32,
+        40,
+        41,
+        42,
+        50,
+        51,
+        52,
+    ]
 
 
 def test_llm2decoder_delay_rejects_empty_engine_input_source():

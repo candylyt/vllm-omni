@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -46,6 +47,120 @@ logger = logging.getLogger(__name__)
 _DEFAULT_CHUNK_FRAMES = 3
 _DEFAULT_CONTEXT_FRAMES = 3
 _DEFAULT_AUDIO_PAD_CODE = 1024
+_DEFAULT_INITIAL_CHUNK_FRAMES = 0
+
+
+@dataclass
+class _DelayAsyncRequestState:
+    """Incremental inverse-delay state for one streaming request.
+
+    The delay model emits delayed[t, q].  We immediately place each code into
+    restored[t - q, q], then keep only incomplete restored rows plus completed
+    rows that are waiting for the next Stage-1 chunk.
+    """
+
+    n_vq: int
+    audio_pad_code: int
+    step: int = 0
+    next_emit_frame: int = 0
+    max_frame_seen: int = -1
+    frames_flushed: int = 0
+    pending_chunk: list[torch.Tensor] = field(default_factory=list)
+    _capacity: int = field(init=False)
+    _rows: torch.Tensor = field(init=False)
+    _filled_counts: torch.Tensor = field(init=False)
+    _frame_ids: torch.Tensor = field(init=False)
+    _vq_positions: torch.Tensor = field(init=False)
+
+    def __post_init__(self) -> None:
+        self._capacity = max(2 * self.n_vq + 2, 4)
+        self._rows = torch.full(
+            (self._capacity, self.n_vq),
+            self.audio_pad_code,
+            dtype=torch.long,
+        )
+        self._filled_counts = torch.zeros(self._capacity, dtype=torch.long)
+        self._frame_ids = torch.full((self._capacity,), -1, dtype=torch.long)
+        self._vq_positions = torch.arange(self.n_vq, dtype=torch.long)
+
+    @property
+    def restored_rows(self) -> dict[int, list[int]]:
+        active = torch.nonzero(self._frame_ids >= 0, as_tuple=False).flatten()
+        return {
+            int(self._frame_ids[slot].item()): self._rows[slot].tolist()
+            for slot in active.tolist()
+        }
+
+    def _clear_slot(self, slot: int) -> None:
+        self._rows[slot].fill_(self.audio_pad_code)
+        self._filled_counts[slot] = 0
+        self._frame_ids[slot] = -1
+
+    def append_delay_row(self, row: torch.Tensor, audio_pad_code: int) -> bool:
+        row = row.detach().to(device="cpu", dtype=torch.long).reshape(-1)
+        if row.numel() != self.n_vq:
+            logger.debug(
+                "[MossTTS Delay async] Ignoring row with %d codes; expected n_vq=%d",
+                row.numel(),
+                self.n_vq,
+            )
+            self.step += 1
+            return False
+
+        self.audio_pad_code = int(audio_pad_code)
+        delayed_step = self.step
+        self.step += 1
+
+        frame_idxs = delayed_step - self._vq_positions
+        valid = (frame_idxs >= 0) & (row != self.audio_pad_code)
+        if valid.any():
+            frames = frame_idxs[valid]
+            channels = self._vq_positions[valid]
+            codes = row[valid]
+            slots = torch.remainder(frames, self._capacity).to(torch.long)
+
+            new_slots = self._frame_ids[slots] != frames
+            if new_slots.any():
+                init_slots = slots[new_slots]
+                self._rows[init_slots] = self.audio_pad_code
+                self._filled_counts[init_slots] = 0
+                self._frame_ids[init_slots] = frames[new_slots]
+
+            was_empty = self._rows[slots, channels] == self.audio_pad_code
+            self._rows[slots, channels] = codes
+            self._filled_counts[slots] += was_empty.to(dtype=torch.long)
+            self.max_frame_seen = max(self.max_frame_seen, int(frames.max().item()))
+
+        self.drain_available(final=False)
+        return True
+
+    def drain_available(self, *, final: bool) -> None:
+        """Move complete restored rows into pending_chunk in frame order."""
+        while True:
+            slot = self.next_emit_frame % self._capacity
+            slot_frame = int(self._frame_ids[slot].item())
+            has_slot = slot_frame == self.next_emit_frame
+            filled = int(self._filled_counts[slot].item()) if has_slot else 0
+
+            if has_slot and filled == self.n_vq:
+                self.pending_chunk.append(self._rows[slot].clone())
+                self._clear_slot(slot)
+                self.next_emit_frame += 1
+                continue
+
+            # Once all q positions for a frame have had their chance to arrive,
+            # an incomplete row can never become valid.  This matches the sync
+            # path's "drop any restored row containing pad" rule.
+            stale = self.step >= self.next_emit_frame + self.n_vq
+            if final:
+                stale = self.next_emit_frame <= self.max_frame_seen
+            if stale:
+                if has_slot:
+                    self._clear_slot(slot)
+                self.next_emit_frame += 1
+                continue
+
+            break
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -121,6 +236,18 @@ def _has_no_codes(codes: Any) -> bool:
     return False
 
 
+def _async_delay_chunk_size(cfg: dict[str, Any], state: _DelayAsyncRequestState) -> int:
+    steady_chunk = int(cfg.get("codec_chunk_frames", _DEFAULT_CHUNK_FRAMES))
+    initial_chunk = cfg.get(
+        "initial_codec_chunk_frames",
+        cfg.get("codec_chunk_frames_at_begin", _DEFAULT_INITIAL_CHUNK_FRAMES),
+    )
+    initial_chunk = int(initial_chunk or 0)
+    if state.frames_flushed == 0 and initial_chunk > 0:
+        return initial_chunk
+    return steady_chunk
+
+
 def _as_int(value: Any, default: int) -> int:
     if value is None:
         return default
@@ -180,10 +307,14 @@ def _apply_de_delay_pattern(
     total_steps, n_vq = codes.shape
     restored = torch.full_like(codes, fill_value=audio_pad_code)
 
-    for ch_idx in range(n_vq):
-        n_elems = total_steps - ch_idx
-        if n_elems > 0:
-            restored[:n_elems, ch_idx] = codes[ch_idx : ch_idx + n_elems, ch_idx]
+    frame_idx = torch.arange(total_steps, device=codes.device).unsqueeze(1)
+    ch_idx = torch.arange(n_vq, device=codes.device).unsqueeze(0)
+    src_steps = frame_idx + ch_idx
+    valid = src_steps < total_steps
+    restored[valid] = codes[
+        src_steps[valid],
+        ch_idx.expand(total_steps, n_vq)[valid],
+    ]
 
     # Keep only rows where every quantizer position holds an actual code.
     valid_rows = ~(restored == audio_pad_code).any(dim=1)
@@ -484,11 +615,12 @@ def llm2decoder_delay_async_chunk(
     Async-chunk processor for MOSS-TTS-Delay.
 
     Called by Stage 0 (delay AR) after every decode step via
-    ``custom_process_next_stage_input_func``.  Accumulates the raw
-    delay-pattern rows emitted by the AR stage, recovers valid frame-major
-    codes by applying the inverse delay transform on the growing buffer,
-    and flushes a payload to Stage 1 (CAT codec) whenever ``chunk_frames``
-    new valid frames are ready.
+    ``custom_process_next_stage_input_func``.  Each raw delay-pattern row is
+    placed directly into an incremental restored-frame ring buffer, and
+    completed frame-major rows are flushed to Stage 1 (CAT codec) whenever
+    enough new valid frames are ready.  ``initial_codec_chunk_frames`` may be
+    used for a small first chunk, while ``codec_chunk_frames`` controls the
+    larger steady-state chunks.
 
     De-delay math
     -------------
@@ -496,18 +628,16 @@ def llm2decoder_delay_async_chunk(
     Inverse: ``frame[t, q] = delayed[t+q, q]``.
     Accumulating N delay steps recovers at most ``max(0, N - n_vq + 1)``
     valid frame-major rows.  With n_vq=32 (MOSS), the first flush therefore
-    requires ``chunk_frames + 31`` delay steps.
+    requires ``initial_codec_chunk_frames + 31`` delay steps when an initial
+    chunk size is configured, otherwise ``codec_chunk_frames + 31``.
 
     Buffer strategy
     ---------------
-    All delay-pattern rows are kept in
-    ``transfer_manager.code_prompt_token_ids[request_id]`` (never cleared
-    per-chunk).  ``transfer_manager._delay_frames_sent[request_id]`` tracks
-    how many valid frames have already been delivered to Stage 1.  On each
-    call the full buffer is de-delayed, and only the *newly recovered* frames
-    are shipped.  The framework's ``cleanup_sender()`` clears
-    ``code_prompt_token_ids`` after the final chunk; we clear
-    ``_delay_frames_sent`` in-function when ``is_finished=True``.
+    ``transfer_manager._moss_tts_delay_async_states[request_id]`` stores only:
+    incomplete restored rows, completed rows waiting for chunk flush, and the
+    next frame index to emit.  Once a frame is emitted it is removed, so memory
+    stays bounded by roughly ``n_vq + codec_chunk_frames`` rows plus any
+    completed rows waiting for the next flush.
 
     left_context_size = 0
     ---------------------
@@ -521,13 +651,23 @@ def llm2decoder_delay_async_chunk(
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
-    chunk_size = int(cfg.get("codec_chunk_frames", _DEFAULT_CHUNK_FRAMES))
 
     request_id = getattr(request, "external_req_id", None)
     if request_id is None:
         return None
 
-    # ── Accumulate this step's raw delay-pattern row ──────────────────────
+    states: dict[str, _DelayAsyncRequestState] = getattr(
+        transfer_manager,
+        "_moss_tts_delay_async_states",
+        None,
+    )
+    if states is None:
+        states = {}
+        transfer_manager._moss_tts_delay_async_states = states
+
+    state = states.get(request_id)
+
+    # ── Incrementally place this raw delay row into restored-frame slots ──
     if isinstance(pooling_output, dict):
         audio_pad_code = _as_int(
             pooling_output.get("audio_pad_code"),
@@ -548,86 +688,64 @@ def llm2decoder_delay_async_chunk(
             row = codes_raw if isinstance(codes_raw, torch.Tensor) else torch.tensor(codes_raw, dtype=torch.long)
             row = row.to(torch.long).reshape(-1)  # [n_vq]
             if row.numel() > 0:
-                transfer_manager.code_prompt_token_ids[request_id].append(row.tolist())
+                if state is None:
+                    state = _DelayAsyncRequestState(
+                        n_vq=int(row.numel()),
+                        audio_pad_code=audio_pad_code,
+                    )
+                    states[request_id] = state
+                state.append_delay_row(row, audio_pad_code)
     elif not is_finished:
         return None
 
-    accumulated = transfer_manager.code_prompt_token_ids[request_id]
-    n_steps = len(accumulated)
-
-    if n_steps == 0:
+    if state is None:
         if is_finished:
             return _make_finished_sentinel(request_id)
         return None
 
-    # ── De-delay all accumulated rows → valid frame-major codes ──────────
-    # Build tensor robustly: filter out any inconsistent entries (e.g. from
-    # unexpected calls with wrong shapes) and use torch.stack instead of
-    # torch.tensor(list_of_lists) which fails on inhomogeneous content in
-    # newer PyTorch.
-    row_tensors = []
-    for entry in accumulated:
-        if isinstance(entry, (list, tuple)) and len(entry) > 0:
-            row_tensors.append(torch.tensor(entry, dtype=torch.long))
-        elif isinstance(entry, torch.Tensor) and entry.numel() > 0:
-            row_tensors.append(entry.to(torch.long).reshape(-1))
-    if not row_tensors:
-        if is_finished:
-            return _make_finished_sentinel(request_id)
-        return None
-    row_tensors = [r for r in row_tensors if r.numel() == row_tensors[0].numel()]
-    if not row_tensors:
-        if is_finished:
-            return _make_finished_sentinel(request_id)
-        return None
-    _pad_codes = getattr(transfer_manager, "_moss_tts_delay_audio_pad_code", {}) or {}
-    audio_pad_code = int(_pad_codes.get(request_id, _DEFAULT_AUDIO_PAD_CODE))
-    raw_tensor = torch.stack(row_tensors, dim=0)  # [n_steps, n_vq]
-    valid_frames = _apply_de_delay_pattern(raw_tensor, audio_pad_code=audio_pad_code)  # [n_valid, n_vq]
-    n_valid = valid_frames.shape[0]
+    if is_finished:
+        state.drain_available(final=True)
 
-    # ── Track how many valid frames have already been sent ────────────────
-    _delay_sent: dict[str, int] = getattr(transfer_manager, "_delay_frames_sent", None)  # type: ignore[assignment]
-    if _delay_sent is None:
-        _delay_sent = {}
-        transfer_manager._delay_frames_sent = _delay_sent
-    frames_sent = _delay_sent.get(request_id, 0)
-    n_new = n_valid - frames_sent
-
-    if n_new <= 0:
-        # Not enough delay steps yet to recover a new valid frame.
+    n_pending = len(state.pending_chunk)
+    if n_pending <= 0:
         if is_finished:
-            _delay_sent.pop(request_id, None)
+            states.pop(request_id, None)
             if hasattr(transfer_manager, "_moss_tts_delay_audio_pad_code"):
                 transfer_manager._moss_tts_delay_audio_pad_code.pop(request_id, None)
             return _make_finished_sentinel(request_id)
         return None
 
-    if not is_finished and n_new < chunk_size:
+    chunk_size = _async_delay_chunk_size(cfg, state)
+    if not is_finished and chunk_size <= 0:
+        return None
+
+    if not is_finished and n_pending < chunk_size:
         return None  # still accumulating
 
     # ── Decide how many frames to flush this call ─────────────────────────
     if is_finished:
-        flush_count = n_new  # everything remaining
+        flush_count = n_pending  # everything remaining
     else:
-        flush_count = (n_new // chunk_size) * chunk_size
+        flush_count = (n_pending // chunk_size) * chunk_size
         if flush_count == 0:
             return None
 
-    flush_frames = valid_frames[frames_sent : frames_sent + flush_count]  # [flush_count, n_vq]
-    flat = flush_frames.reshape(-1).tolist()
+    flush_frames = state.pending_chunk[:flush_count]
+    del state.pending_chunk[:flush_count]
+    flat = torch.stack(flush_frames, dim=0).reshape(-1).tolist()
+    state.frames_flushed += flush_count
+    payload_chunk_size = chunk_size if chunk_size > 0 else flush_count
 
     # ── Update sent counter; clean up on final flush ──────────────────────
-    _delay_sent[request_id] = frames_sent + flush_count
     if is_finished:
-        _delay_sent.pop(request_id, None)
+        states.pop(request_id, None)
         if hasattr(transfer_manager, "_moss_tts_delay_audio_pad_code"):
             transfer_manager._moss_tts_delay_audio_pad_code.pop(request_id, None)
 
     return {
         "code_predictor_codes": flat,
         "code_flat_numel": len(flat),
-        "codec_chunk_frames": chunk_size,
+        "codec_chunk_frames": payload_chunk_size,
         "left_context_size": 0,
         "request_id": request_id,
         "finished": torch.tensor(is_finished, dtype=torch.bool),

@@ -128,9 +128,10 @@ runtime:
         connector_get_sleep_s: 0.01
         connector_get_max_wait_first_chunk: 3000
         connector_get_max_wait: 300
-        # With n_vq=32, first flush needs (31 + codec_chunk_frames) delay steps.
-        # Keep small to minimise initial audio latency.
-        codec_chunk_frames: 3
+        # First flush stays small for time-to-first-audio. Later flushes are
+        # larger so async throughput is closer to offline/batched decode.
+        initial_codec_chunk_frames: 3
+        codec_chunk_frames: 50
         # MossTTSDecoderModel does not trim left context, so set to 0.
         codec_left_context_frames: 0
 

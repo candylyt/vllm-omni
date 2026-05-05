@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
@@ -44,18 +45,21 @@ class MossTTSDelayRequestState:
     delayed_length: int = _UNSET_DELAY_LENGTH
     decode_steps_generated: int = 0
     pending_audio_row: torch.Tensor = field(init=False)
-    audio_history: list[list[int]] = field(init=False)
+    audio_history: list[set[int]] = field(init=False)
 
     def __post_init__(self) -> None:
         self.pending_audio_row = torch.full((self.n_vq,), self.audio_pad_code, dtype=torch.long)
-        self.audio_history = [[] for _ in range(self.n_vq)]
+        self.audio_history = [set() for _ in range(self.n_vq)]
 
-    def store_next_audio_row(self, row: torch.Tensor) -> None:
-        row = row.detach().to(torch.long).cpu().reshape(self.n_vq)
+    def store_next_audio_row(self, row: torch.Tensor, *, track_history: bool) -> None:
+        row = row.detach().to(torch.long).reshape(self.n_vq)
         self.pending_audio_row = row
-        for ch_idx, token in enumerate(row.tolist()):
+        if not track_history:
+            self.decode_steps_generated += 1
+            return
+        for ch_idx, token in enumerate(row.cpu().tolist()):
             if token != self.audio_pad_code:
-                self.audio_history[ch_idx].append(token)
+                self.audio_history[ch_idx].add(int(token))
         self.decode_steps_generated += 1
 
 
@@ -95,18 +99,20 @@ class MossTTSDelayARStageModel(nn.Module, SupportsPP):
             prefix=backbone_prefix,
         )
 
-        self.emb_ext = nn.ModuleList(
-            nn.Embedding(
-                self.audio_vocab_size + 1,
-                self.hidden_size,
-                padding_idx=self.audio_pad_code,
-            )
-            for _ in range(self.n_vq)
+        audio_vocab_with_pad = self.audio_vocab_size + 1
+        self.audio_embedding_weight = nn.Parameter(
+            torch.empty(self.n_vq, audio_vocab_with_pad, self.hidden_size)
         )
-        self.lm_heads = nn.ModuleList(
-            [nn.Linear(self.hidden_size, lang_cfg.vocab_size, bias=False)]
-            + [nn.Linear(self.hidden_size, self.audio_vocab_size + 1, bias=False) for _ in range(self.n_vq)]
+        nn.init.normal_(self.audio_embedding_weight)
+        with torch.no_grad():
+            self.audio_embedding_weight[:, self.audio_pad_code].zero_()
+
+        self.text_lm_head = nn.Linear(self.hidden_size, lang_cfg.vocab_size, bias=False)
+        self.audio_lm_head_weight = nn.Parameter(
+            torch.empty(self.n_vq, audio_vocab_with_pad, self.hidden_size)
         )
+        for ch_idx in range(self.n_vq):
+            nn.init.kaiming_uniform_(self.audio_lm_head_weight[ch_idx], a=math.sqrt(5))
         self.sampler = Sampler()
 
         self._request_states: dict[str, MossTTSDelayRequestState] = {}
@@ -277,16 +283,29 @@ class MossTTSDelayARStageModel(nn.Module, SupportsPP):
         if not request_ids or not seq_lens:
             return embeds
 
+        decode_offsets: list[int] = []
+        audio_rows: list[torch.Tensor] = []
         offset = 0
         for request_id, seq_len in zip(request_ids, seq_lens):
             if seq_len == 1:
                 state = self._request_states.get(request_id)
                 if state is not None:
-                    row = state.pending_audio_row.to(embeds.device)
-                    for ch_idx, token in enumerate(row.tolist()):
-                        ch_token = torch.tensor([token], device=embeds.device, dtype=torch.long)
-                        embeds[offset] = embeds[offset] + self.emb_ext[ch_idx](ch_token)[0]
+                    decode_offsets.append(offset)
+                    audio_rows.append(state.pending_audio_row)
             offset += seq_len
+
+        if audio_rows:
+            rows = torch.stack(
+                [row.to(device=embeds.device, dtype=torch.long, non_blocking=True) for row in audio_rows],
+                dim=0,
+            )
+            vq_positions = torch.arange(self.n_vq, device=embeds.device, dtype=torch.long).expand(
+                rows.shape[0],
+                -1,
+            )
+            audio_embeds = self.audio_embedding_weight[vq_positions, rows].sum(dim=1)
+            decode_offsets_t = torch.tensor(decode_offsets, device=embeds.device, dtype=torch.long)
+            embeds[decode_offsets_t] = embeds[decode_offsets_t] + audio_embeds
         return embeds
 
     # ------------------------------------------------------------------ #
@@ -302,13 +321,37 @@ class MossTTSDelayARStageModel(nn.Module, SupportsPP):
             post_audio = positions > (state.delayed_length - 1)
         return pre_audio & post_audio
 
+    def _audio_masks(
+        self,
+        states: list[MossTTSDelayRequestState],
+        device: torch.device,
+    ) -> torch.Tensor:
+        if not states:
+            return torch.empty((0, self.n_vq), dtype=torch.bool, device=device)
+
+        positions = torch.arange(self.n_vq, device=device, dtype=torch.long).unsqueeze(0)
+        audio_lengths = torch.tensor(
+            [state.audio_length for state in states],
+            device=device,
+            dtype=torch.long,
+        ).unsqueeze(1)
+        delayed_lengths = torch.tensor(
+            [state.delayed_length for state in states],
+            device=device,
+            dtype=torch.long,
+        ).unsqueeze(1)
+
+        pre_audio = audio_lengths > positions
+        post_audio = (delayed_lengths == _UNSET_DELAY_LENGTH) | (positions > (delayed_lengths - 1))
+        return pre_audio & post_audio
+
     @staticmethod
     def _apply_repetition_penalty(
         logits: torch.Tensor,
-        histories: list[list[int]],
+        histories: list[set[int]] | None,
         penalty: float,
     ) -> torch.Tensor:
-        if penalty <= 1.0:
+        if penalty <= 1.0 or not histories:
             return logits
 
         for row_idx, history in enumerate(histories):
@@ -349,7 +392,7 @@ class MossTTSDelayARStageModel(nn.Module, SupportsPP):
     def _sample_audio_from_logits(
         self,
         logits: torch.Tensor,
-        histories: list[list[int]],
+        histories: list[set[int]] | None,
         *,
         temperature: float,
         top_k: int,
@@ -391,27 +434,36 @@ class MossTTSDelayARStageModel(nn.Module, SupportsPP):
         if batch_size == 0:
             return next_audio
 
-        audio_masks = torch.stack(
-            [self._audio_mask(state, device) for state in decode_states],
-            dim=0,
+        audio_masks = self._audio_masks(decode_states, device)
+
+        audio_logits = torch.einsum(
+            "bh,qvh->bqv",
+            decode_hidden,
+            self.audio_lm_head_weight,
         )
 
-        for ch_idx in range(self.n_vq):
-            active = torch.nonzero(audio_masks[:, ch_idx], as_tuple=False).flatten()
-            if active.numel() == 0:
-                continue
+        active_b, active_q = torch.nonzero(audio_masks, as_tuple=True)
+        if active_b.numel() == 0:
+            return next_audio
 
-            logits = self.lm_heads[ch_idx + 1](decode_hidden[active])
-            histories = [decode_states[i].audio_history[ch_idx] for i in active.tolist()]
-            sampled = self._sample_audio_from_logits(
-                logits,
-                histories,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-            )
-            next_audio[active, ch_idx] = sampled.to(torch.long)
+        histories: list[set[int]] | None = None
+        if repetition_penalty > 1.0:
+            active_b_list = active_b.tolist()
+            active_q_list = active_q.tolist()
+            histories = [
+                decode_states[batch_idx].audio_history[ch_idx]
+                for batch_idx, ch_idx in zip(active_b_list, active_q_list)
+            ]
+
+        sampled = self._sample_audio_from_logits(
+            audio_logits[active_b, active_q, :],
+            histories,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+        )
+        next_audio[active_b, active_q] = sampled.to(torch.long)
 
         return next_audio
 
@@ -459,17 +511,18 @@ class MossTTSDelayARStageModel(nn.Module, SupportsPP):
         multimodal_outputs: dict[str, torch.Tensor | int] = {}
         if decode_positions and decode_states and not torch.cuda.is_current_stream_capturing():
             decode_hidden = hidden_states[torch.tensor(decode_positions, device=hidden_states.device)]
+            repetition_penalty = float(kwargs.get("audio_repetition_penalty", 1.0))
             audio_rows = self._sample_delay_audio_rows(
                 decode_hidden,
                 decode_states,
                 temperature=float(kwargs.get("audio_temperature", 1.7)),
                 top_k=int(kwargs.get("audio_top_k", 25)),
                 top_p=float(kwargs.get("audio_top_p", 0.8)),
-                repetition_penalty=float(kwargs.get("audio_repetition_penalty", 1.0)),
+                repetition_penalty=repetition_penalty,
             )
 
             for state, row in zip(decode_states, audio_rows):
-                state.store_next_audio_row(row)
+                state.store_next_audio_row(row, track_history=repetition_penalty > 1.0)
 
             multimodal_outputs = {
                 "code_predictor_codes": audio_rows.reshape(audio_rows.shape[0], 1, self.n_vq, 1),
@@ -486,7 +539,7 @@ class MossTTSDelayARStageModel(nn.Module, SupportsPP):
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata | None = None,
     ) -> torch.Tensor:
-        logits = self.lm_heads[0](hidden_states)
+        logits = self.text_lm_head(hidden_states)
         if not self._last_request_ids:
             return logits
 
@@ -572,6 +625,7 @@ class MossTTSDelayARStageModel(nn.Module, SupportsPP):
         for ckpt_name, tensor in weights:
             mapped: str | None = None
             shard_id = None
+            stacked_param: tuple[str, int] | None = None
 
             if ckpt_name.startswith("language_model.") or ckpt_name.startswith("model.language_model."):
                 relative = ckpt_name.split("language_model.", maxsplit=1)[1]
@@ -583,9 +637,42 @@ class MossTTSDelayARStageModel(nn.Module, SupportsPP):
                 if mapped is None:
                     mapped = "backbone." + relative
             elif ckpt_name.startswith("emb_ext.") or ckpt_name.startswith("model.emb_ext."):
-                mapped = ckpt_name.replace("model.", "", 1)
+                relative = ckpt_name.replace("model.", "", 1)
+                parts = relative.split(".")
+                if len(parts) == 3 and parts[0] == "emb_ext" and parts[2] == "weight":
+                    stacked_param = ("audio_embedding_weight", int(parts[1]))
             elif ckpt_name.startswith("lm_heads.") or ckpt_name.startswith("model.lm_heads."):
-                mapped = ckpt_name.replace("model.", "", 1)
+                relative = ckpt_name.replace("model.", "", 1)
+                parts = relative.split(".")
+                if len(parts) == 3 and parts[0] == "lm_heads" and parts[2] == "weight":
+                    head_idx = int(parts[1])
+                    if head_idx == 0:
+                        mapped = "text_lm_head.weight"
+                    else:
+                        stacked_param = ("audio_lm_head_weight", head_idx - 1)
+
+            if stacked_param is not None:
+                param_name, ch_idx = stacked_param
+                param = params.get(param_name)
+                if param is None or ch_idx < 0 or ch_idx >= param.shape[0]:
+                    logger.debug(
+                        "[MossTTS Delay] Unused stacked checkpoint key %s (mapped=%s[%d])",
+                        ckpt_name,
+                        param_name,
+                        ch_idx,
+                    )
+                    continue
+                if param.data[ch_idx].shape != tensor.shape:
+                    logger.warning(
+                        "[MossTTS Delay] Shape mismatch for %s: ckpt=%s model=%s",
+                        ckpt_name,
+                        tuple(tensor.shape),
+                        tuple(param.data[ch_idx].shape),
+                    )
+                    continue
+                param.data[ch_idx].copy_(tensor.to(device=param.device, dtype=param.dtype))
+                loaded.add(param_name)
+                continue
 
             if mapped is None or mapped not in params:
                 logger.debug(
