@@ -139,12 +139,41 @@ class MossTTSLocalTransformerWrapper(nn.Module):
     that don't accept the cache kwargs fall back to the recompute path
     automatically.
 
+    Why a patch is needed
+    ---------------------
+    The shipped ``MossTTSLocalTransformer.forward`` accepts ``use_cache`` and
+    ``past_key_values`` in its signature but contains three lines that defeat
+    the cache entirely:
+
+        use_cache = False                                # forced override
+        assert not use_cache                             # ensures cache stays off
+        if use_cache and past_key_values is None:
+            assert False                                 # blocks DynamicCache init
+            past_key_values = DynamicCache()
+
+    and the per-layer call passes ``past_key_value=None`` and
+    ``cache_position=None`` regardless of what the caller provided, so the
+    decoder layers never see any cache state.  Result: every "incremental"
+    call is actually a stateless single-token forward, with no memory of
+    earlier channels — the source of the garbage-audio symptom we saw.
+
+    On wrapper init, when the cache is opted in, ``_install_cache_patch``
+    monkey-patches ``self.transformer.forward`` with a corrected version
+    that drops those overrides and threads the cache args through to the
+    decoder layers.  The patched forward preserves all other behaviour
+    bit-for-bit (same causal-mask construction, same ordering, same return
+    shape) so the recompute path remains unchanged.
+
+    Because the underlying attention class is
+    ``MossTTSAttentionWithoutPositionalEmbedding`` (RoPE deleted in
+    __init__), no position-handling subtlety is involved — Q attends to
+    K/V via positionless dot-product attention, which is mathematically
+    equivalent under recompute vs. cache for autoregressive decoding.
+
     Kill switch
     -----------
-    Set ``MOSS_TTS_LOCAL_KV_CACHE=0`` to force the legacy recompute path
-    even when the model supports caching.  Useful if a future model variant
-    silently breaks cache semantics — flip the env var and ship while we
-    investigate.
+    Set ``MOSS_TTS_LOCAL_KV_CACHE=0`` to skip the patch entirely and force
+    the legacy recompute path.
     """
 
     def __init__(self, local_qwen3_config, model_path: str | None = None):
@@ -185,25 +214,193 @@ class MossTTSLocalTransformerWrapper(nn.Module):
             self._has_position_ids = False
             self._has_cache_position = False
 
-        # Kill switch: MOSS_TTS_LOCAL_KV_CACHE=0 forces the legacy path.
+        # Kill switch: MOSS_TTS_LOCAL_KV_CACHE=0 forces the legacy recompute
+        # path (skips the patch installation below).  Default is enabled.
         import os
         if os.environ.get("MOSS_TTS_LOCAL_KV_CACHE", "1") == "0" and self.supports_kv_cache:
-            logger.info(
-                "[MossTTS Local] KV cache disabled by MOSS_TTS_LOCAL_KV_CACHE=0; "
-                "using legacy recompute path."
-            )
             self.supports_kv_cache = False
+
+        # Install the forward-method patch that fixes the cache-disabling
+        # overrides in the shipped MossTTSLocalTransformer.  See the class
+        # docstring for the exact lines being patched.  If the patch fails
+        # to install (e.g. import errors), fall back to the recompute path.
+        if self.supports_kv_cache:
+            if not self._install_cache_patch():
+                self.supports_kv_cache = False
 
         if self.supports_kv_cache:
             logger.info(
-                "[MossTTS Local] KV cache enabled (position_ids=%s, "
-                "cache_position=%s).",
-                self._has_position_ids, self._has_cache_position,
+                "[MossTTS Local] KV cache enabled (patched forward installed)."
             )
         else:
             logger.info(
-                "[MossTTS Local] KV cache unavailable — using recompute path."
+                "[MossTTS Local] Using recompute path (KV cache disabled)."
             )
+
+    def _install_cache_patch(self) -> bool:
+        """Replace MossTTSLocalTransformer.forward with a version that
+        actually honors ``use_cache=True`` and threads ``past_key_values`` /
+        ``cache_position`` through to each decoder layer.
+
+        Returns True on success, False if any required transformers symbol
+        cannot be imported (in which case the wrapper falls back to the
+        legacy recompute path).
+        """
+        try:
+            import types
+            from transformers.cache_utils import Cache, DynamicCache
+            from transformers.modeling_outputs import BaseModelOutputWithPast
+            from transformers.masking_utils import create_causal_mask
+        except ImportError as exc:
+            logger.warning(
+                "[MossTTS Local] Could not import cache patch dependencies "
+                "(%s); falling back to recompute path.",
+                exc,
+            )
+            return False
+
+        def patched_forward(
+            t,                                    # bound transformer instance
+            input_ids=None,
+            attention_mask=None,
+            position_ids=None,
+            past_key_values=None,
+            inputs_embeds=None,
+            use_cache=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            cache_position=None,
+            **flash_attn_kwargs,
+        ):
+            """Drop-in replacement for MossTTSLocalTransformer.forward.
+
+            Diff from the original (line-for-line where they differ):
+
+                ORIGINAL:                                 PATCHED:
+                ─────────                                 ────────
+                use_cache = False                         (removed)
+                assert not use_cache                      (removed)
+                if use_cache and past_key_values is None:
+                    assert False                          (removed)
+                    past_key_values = DynamicCache()      (kept; now reachable)
+
+                decoder_layer(...,                        decoder_layer(...,
+                    past_key_value=None,                      past_key_value=past_key_values,
+                    cache_position=None,                      cache_position=cache_position,
+                    ...)                                      ...)
+
+            Everything else (causal-mask construction, layer iteration,
+            final norm, return shape) is preserved verbatim.
+            """
+            output_attentions = (
+                output_attentions if output_attentions is not None
+                else t.config.output_attentions
+            )
+            output_hidden_states = (
+                output_hidden_states if output_hidden_states is not None
+                else t.config.output_hidden_states
+            )
+            use_cache = use_cache if use_cache is not None else t.config.use_cache
+            # PATCH: original forced `use_cache = False; assert not use_cache` here.
+
+            if (input_ids is None) ^ (inputs_embeds is not None):
+                raise ValueError(
+                    "You must specify exactly one of input_ids or inputs_embeds"
+                )
+
+            if not isinstance(past_key_values, (type(None), Cache)):
+                raise ValueError(
+                    "The `past_key_values` should be either a `Cache` object or `None`."
+                )
+
+            if inputs_embeds is None:
+                # Note: original __init__ deletes self.embed_tokens, so this
+                # branch will fail if input_ids is ever provided.  Our wrapper
+                # always passes inputs_embeds, so this is fine.
+                inputs_embeds = t.embed_tokens(input_ids)
+
+            # PATCH: original had `assert False` blocking this initialisation.
+            if use_cache and past_key_values is None:
+                past_key_values = DynamicCache()
+
+            if cache_position is None:
+                past_seen_tokens = (
+                    past_key_values.get_seq_length()
+                    if past_key_values is not None else 0
+                )
+                cache_position = torch.arange(
+                    past_seen_tokens,
+                    past_seen_tokens + inputs_embeds.shape[1],
+                    device=inputs_embeds.device,
+                )
+
+            if position_ids is None:
+                position_ids = cache_position.unsqueeze(0)
+
+            mask_kwargs = {
+                "config": t.config,
+                "input_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
+            # NOTE: the original code has a trailing comma here making this a
+            # 1-tuple — preserved verbatim because the recompute path
+            # demonstrably works with that form, suggesting the underlying
+            # MossTTSAttentionWithoutPositionalEmbedding either ignores
+            # attention_mask or handles tuple form.  Changing it could
+            # silently alter behaviour, so we don't.
+            causal_mask = create_causal_mask(**mask_kwargs),
+
+            hidden_states = inputs_embeds
+
+            all_hidden_states = () if output_hidden_states else None
+            all_self_attns = () if output_attentions else None
+
+            for decoder_layer in t.layers[: t.config.num_hidden_layers]:
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
+
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=causal_mask,
+                    position_ids=None,
+                    # PATCH: original passed past_key_value=None unconditionally.
+                    past_key_value=past_key_values,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    # PATCH: original passed cache_position=None unconditionally.
+                    cache_position=cache_position,
+                    position_embeddings=None,
+                    **flash_attn_kwargs,
+                )
+
+                hidden_states = layer_outputs
+
+                if output_attentions:
+                    all_self_attns += (layer_outputs[1],)
+
+            hidden_states = t.norm(hidden_states)
+
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            return BaseModelOutputWithPast(
+                last_hidden_state=hidden_states,
+                past_key_values=past_key_values if use_cache else None,
+                hidden_states=all_hidden_states,
+                attentions=all_self_attns,
+            )
+
+        # Bind the function as a method on the transformer instance.  This
+        # patches only this one instance; other models in the process are
+        # unaffected.
+        self.transformer.forward = types.MethodType(patched_forward, self.transformer)
+        logger.info(
+            "[MossTTS Local] Cache patch installed on local transformer."
+        )
+        return True
 
     @staticmethod
     def _cache_length(past_key_values: Any) -> int:
