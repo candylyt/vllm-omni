@@ -50,6 +50,7 @@ The mapping is implemented in `MossTTSARStageModel.load_weights`.
 
 import copy
 import logging
+import os
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -75,6 +76,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 _TIMER = get_timer()
 
 logger = logging.getLogger(__name__)
+_LOCAL_KV_DEBUG = os.environ.get("MOSS_TTS_LOCAL_KV_DEBUG", "0") == "1"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1043,6 +1045,8 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
 
         audio_codes: list[torch.Tensor] = []
         text_logits: torch.Tensor | None = None
+        debug_input_lengths: list[int] | None = [] if _LOCAL_KV_DEBUG else None
+        debug_cache_lengths: list[int] | None = [] if _LOCAL_KV_DEBUG else None
 
         for ch in range(self.channels):   # ch = 0 (text), 1..32 (audio)
             with record_function(f"local/ch_{ch:02d}_transformer"), \
@@ -1050,6 +1054,11 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                 if use_cache_path:
                     # Incremental path: feed only the new token, reuse past K/V.
                     new_input = current_proj.unsqueeze(1)              # [B, 1, local_D]
+                    if debug_input_lengths is not None and debug_cache_lengths is not None:
+                        debug_input_lengths.append(int(new_input.shape[1]))
+                        debug_cache_lengths.append(
+                            self.local_transformer._cache_length(past_kv)
+                        )
                     local_out, past_kv = self.local_transformer(
                         new_input, past_key_values=past_kv, use_cache=True,
                     )                                                  # [B, 1, local_D]
@@ -1059,6 +1068,9 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                     local_ctx = torch.cat(
                         [local_ctx, current_proj.unsqueeze(1)], dim=1
                     )                                                  # [B, ch+1, local_D]
+                    if debug_input_lengths is not None and debug_cache_lengths is not None:
+                        debug_input_lengths.append(int(local_ctx.shape[1]))
+                        debug_cache_lengths.append(0)
                     local_out, _ = self.local_transformer(local_ctx)   # [B, ch+1, local_D]
                     last_h = local_out[:, -1, :]                       # [B, local_D]
 
@@ -1110,6 +1122,19 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
 
         if text_logits is None:
             text_logits = torch.zeros(B, self.lm_heads[0].out_features, device=dev, dtype=dtype)
+
+        if debug_input_lengths is not None and debug_cache_lengths is not None:
+            logger.info(
+                "[MossTTS Local KV] mode=%s channels=%d input_lengths=%s "
+                "cache_lengths=%s total_input_tokens=%d total_cache_tokens=%d",
+                "cache" if use_cache_path else "recompute",
+                self.channels,
+                debug_input_lengths,
+                debug_cache_lengths,
+                sum(debug_input_lengths),
+                sum(debug_cache_lengths),
+            )
+
         return codes, text_logits
 
     # ══════════════════════════════════════════════════════════════════
