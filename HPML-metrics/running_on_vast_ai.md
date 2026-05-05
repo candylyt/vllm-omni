@@ -26,6 +26,8 @@ source ~/.bashrc
 ```bash
 pip install uv --quiet
 pip install datasets
+pip install wandb
+pip install soundfile
 uv pip install vllm==0.19.1 --torch-backend=auto
 uv pip install setuptools_scm
 ```
