@@ -77,6 +77,11 @@ _TIMER = get_timer()
 logger = logging.getLogger(__name__)
 
 
+# Sentinel for "do not pass this kwarg at all" (distinct from None which is
+# itself a valid value for past_key_values).  Used by the KV-cache probe.
+_OMIT: Any = object()
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Lightweight modules cloned from MOSS-TTS (kept identical for weight compat)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -264,12 +269,21 @@ class MossTTSLocalTransformerWrapper(nn.Module):
                 input_ids=None, inputs_embeds=test_input
             ).last_hidden_state
 
+            # Try to import DynamicCache — modern HF transformers expose this.
+            # Some models distinguish between past_key_values=None (no cache,
+            # build fresh internally) and an explicit empty DynamicCache().
+            try:
+                from transformers.cache_utils import DynamicCache
+                _DynamicCache: Any = DynamicCache
+            except ImportError:
+                _DynamicCache = None
+
             # Helper to build a kwargs dict given which extras to include.
-            def build(use_cache: bool, with_past: bool,
+            def build(use_cache: bool, past_kv: Any,
                       with_position_ids: bool, with_cache_position: bool) -> dict:
                 kw: dict[str, Any] = {}
-                if with_past and self._has_past_kv:
-                    kw["past_key_values"] = None
+                if past_kv is not _OMIT and self._has_past_kv:
+                    kw["past_key_values"] = past_kv
                 if use_cache and self._has_use_cache:
                     kw["use_cache"] = True
                 if with_position_ids and self._has_position_ids:
@@ -281,27 +295,33 @@ class MossTTSLocalTransformerWrapper(nn.Module):
             # Probe matrix: each entry is (label, kwargs).  The first one
             # exactly matches the no-cache reference (so should always be
             # zero).  Each subsequent variant adds one cache-related kwarg.
-            variants = [
+            variants: list[tuple[str, dict]] = [
                 ("baseline (no cache args)", {}),
                 ("use_cache only",
-                    build(use_cache=True, with_past=False,
+                    build(use_cache=True, past_kv=_OMIT,
                           with_position_ids=False, with_cache_position=False)),
                 ("past_key_values=None only",
-                    build(use_cache=False, with_past=True,
+                    build(use_cache=False, past_kv=None,
                           with_position_ids=False, with_cache_position=False)),
-                ("past_key_values + use_cache",
-                    build(use_cache=True, with_past=True,
+                ("past_key_values=None + use_cache",
+                    build(use_cache=True, past_kv=None,
                           with_position_ids=False, with_cache_position=False)),
                 ("+ position_ids",
-                    build(use_cache=True, with_past=True,
+                    build(use_cache=True, past_kv=None,
                           with_position_ids=True, with_cache_position=False)),
                 ("+ cache_position",
-                    build(use_cache=True, with_past=True,
+                    build(use_cache=True, past_kv=None,
                           with_position_ids=False, with_cache_position=True)),
                 ("+ both positions",
-                    build(use_cache=True, with_past=True,
+                    build(use_cache=True, past_kv=None,
                           with_position_ids=True, with_cache_position=True)),
             ]
+            if _DynamicCache is not None:
+                variants.append((
+                    "DynamicCache() + both positions",
+                    build(use_cache=True, past_kv=_DynamicCache(),
+                          with_position_ids=True, with_cache_position=True),
+                ))
 
             logger.info(
                 "[MossTTS Local] KV-cache equivalence probe "
@@ -309,6 +329,8 @@ class MossTTSLocalTransformerWrapper(nn.Module):
             )
             best_label = None
             best_max_abs = float("inf")
+            # Re-fetch the reference INSIDE this function each variant — to
+            # detect whether the previous probe call mutated model state.
             for label, kw in variants:
                 try:
                     out = self.transformer(
@@ -316,26 +338,50 @@ class MossTTSLocalTransformerWrapper(nn.Module):
                     ).last_hidden_state
                     max_abs = (out - ref).abs().max().item()
                     logger.info(
-                        "[MossTTS Local]   variant=%-30s max_abs=%.6e", label, max_abs
+                        "[MossTTS Local]   variant=%-32s max_abs=%.6e", label, max_abs
                     )
                     if max_abs < best_max_abs:
                         best_max_abs = max_abs
                         best_label = label
                 except Exception as e:
                     logger.info(
-                        "[MossTTS Local]   variant=%-30s FAILED: %s", label, e
+                        "[MossTTS Local]   variant=%-32s FAILED: %s", label, e
                     )
+
+            # State-leak check: re-run the *baseline* (plain) forward after
+            # all the cache-mode variants.  If the model leaks state between
+            # calls (e.g. caches a DynamicCache on itself), this re-run will
+            # diverge from the original reference even though the call args
+            # are identical.
+            recheck = self.transformer(
+                input_ids=None, inputs_embeds=test_input
+            ).last_hidden_state
+            recheck_diff = (recheck - ref).abs().max().item()
+            logger.info(
+                "[MossTTS Local]   recheck (plain forward, post-probe)  "
+                "max_abs_vs_initial_ref=%.6e",
+                recheck_diff,
+            )
+            if recheck_diff > 1e-3:
+                logger.warning(
+                    "[MossTTS Local] State leak detected: a plain forward "
+                    "call after running cache-mode variants no longer matches "
+                    "the initial baseline (max_abs=%.4e).  The custom local "
+                    "transformer is mutating internal state across calls — "
+                    "this is the cause of the runtime KV-cache divergence.",
+                    recheck_diff,
+                )
 
             verdict = (
                 "PASS — KV cache can be made equivalent (safe to enable)"
-                if best_max_abs < 1e-3
-                else "FAIL — no kwarg combination matches the plain forward; "
-                     "do NOT enable KV cache without modifying the local model"
+                if best_max_abs < 1e-3 and recheck_diff < 1e-3
+                else "FAIL — divergence detected; do NOT enable KV cache "
+                     "without further investigation"
             )
             logger.info(
                 "[MossTTS Local] KV-cache probe verdict: %s "
-                "(best=%s, max_abs=%.6e)",
-                verdict, best_label, best_max_abs,
+                "(best=%s, max_abs=%.6e, state_leak=%.6e)",
+                verdict, best_label, best_max_abs, recheck_diff,
             )
         except Exception as e:
             logger.warning(
@@ -1014,6 +1060,15 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         self._last_seq_lens = []
         # Drop warmup samples so the post-warmup report is clean.
         _TIMER.reset()
+
+        # Re-run the KV-cache equivalence probe AFTER warmup.  If results
+        # differ from the init-time probe, vLLM's profile_run has primed
+        # the model's internal state in a way that breaks cache equivalence
+        # — that's the bug producing runtime divergence.
+        logger.info(
+            "[MossTTS Local] Re-running KV-cache equivalence probe POST-WARMUP:"
+        )
+        self.local_transformer._probe_kv_cache_equivalence()
 
     # ══════════════════════════════════════════════════════════════════
     #  Forward
