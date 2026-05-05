@@ -184,11 +184,10 @@ def profile_mode(mode, sentences, model, repo, output_base, init_sleep, mtype):
 
         if run["ok"]:
             print(f"RTF={run['rtf']:.3f}  dur={run['audio_dur_s']:.2f}s fcl={run['first_chunk_latency_s']:.2f}s")
-            wandbRun.log({"text": text, "rtf": run["rtf"], "audio_dur_s": run["audio_dur_s"], "first_chunk_latency_s": run["first_chunk_latency_s"], "num_chunks": run["num_chunks"]})
+            wandbRun.log({"rtf": run["rtf"], "audio_dur_s": run["audio_dur_s"], "first_chunk_latency_s": run["first_chunk_latency_s"], "num_chunks": run["num_chunks"], 'total_time_s': run["total_time_s"]})
         else:
             print(f"Oopsies!  {run['error'][:60]}")
 
-    
     wandbRun.finish()
 
 def main():
