@@ -150,28 +150,90 @@ class MossTTSLocalTransformerWrapper(nn.Module):
             )
         self.transformer = MossTTSLocalTransformer(local_qwen3_config)
 
-        # One-time capability probe: does the underlying transformer's forward
-        # accept past_key_values + use_cache?  Modern HF Qwen3-style models do;
-        # if not, _local_forward will fall back to the legacy recompute path.
+        # One-time capability probe: which kwargs does the underlying
+        # transformer's forward actually accept?
+        #
+        #   past_key_values + use_cache  → required for the incremental path
+        #   position_ids                 → standard HF Qwen3 kwarg, lets us
+        #                                  override the auto-position guess
+        #                                  (critical when sending single
+        #                                  tokens with a populated cache)
+        #   cache_position               → newer HF kwarg; some Qwen3-based
+        #                                  models use it to derive RoPE
         import inspect
         try:
             sig_params = inspect.signature(self.transformer.forward).parameters
-            self.supports_kv_cache: bool = (
-                "past_key_values" in sig_params and "use_cache" in sig_params
-            )
+            self._has_past_kv: bool = "past_key_values" in sig_params
+            self._has_use_cache: bool = "use_cache" in sig_params
+            self.supports_kv_cache: bool = self._has_past_kv and self._has_use_cache
+            self._has_position_ids: bool = "position_ids" in sig_params
+            self._has_cache_position: bool = "cache_position" in sig_params
         except (TypeError, ValueError):
             self.supports_kv_cache = False
+            self._has_position_ids = False
+            self._has_cache_position = False
+
+        # Env-var kill switch.  Set MOSS_TTS_LOCAL_KV_CACHE=0 to force the
+        # legacy recompute path even when the model advertises cache support.
+        # Useful while debugging correctness regressions.
+        import os
+        kv_env = os.environ.get("MOSS_TTS_LOCAL_KV_CACHE", "1")
+        kv_disabled_by_env = kv_env == "0"
+        if kv_disabled_by_env and self.supports_kv_cache:
+            logger.warning(
+                "[MossTTS Local] KV cache forcibly DISABLED via "
+                "MOSS_TTS_LOCAL_KV_CACHE=0 — using legacy recompute path."
+            )
+            self.supports_kv_cache = False
+
+        # Verify mode: when MOSS_TTS_LOCAL_KV_CACHE_VERIFY=1, _local_forward
+        # runs both paths on the same input and warns if outputs diverge
+        # beyond a tight tolerance.  Slow — for debugging only.
+        self._verify_kv_cache: bool = (
+            os.environ.get("MOSS_TTS_LOCAL_KV_CACHE_VERIFY", "0") == "1"
+            and self.supports_kv_cache
+        )
 
         if self.supports_kv_cache:
             logger.info(
                 "[MossTTS Local] Local transformer supports KV cache — "
-                "incremental decoding enabled."
+                "incremental decoding enabled.  position_ids=%s, "
+                "cache_position=%s, verify=%s",
+                self._has_position_ids,
+                self._has_cache_position,
+                self._verify_kv_cache,
             )
         else:
             logger.warning(
                 "[MossTTS Local] Local transformer forward does not accept "
-                "past_key_values/use_cache; falling back to recompute path."
+                "past_key_values/use_cache (or KV cache disabled by env); "
+                "falling back to recompute path."
             )
+
+    @staticmethod
+    def _cache_length(past_key_values: Any) -> int:
+        """Return the number of cached tokens in a past_key_values object.
+
+        Handles both the modern ``Cache`` interface (HF transformers ≥ 4.36)
+        and the legacy tuple-of-tuples format ``((k0, v0), (k1, v1), …)``.
+        Returns 0 when ``past_key_values`` is ``None`` or unparseable.
+        """
+        if past_key_values is None:
+            return 0
+        # Modern HF Cache object
+        if hasattr(past_key_values, "get_seq_length"):
+            try:
+                return int(past_key_values.get_seq_length())
+            except Exception:
+                pass
+        # Legacy tuple-of-tuples: ((k0, v0), (k1, v1), …) where each k/v has
+        # shape [B, num_heads, seq_len, head_dim].
+        try:
+            first_layer = past_key_values[0]
+            k = first_layer[0] if isinstance(first_layer, (tuple, list)) else first_layer
+            return int(k.shape[-2])
+        except (TypeError, IndexError, AttributeError):
+            return 0
 
     def forward(
         self,
@@ -194,6 +256,17 @@ class MossTTSLocalTransformerWrapper(nn.Module):
             Returns ``(hidden_states[B, 1, D], new_past_key_values)`` where
             ``new_past_key_values`` is the cache after appending this token.
 
+        Position handling
+        -----------------
+        When in incremental mode, we explicitly compute the absolute
+        position of the new token(s) as ``[past_length, past_length + t)``
+        and pass it via ``position_ids`` and/or ``cache_position`` if the
+        model accepts them.  This is critical for RoPE-based attention:
+        without it the model receives positions ``[0, 1, …, t-1)`` for
+        every call and applies the wrong rotary embeddings, producing
+        garbage outputs that are still numerically valid (so no error is
+        raised — the audio just turns into noise).
+
         If the underlying HF model does not advertise cache support
         (``self.supports_kv_cache is False``) the cache kwargs are silently
         dropped and the call behaves like the recompute path — callers can
@@ -201,11 +274,26 @@ class MossTTSLocalTransformerWrapper(nn.Module):
         """
         want_cache = use_cache or past_key_values is not None
         if want_cache and self.supports_kv_cache:
+            B, t, _ = inputs_embeds.shape
+            past_length = self._cache_length(past_key_values)
+            cache_position = torch.arange(
+                past_length, past_length + t,
+                device=inputs_embeds.device,
+                dtype=torch.long,
+            )
+
+            extra: dict[str, Any] = {}
+            if self._has_cache_position:
+                extra["cache_position"] = cache_position
+            if self._has_position_ids:
+                extra["position_ids"] = cache_position.unsqueeze(0).expand(B, -1)
+
             out = self.transformer(
                 input_ids=None,
                 inputs_embeds=inputs_embeds,
                 past_key_values=past_key_values,
                 use_cache=True,
+                **extra,
             )
             return out.last_hidden_state, out.past_key_values
         out = self.transformer(input_ids=None, inputs_embeds=inputs_embeds)
@@ -639,13 +727,19 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         current_proj = self.speech_embedding_to_local_mlp(global_hidden)  # [B, local_D]
 
         use_cache_path = self.local_transformer.supports_kv_cache
+        verify_mode = use_cache_path and getattr(
+            self.local_transformer, "_verify_kv_cache", False
+        )
+
         # Cache-mode state: incremental K/V across the 33-channel loop.
         past_kv: Any = None
-        # Recompute-mode state: growing local context (only used in fallback).
+        # Recompute-mode state: growing local context.  Always allocated when
+        # we're in verify mode (so we can cross-check), otherwise only when
+        # use_cache_path is False.
         local_ctx: torch.Tensor | None = (
-            None
-            if use_cache_path
-            else torch.zeros(B, 0, local_dim, device=dev, dtype=dtype)
+            torch.zeros(B, 0, local_dim, device=dev, dtype=dtype)
+            if (not use_cache_path or verify_mode)
+            else None
         )
 
         audio_codes: list[torch.Tensor] = []
@@ -661,6 +755,25 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                         new_input, past_key_values=past_kv, use_cache=True,
                     )                                                  # [B, 1, local_D]
                     last_h = local_out[:, 0, :]                        # [B, local_D]
+
+                    if verify_mode:
+                        # Run the recompute path on the same growing context
+                        # and compare its last-position output to ours.
+                        local_ctx = torch.cat(
+                            [local_ctx, current_proj.unsqueeze(1)], dim=1
+                        )
+                        ref_out, _ = self.local_transformer(local_ctx)
+                        ref_h = ref_out[:, -1, :]
+                        max_abs = (last_h - ref_h).abs().max().item()
+                        rel = max_abs / max(ref_h.abs().max().item(), 1e-6)
+                        if max_abs > 1e-2 or rel > 5e-2:
+                            logger.warning(
+                                "[MossTTS Local] KV-cache vs recompute mismatch "
+                                "at ch=%d: max_abs=%.4f rel=%.4f — falling back "
+                                "to recompute output for this channel.",
+                                ch, max_abs, rel,
+                            )
+                            last_h = ref_h
                 else:
                     # Legacy recompute path: full re-forward over growing context.
                     local_ctx = torch.cat(
