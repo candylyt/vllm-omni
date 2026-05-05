@@ -157,6 +157,14 @@ class MossTTSLocalTransformerWrapper(nn.Module):
     call is actually a stateless single-token forward, with no memory of
     earlier channels — the source of the garbage-audio symptom we saw.
 
+    Cache support must also exist in the per-layer attention implementation.
+    Some MOSS remote-code revisions expose ``past_key_values`` / ``use_cache``
+    on the outer transformer signature but still contain
+    ``assert past_key_value is None`` inside ``self_attn.forward``.  For those
+    builds we monkey-patch both the outer transformer forward and every
+    decoder layer's self-attention forward so cache state is threaded all the
+    way down to ``Cache.update(...)``.
+
     On wrapper init, when the cache is opted in, ``_install_cache_patch``
     monkey-patches ``self.transformer.forward`` with a corrected version
     that drops those overrides and threads the cache args through to the
@@ -237,6 +245,30 @@ class MossTTSLocalTransformerWrapper(nn.Module):
                 "[MossTTS Local] Using recompute path (KV cache disabled)."
             )
 
+    def _attention_supports_kv_cache(self) -> bool:
+        """Return True when decoder self-attention is patchable for caching."""
+        import inspect
+
+        try:
+            first_layer = self.transformer.layers[0]
+            self_attn = first_layer.self_attn
+            sig_params = inspect.signature(self_attn.forward).parameters
+        except (AttributeError, IndexError, TypeError, ValueError):
+            logger.info(
+                "[MossTTS Local] Could not inspect self-attention cache "
+                "support; falling back to recompute path."
+            )
+            return False
+
+        if "past_key_value" not in sig_params:
+            logger.info(
+                "[MossTTS Local] Self-attention forward does not accept "
+                "`past_key_value`; falling back to recompute path."
+            )
+            return False
+
+        return True
+
     def _install_cache_patch(self) -> bool:
         """Replace MossTTSLocalTransformer.forward with a version that
         actually honors ``use_cache=True`` and threads ``past_key_values`` /
@@ -258,6 +290,91 @@ class MossTTSLocalTransformerWrapper(nn.Module):
                 exc,
             )
             return False
+
+        if not self._attention_supports_kv_cache():
+            return False
+
+        def patch_attention_forward(layer_self_attn) -> None:
+            original_globals = layer_self_attn.forward.__func__.__globals__
+            eager_attention_forward = original_globals["eager_attention_forward"]
+            all_attention_functions = original_globals["ALL_ATTENTION_FUNCTIONS"]
+
+            def patched_attention_forward(
+                attn,
+                hidden_states: torch.Tensor,
+                position_embeddings=None,
+                attention_mask: Optional[torch.Tensor] = None,
+                past_key_value: Optional[Cache] = None,
+                cache_position: Optional[torch.LongTensor] = None,
+                **kwargs,
+            ):
+                input_shape = hidden_states.shape[:-1]
+                hidden_shape = (*input_shape, -1, attn.head_dim)
+
+                query_states = attn.q_norm(
+                    attn.q_proj(hidden_states).view(hidden_shape)
+                ).transpose(1, 2)
+                key_states = attn.k_norm(
+                    attn.k_proj(hidden_states).view(hidden_shape)
+                ).transpose(1, 2)
+                value_states = attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+                if past_key_value is not None:
+                    cache_kwargs: dict[str, Any] = {}
+                    if cache_position is not None:
+                        cache_kwargs["cache_position"] = cache_position
+                    key_states, value_states = past_key_value.update(
+                        key_states,
+                        value_states,
+                        attn.layer_idx,
+                        cache_kwargs,
+                    )
+
+                attention_interface = eager_attention_forward
+                if attn.config._attn_implementation != "eager":
+                    if (
+                        attn.config._attn_implementation == "sdpa"
+                        and kwargs.get("output_attentions", False)
+                    ):
+                        logger.warning(
+                            "`scaled_dot_product_attention` does not support "
+                            "`output_attentions=True`; falling back to eager "
+                            "attention for MOSS-TTS local transformer."
+                        )
+                    else:
+                        if hasattr(all_attention_functions, "get_interface"):
+                            attention_interface = all_attention_functions.get_interface(
+                                attn.config._attn_implementation,
+                                eager_attention_forward,
+                            )
+                        else:
+                            attention_interface = all_attention_functions[
+                                attn.config._attn_implementation
+                            ]
+
+                attn_output, attn_weights = attention_interface(
+                    attn,
+                    query_states,
+                    key_states,
+                    value_states,
+                    is_causal=True,
+                    attention_mask=attention_mask,
+                    dropout=0.0 if not attn.training else attn.attention_dropout,
+                    scaling=attn.scaling,
+                    sliding_window=attn.sliding_window,
+                    **kwargs,
+                )
+
+                attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+                attn_output = attn.o_proj(attn_output)
+                return attn_output, attn_weights
+
+            layer_self_attn.forward = types.MethodType(
+                patched_attention_forward, layer_self_attn
+            )
+
+        for decoder_layer in self.transformer.layers[: self.transformer.config.num_hidden_layers]:
+            patch_attention_forward(decoder_layer.self_attn)
 
         def patched_forward(
             t,                                    # bound transformer instance
@@ -345,13 +462,7 @@ class MossTTSLocalTransformerWrapper(nn.Module):
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
             }
-            # NOTE: the original code has a trailing comma here making this a
-            # 1-tuple — preserved verbatim because the recompute path
-            # demonstrably works with that form, suggesting the underlying
-            # MossTTSAttentionWithoutPositionalEmbedding either ignores
-            # attention_mask or handles tuple form.  Changing it could
-            # silently alter behaviour, so we don't.
-            causal_mask = create_causal_mask(**mask_kwargs),
+            causal_mask = create_causal_mask(**mask_kwargs)
 
             hidden_states = inputs_embeds
 
@@ -398,7 +509,8 @@ class MossTTSLocalTransformerWrapper(nn.Module):
         # unaffected.
         self.transformer.forward = types.MethodType(patched_forward, self.transformer)
         logger.info(
-            "[MossTTS Local] Cache patch installed on local transformer."
+            "[MossTTS Local] Cache patch installed on local transformer "
+            "and attention layers."
         )
         return True
 
