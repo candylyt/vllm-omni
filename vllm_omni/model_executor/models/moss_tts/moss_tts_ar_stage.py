@@ -237,11 +237,26 @@ class MossTTSLocalTransformerWrapper(nn.Module):
         fixed at the wrapper level and would require changes inside the
         custom remote-code transformer itself.
 
-        Runs once at engine init.  Cheap (~milliseconds on a tiny synthetic
-        input) and always logged so the user has a definitive answer.
+        Runs once at engine init and again after warmup.  Cheap
+        (~milliseconds on a tiny synthetic input) and always logged so the
+        user has a definitive answer.
+
+        IMPORTANT: this method must NOT perturb the global PyTorch RNG.
+        ``_local_forward`` calls ``torch.multinomial`` for per-channel
+        audio sampling, which reads the global RNG.  Seeding the RNG here
+        would make every generation start from the same fixed seed and
+        produce a different (often worse) audio trajectory than expected.
+        We use a torch.Generator for synthetic input and save/restore the
+        global RNG state across the probe as belt-and-suspenders.
         """
         if not self._has_past_kv and not self._has_use_cache:
             return  # Model can't accept any cache kwargs — nothing to probe
+
+        # ── Snapshot RNG state so the probe is observationally pure ─────
+        cpu_rng_state = torch.get_rng_state()
+        cuda_rng_state = (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        )
 
         try:
             params = list(self.transformer.parameters())
@@ -261,8 +276,14 @@ class MossTTSLocalTransformerWrapper(nn.Module):
                 return
 
             B, t = 1, 1
-            torch.manual_seed(0)
-            test_input = torch.randn(B, t, D, device=device, dtype=dtype)
+            # Use a local Generator instead of torch.manual_seed so the
+            # global RNG is never touched.  The Generator must live on the
+            # same device as the tensor we're creating.
+            gen = torch.Generator(device=device)
+            gen.manual_seed(0)
+            test_input = torch.randn(
+                B, t, D, generator=gen, device=device, dtype=dtype
+            )
 
             # Reference: plain forward, no cache kwargs at all.
             ref = self.transformer(
@@ -387,6 +408,12 @@ class MossTTSLocalTransformerWrapper(nn.Module):
             logger.warning(
                 "[MossTTS Local] KV-cache probe could not run: %s", e
             )
+        finally:
+            # Restore RNG state regardless of whether the probe succeeded.
+            # See the docstring for why this matters.
+            torch.set_rng_state(cpu_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state_all(cuda_rng_state)
 
     @staticmethod
     def _cache_length(past_key_values: Any) -> int:
