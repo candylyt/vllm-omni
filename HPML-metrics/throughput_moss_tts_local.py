@@ -76,7 +76,21 @@ def make_yaml(base_yaml_path, max_num_seqs, gpu_mem_stage0=None, gpu_mem_stage1=
 
 
 
-def run_batch(model, repo, mode, bs, prompt, ar_params, decoder_params, init_sleep, gpu_mem_stage0=None, gpu_mem_stage1=None, max_num_batched_tokens=None):
+def run_batch(
+    model,
+    repo,
+    mode,
+    bs,
+    prompt,
+    ar_params,
+    decoder_params,
+    init_sleep,
+    gpu_mem_stage0=None,
+    gpu_mem_stage1=None,
+    max_num_batched_tokens=None,
+    save_audio_dir=None,
+    repeat_idx=0,
+):
     yaml = "moss_tts_async.yaml" if mode == "async" else "moss_tts.yaml"
     baseYAML = os.path.join(repo, f"vllm_omni/model_executor/stage_configs/{yaml}")
     pathYAML = make_yaml(baseYAML, max_num_seqs=bs, gpu_mem_stage0=gpu_mem_stage0, gpu_mem_stage1=gpu_mem_stage1, max_num_batched_tokens=max_num_batched_tokens)
@@ -90,6 +104,10 @@ def run_batch(model, repo, mode, bs, prompt, ar_params, decoder_params, init_sle
     wall = time.perf_counter() - t0
 
     audioTotal = 0.0
+    batch_out_dir = None
+    if save_audio_dir:
+        batch_out_dir = Path(save_audio_dir) / f"{mode}_bs{bs}_rep{repeat_idx:02d}"
+        batch_out_dir.mkdir(parents=True, exist_ok=True)
 
 
     # calc total audio duration and save wavs for all samples in the batch
@@ -97,18 +115,29 @@ def run_batch(model, repo, mode, bs, prompt, ar_params, decoder_params, init_sle
         if stage.final_output_type != "audio":
             continue
 
+        request_id = stage.request_output.request_id
         audioTensor = stage.request_output.outputs[0].multimodal_output["audio"]
 
         if audioTensor is None:
             continue
 
         if isinstance(audioTensor, list):
-            audioTensor = torch.cat(audioTensor, dim=0)
+            chunks = [
+                t for t in audioTensor
+                if isinstance(t, torch.Tensor) and t.numel() > 0
+            ]
+            if not chunks:
+                continue
+            audioTensor = torch.cat(chunks, dim=0)
 
         audioNP = audioTensor.float().detach().cpu().numpy().flatten()
 
         # compute audio duration and accumulate total audio duration for the batch. 24000 is the sample rate for moss
         audioTotal += len(audioNP) / 24000
+
+        if batch_out_dir is not None:
+            wav_path = batch_out_dir / f"{request_id}.wav"
+            sf.write(wav_path, audioNP, samplerate=24000, format="WAV")
 
 
     # cleanup the current omni instance and yaml file to free GPU memory before the next batch
@@ -148,9 +177,22 @@ def run_benchmark(args):
     for bs in args.batch_sizes:
         walls, audios, tps = [], [], []
 
-        for _ in range(N_REPEATS):
-            wall, audio = run_batch(model=args.model, repo=args.repo, mode=args.mode, bs=bs, prompt=prompt, ar_params=ar_params, decoder_params=decoder_params,
-                                    init_sleep=args.init_sleep_seconds, gpu_mem_stage0=args.gpu_mem_stage0, gpu_mem_stage1=args.gpu_mem_stage1, max_num_batched_tokens=args.max_num_batched_tokens)
+        for repeat_idx in range(N_REPEATS):
+            wall, audio = run_batch(
+                model=args.model,
+                repo=args.repo,
+                mode=args.mode,
+                bs=bs,
+                prompt=prompt,
+                ar_params=ar_params,
+                decoder_params=decoder_params,
+                init_sleep=args.init_sleep_seconds,
+                gpu_mem_stage0=args.gpu_mem_stage0,
+                gpu_mem_stage1=args.gpu_mem_stage1,
+                max_num_batched_tokens=args.max_num_batched_tokens,
+                save_audio_dir=args.save_audio_dir,
+                repeat_idx=repeat_idx,
+            )
 
             tp = audio / wall
             walls.append(wall); audios.append(audio); tps.append(tp)
@@ -183,6 +225,7 @@ def main():
     p.add_argument("--gpu-mem-stage0", type=float, default=None)
     p.add_argument("--gpu-mem-stage1", type=float, default=None)
     p.add_argument("--max-num-batched-tokens", type=int, default=None)
+    p.add_argument("--save-audio-dir", default=None)
     args = p.parse_args()
     
     os.environ["VLLM_LOGGING_LEVEL"] = os.environ.get("VLLM_LOGGING_LEVEL", "WARNING")
