@@ -465,7 +465,6 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
 
         if (
             request_ids
-            and len(request_codes_list) > 1
             and all(isinstance(rid, str) and rid for rid in request_ids)
         ):
             logger.info(
