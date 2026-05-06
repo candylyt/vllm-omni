@@ -1,13 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import atexit
 import threading
+import time
 from collections import deque
 from typing import Any
 
 from ..utils.logging import get_connector_logger
 
 logger = get_connector_logger(__name__)
+
+
+def _config_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 
 class OmniTransferAdapterBase:
@@ -35,6 +49,23 @@ class OmniTransferAdapterBase:
         self.stop_event = threading.Event()
         self._recv_cond = threading.Condition()
         self._save_cond = threading.Condition()
+        connector_config = getattr(getattr(self, "connector", None), "config", {}) or {}
+        self._recv_poll_wait_s = float(
+            connector_config.get("connector_poll_wait_s", 0.001)
+        )
+        self._profile_async = _config_bool(connector_config.get("profile_async_transfer"))
+        self._profile_stats = {
+            "poll_attempts": 0,
+            "poll_successes": 0,
+            "poll_wall_s": 0.0,
+            "recv_backoff_s": 0.0,
+            "save_enqueued": 0,
+            "save_skipped": 0,
+            "save_tasks": 0,
+            "save_wall_s": 0.0,
+        }
+        if self._profile_async:
+            atexit.register(self._log_profile_stats)
 
         self.recv_thread = threading.Thread(target=self.recv_loop, daemon=True)
         self.recv_thread.start()
@@ -66,8 +97,15 @@ class OmniTransferAdapterBase:
                     continue
                 self.request_ids_mapping[request_id] = request.external_req_id
                 try:
+                    poll_t0 = time.perf_counter()
                     is_success = self._poll_single_request(request)
+                    poll_dt = time.perf_counter() - poll_t0
+                    if self._profile_async:
+                        self._profile_stats["poll_attempts"] += 1
+                        self._profile_stats["poll_wall_s"] += poll_dt
                     if is_success:
+                        if self._profile_async:
+                            self._profile_stats["poll_successes"] += 1
                         any_success = True
                     else:
                         self._pending_load_reqs.append(request)
@@ -80,7 +118,11 @@ class OmniTransferAdapterBase:
                 if not self._pending_load_reqs and not self.stop_event.is_set():
                     self._recv_cond.wait(timeout=0.1)
                 elif not any_success and not self.stop_event.is_set():
-                    self._recv_cond.wait(timeout=0.001)
+                    wait_s = self._recv_poll_wait_s
+                    if self._profile_async:
+                        self._profile_stats["recv_backoff_s"] += wait_s
+                    if wait_s > 0:
+                        self._recv_cond.wait(timeout=wait_s)
 
     def save_loop(self):
         """Loop to send outgoing data."""
@@ -88,7 +130,11 @@ class OmniTransferAdapterBase:
             while self._pending_save_reqs:
                 task = self._pending_save_reqs.popleft()
                 try:
+                    save_t0 = time.perf_counter()
                     self._send_single_request(task)
+                    if self._profile_async:
+                        self._profile_stats["save_tasks"] += 1
+                        self._profile_stats["save_wall_s"] += time.perf_counter() - save_t0
                 except Exception as e:
                     logger.warning(f"Error saving data for {task.get('request_id')}: {e}")
 
@@ -135,6 +181,30 @@ class OmniTransferAdapterBase:
             self._save_cond.notify_all()
         if self.connector is not None:
             try:
+                if self._profile_async:
+                    logger.warning(
+                        self._format_profile_stats(),
+                    )
                 self.connector.close()
             except Exception:
                 pass
+
+    def _format_profile_stats(self) -> str:
+        return (
+            "[AsyncTransferProfile] poll_attempts=%d poll_successes=%d "
+            "poll_wall_s=%.6f recv_backoff_s=%.6f save_enqueued=%d "
+            "save_skipped=%d save_tasks=%d save_wall_s=%.6f"
+        ) % (
+            self._profile_stats["poll_attempts"],
+            self._profile_stats["poll_successes"],
+            self._profile_stats["poll_wall_s"],
+            self._profile_stats["recv_backoff_s"],
+            self._profile_stats["save_enqueued"],
+            self._profile_stats["save_skipped"],
+            self._profile_stats["save_tasks"],
+            self._profile_stats["save_wall_s"],
+        )
+
+    def _log_profile_stats(self) -> None:
+        if self._profile_async:
+            logger.warning(self._format_profile_stats())

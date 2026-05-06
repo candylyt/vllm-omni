@@ -88,6 +88,10 @@ def make_yaml(
     gpu_mem_stage0=None,
     gpu_mem_stage1=None,
     max_num_batched_tokens=None,
+    connector_poll_wait_s=None,
+    profile_async_transfer=False,
+    initial_codec_chunk_frames=None,
+    codec_chunk_frames=None,
 ):
     with open(base_yaml_path) as f:
         cfg = yaml.safe_load(f)
@@ -122,6 +126,17 @@ def make_yaml(
     runtime_defaults = cfg.get("runtime", {}).get("defaults")
     if isinstance(runtime_defaults, dict) and "max_inflight" in runtime_defaults:
         runtime_defaults["max_inflight"] = max_num_seqs
+    connector = cfg.get("runtime", {}).get("connectors", {}).get("connector_of_shared_memory", {})
+    extra = connector.get("extra")
+    if isinstance(extra, dict):
+        if connector_poll_wait_s is not None:
+            extra["connector_poll_wait_s"] = connector_poll_wait_s
+        if profile_async_transfer:
+            extra["profile_async_transfer"] = 1
+        if initial_codec_chunk_frames is not None:
+            extra["initial_codec_chunk_frames"] = initial_codec_chunk_frames
+        if codec_chunk_frames is not None:
+            extra["codec_chunk_frames"] = codec_chunk_frames
 
     tmp = tempfile.NamedTemporaryFile(
         mode="w",
@@ -147,6 +162,10 @@ def run_batch(
     gpu_mem_stage0=None,
     gpu_mem_stage1=None,
     max_num_batched_tokens=None,
+    connector_poll_wait_s=None,
+    profile_async_transfer=False,
+    initial_codec_chunk_frames=None,
+    codec_chunk_frames=None,
 ):
     yaml_name = "moss_tts_delay_async.yaml" if mode == "async" else "moss_tts_delay.yaml"
     base_yaml = os.path.join(
@@ -161,6 +180,10 @@ def run_batch(
         gpu_mem_stage0=gpu_mem_stage0,
         gpu_mem_stage1=gpu_mem_stage1,
         max_num_batched_tokens=max_num_batched_tokens,
+        connector_poll_wait_s=connector_poll_wait_s,
+        profile_async_transfer=profile_async_transfer,
+        initial_codec_chunk_frames=initial_codec_chunk_frames,
+        codec_chunk_frames=codec_chunk_frames,
     )
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -258,6 +281,10 @@ def run_benchmark(args):
                 gpu_mem_stage0=args.gpu_mem_stage0,
                 gpu_mem_stage1=args.gpu_mem_stage1,
                 max_num_batched_tokens=args.max_num_batched_tokens,
+                connector_poll_wait_s=args.connector_poll_wait_s,
+                profile_async_transfer=args.profile_async_transfer,
+                initial_codec_chunk_frames=args.initial_codec_chunk_frames,
+                codec_chunk_frames=args.codec_chunk_frames,
             )
 
             tp = audio / wall if wall > 0 else 0
@@ -313,6 +340,10 @@ def main():
     parser.add_argument("--gpu-mem-stage0", type=float, default=None)
     parser.add_argument("--gpu-mem-stage1", type=float, default=None)
     parser.add_argument("--max-num-batched-tokens", type=int, default=None)
+    parser.add_argument("--connector-poll-wait-s", type=float, default=None)
+    parser.add_argument("--profile-async-transfer", action="store_true")
+    parser.add_argument("--initial-codec-chunk-frames", type=int, default=None)
+    parser.add_argument("--codec-chunk-frames", type=int, default=None)
     args = parser.parse_args()
 
     global BATCH_SIZES

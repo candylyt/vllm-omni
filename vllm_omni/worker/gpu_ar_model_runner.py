@@ -6,6 +6,7 @@ and also outputs sampled tokens.
 
 from __future__ import annotations
 
+import inspect
 from copy import copy
 from typing import Any, NamedTuple
 
@@ -540,6 +541,16 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
+            bookkeeping_sync = self._bookkeeping_sync
+            bookkeeping_args = [
+                scheduler_output,
+                sampler_output,
+                logits,
+                hidden_states,
+                scheduler_output.total_num_scheduled_tokens,
+            ]
+            if "spec_decode_metadata" in inspect.signature(bookkeeping_sync).parameters:
+                bookkeeping_args.append(spec_decode_metadata)
             (
                 num_nans_in_logits,
                 logprobs_lists,
@@ -548,14 +559,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 req_ids_output_copy,
                 req_id_to_index_output_copy,
                 invalid_req_indices,
-            ) = self._bookkeeping_sync(
-                scheduler_output,
-                sampler_output,
-                logits,
-                hidden_states,
-                scheduler_output.total_num_scheduled_tokens,
-                spec_decode_metadata,
-            )
+            ) = bookkeeping_sync(*bookkeeping_args)
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled

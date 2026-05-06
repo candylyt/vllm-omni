@@ -30,8 +30,10 @@
 #                                if unset (will auto-download from HuggingFace).
 
 import copy
+import atexit
 import logging
 import os
+import time
 from collections.abc import Iterable
 from contextlib import ExitStack
 from typing import Any
@@ -472,6 +474,18 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         self._batch_streaming_decode_failed = False
         self._logged_stateless_batch_decode = False
         self._logged_streaming_batch_decode = False
+        self._profile_decoder = os.environ.get("MOSS_TTS_DECODER_PROFILE") == "1"
+        self._decoder_profile_stats = {
+            "forward_calls": 0,
+            "batch_streaming_calls": 0,
+            "batch_streaming_wall_s": 0.0,
+            "batch_stateless_calls": 0,
+            "batch_stateless_wall_s": 0.0,
+            "single_decode_calls": 0,
+            "single_decode_wall_s": 0.0,
+        }
+        if self._profile_decoder:
+            atexit.register(self._log_decoder_profile)
 
         # Dummy logits processor / sampler required by vllm's model protocol
         self.logits_processor = LogitsProcessor(cfg.language_config.vocab_size)
@@ -711,16 +725,23 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         Returns     : [samples]   float32  (empty tensor if codes are invalid)
         """
         empty = torch.zeros(0, dtype=torch.float32, device=self.device)
+        profile_t0 = time.perf_counter() if self._profile_decoder else 0.0
 
         if flat_codes is None or flat_codes.numel() == 0:
             if request_id and is_finished:
                 self._exit_streaming(request_id)
+            if self._profile_decoder:
+                self._decoder_profile_stats["single_decode_calls"] += 1
+                self._decoder_profile_stats["single_decode_wall_s"] += time.perf_counter() - profile_t0
             return empty
 
         codes = _parse_flat_codes(flat_codes, self.n_vq)  # [n_vq, T] or None
         if codes is None:
             if request_id and is_finished:
                 self._exit_streaming(request_id)
+            if self._profile_decoder:
+                self._decoder_profile_stats["single_decode_calls"] += 1
+                self._decoder_profile_stats["single_decode_wall_s"] += time.perf_counter() - profile_t0
             return empty
 
         try:
@@ -749,6 +770,10 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
             if request_id and is_finished:
                 self._exit_streaming(request_id)
             return empty
+        finally:
+            if self._profile_decoder:
+                self._decoder_profile_stats["single_decode_calls"] += 1
+                self._decoder_profile_stats["single_decode_wall_s"] += time.perf_counter() - profile_t0
 
     def _batch_decode_stateless(
         self,
@@ -757,6 +782,9 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         """Decode sync-mode Stage-1 requests in one CAT codec forward."""
         if len(request_codes_list) <= 1 or self._batch_stateless_decode_failed:
             return None
+        profile_t0 = time.perf_counter() if self._profile_decoder else 0.0
+        if self._profile_decoder:
+            self._decoder_profile_stats["batch_stateless_calls"] += 1
 
         results, valid_indices, batch_codes, batch_lengths = self._pack_code_batch(request_codes_list)
         if batch_codes is None or batch_lengths is None:
@@ -823,6 +851,9 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
             )
             self._suspend_active_streaming()
             return None
+        finally:
+            if self._profile_decoder:
+                self._decoder_profile_stats["batch_stateless_wall_s"] += time.perf_counter() - profile_t0
 
     def _batch_decode_streaming(
         self,
@@ -835,7 +866,6 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
             return None
         if any(request_id is None for request_id in request_ids):
             return None
-
         results, valid_indices, batch_codes, batch_lengths = self._pack_code_batch(request_codes_list)
         if batch_codes is None or batch_lengths is None:
             for i, request_id in enumerate(request_ids):
@@ -846,6 +876,9 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
             return None
 
         valid_request_ids = [str(request_ids[i]) for i in valid_indices]
+        profile_t0 = time.perf_counter() if self._profile_decoder else 0.0
+        if self._profile_decoder:
+            self._decoder_profile_stats["batch_streaming_calls"] += 1
 
         try:
             self._activate_streaming_batch(valid_request_ids)
@@ -875,6 +908,9 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
             )
             self._suspend_active_streaming()
             return None
+        finally:
+            if self._profile_decoder:
+                self._decoder_profile_stats["batch_streaming_wall_s"] += time.perf_counter() - profile_t0
 
     @torch.inference_mode()
     def _batch_decode(
@@ -920,6 +956,9 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs,
     ) -> OmniOutput:
+        if self._profile_decoder:
+            self._decoder_profile_stats["forward_calls"] += 1
+
         # Resolve runtime_additional_information from alternate kwargs keys
         if runtime_additional_information is None:
             runtime_additional_information = kwargs.get("model_intermediate_buffer") or kwargs.get(
@@ -1019,6 +1058,22 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
             hidden_size,
             dtype=torch.bfloat16,
             device=self.device,
+        )
+
+    def _log_decoder_profile(self) -> None:
+        if not self._profile_decoder:
+            return
+        logger.warning(
+            "[MossTTSDecoderProfile] forward_calls=%d batch_streaming_calls=%d "
+            "batch_streaming_wall_s=%.6f batch_stateless_calls=%d "
+            "batch_stateless_wall_s=%.6f single_decode_calls=%d single_decode_wall_s=%.6f",
+            self._decoder_profile_stats["forward_calls"],
+            self._decoder_profile_stats["batch_streaming_calls"],
+            self._decoder_profile_stats["batch_streaming_wall_s"],
+            self._decoder_profile_stats["batch_stateless_calls"],
+            self._decoder_profile_stats["batch_stateless_wall_s"],
+            self._decoder_profile_stats["single_decode_calls"],
+            self._decoder_profile_stats["single_decode_wall_s"],
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:

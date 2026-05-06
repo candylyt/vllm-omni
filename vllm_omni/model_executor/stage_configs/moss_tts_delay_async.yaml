@@ -134,6 +134,7 @@ runtime:
         codec_chunk_frames: 50
         # MossTTSDecoderModel does not trim left context, so set to 0.
         codec_left_context_frames: 0
+        build_chunk_payload_on_submit: true
 
   edges:
     - from: 0

@@ -11,7 +11,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStat
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
-from vllm.v1.core.sched.utils import remove_all
+from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.outputs import ModelRunnerOutput
@@ -76,6 +76,33 @@ class OmniARScheduler(VLLMScheduler):
             getattr(model_config, "custom_process_next_stage_input_func", None)
             == _MOSS_TTS_DELAY_ASYNC_PROCESSOR
         )
+        self._moss_tts_delay_stop_token_id: int | None = None
+        if getattr(model_config, "model_stage", None) == "delay_ar_stage":
+            hf_config = getattr(model_config, "hf_config", None)
+            stop_token_id = getattr(hf_config, "audio_end_token_id", None)
+            if stop_token_id is not None:
+                self._moss_tts_delay_stop_token_id = int(stop_token_id)
+
+    def _update_request_with_output(
+        self, request: Request, new_token_ids: list[int]
+    ) -> tuple[list[int], bool]:
+        if self._moss_tts_delay_stop_token_id is None:
+            return super()._update_request_with_output(request, new_token_ids)
+
+        stopped = False
+        stop_token_id = self._moss_tts_delay_stop_token_id
+        for num_new, output_token_id in enumerate(new_token_ids, 1):
+            request.append_output_token_ids(output_token_id)
+            if output_token_id == stop_token_id:
+                request.status = RequestStatus.FINISHED_STOPPED
+                request.stop_reason = stop_token_id
+                stopped = True
+            else:
+                stopped = check_stop(request, self.max_model_len)
+            if stopped:
+                del new_token_ids[num_new:]
+                break
+        return new_token_ids, stopped
 
     def _get_kv_transfer_criteria(self) -> dict | None:
         # Note: vllm_config is available in Scheduler after super().__init__
