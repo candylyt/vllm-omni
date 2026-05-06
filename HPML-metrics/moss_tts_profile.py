@@ -158,7 +158,8 @@ def profile_mode(mode, sentences, model, repo, output_base, init_sleep, mtype):
     ar_stop_ids = get_stop_ids(model)
     ar_params = None
 
-    wandbRun = wandb.init(project="hpml-final-project", name= f"vllm-local-inference-profile-{mode}", 
+
+    wandbRun = wandb.init(project="hpml-final-project", name= f"vllm-{mtype}-inference-profile-{mode}", 
                           config={"model": model, "mode": mode})
 
     # set sampling params for AR stage for model
