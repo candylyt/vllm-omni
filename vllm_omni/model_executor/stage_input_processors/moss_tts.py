@@ -116,9 +116,19 @@ def _codes_to_flat_list(codes: Any, n_vq: int) -> list[int] | None:
     return codes.tolist()
 
 
-def _make_finished_sentinel() -> dict[str, Any]:
+def _make_finished_sentinel(
+    request_id: str,
+    chunk_size: int,
+) -> dict[str, Any]:
     """Minimal payload signalling Stage 1 to end the request."""
-    return {"code_predictor_codes": [], "finished": torch.tensor(True, dtype=torch.bool)}
+    return {
+        "code_predictor_codes": [],
+        "code_flat_numel": 0,
+        "codec_chunk_frames": chunk_size,
+        "left_context_size": 0,
+        "request_id": request_id,
+        "finished": torch.tensor(True, dtype=torch.bool),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -315,7 +325,7 @@ def llm2decoder_async_chunk(
     if n_new <= 0:
         if is_finished:
             sent_map.pop(request_id, None)
-            return _make_finished_sentinel()
+            return _make_finished_sentinel(request_id, chunk_size)
         return None
 
     if not is_finished and n_new < chunk_size:
