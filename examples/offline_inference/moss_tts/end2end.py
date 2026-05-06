@@ -13,6 +13,7 @@ Usage:
 import copy
 import os
 import soundfile as sf
+import torch
 from vllm import SamplingParams
 from vllm_omni.entrypoints.omni import Omni
 
