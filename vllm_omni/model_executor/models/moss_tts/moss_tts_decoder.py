@@ -486,6 +486,17 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         }
         if self._profile_decoder:
             atexit.register(self._log_decoder_profile)
+        self._first_chunk_dir: str | None = os.environ.get("MOSS_FIRST_CHUNK_DIR")
+        self._first_chunk_seen: set[str] = set()
+        if self._first_chunk_dir:
+            try:
+                os.makedirs(self._first_chunk_dir, exist_ok=True)
+            except OSError:
+                logger.warning(
+                    "[MossTTS Decoder] Could not create first-chunk directory: %s",
+                    self._first_chunk_dir,
+                )
+                self._first_chunk_dir = None
 
         # Dummy logits processor / sampler required by vllm's model protocol
         self.logits_processor = LogitsProcessor(cfg.language_config.vocab_size)
@@ -494,6 +505,30 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
     # ══════════════════════════════════════════════════════════════════
     #  Core decode logic
     # ══════════════════════════════════════════════════════════════════
+
+    def _record_first_chunk(self, request_id: str | None) -> None:
+        if not self._first_chunk_dir:
+            return
+
+        timestamp = f"{time.time():.9f}"
+        keys = [request_id] if request_id else []
+        keys.append("first")
+
+        for key in keys:
+            if not key or key in self._first_chunk_seen:
+                continue
+            path = os.path.join(self._first_chunk_dir, f"{key}.first_chunk.ts")
+            if key == "first" and os.path.exists(path):
+                self._first_chunk_seen.add(key)
+                continue
+            try:
+                with open(path, "x", encoding="utf-8") as f:
+                    f.write(timestamp)
+                self._first_chunk_seen.add(key)
+            except FileExistsError:
+                self._first_chunk_seen.add(key)
+            except OSError:
+                logger.exception("[MossTTS Decoder] Failed to record first chunk timestamp")
 
     def _get_all_streaming_modules(self) -> list:
         """Return a stable ordered list of every StreamingModule in the codec decoder."""
@@ -763,6 +798,8 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
                 # Fallback: stateless single-call decode (sync / non-streaming mode).
                 wav = self._codec.decode(codes)
 
+            if wav is not None and wav.numel() > 0:
+                self._record_first_chunk(request_id)
             return wav.to(self.device)
         except Exception as exc:
             logger.error("[MossTTS Decoder] Codec decode failed: %s", exc, exc_info=True)
