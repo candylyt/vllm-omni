@@ -54,6 +54,10 @@ logger = logging.getLogger(__name__)
 _TIMER = get_timer()
 
 
+def _decoder_debug_enabled() -> bool:
+    return os.environ.get("MOSS_TTS_DECODER_DEBUG", "0") == "1"
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CAT Codec worker (singleton per process / device)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -337,22 +341,24 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         """Enter one shared codec streaming context for a multi-request batch."""
         if self._batched_streaming_stack is not None:
             if self._batched_streaming_request_ids != request_ids:
-                logger.warning(
-                    "[MossTTS Decoder] Batched streaming request set changed "
-                    "from %s to %s; resetting codec streaming state.",
-                    self._batched_streaming_request_ids,
-                    request_ids,
-                )
+                if _decoder_debug_enabled():
+                    logger.warning(
+                        "[MossTTS Decoder] Batched streaming request set changed "
+                        "from %s to %s; resetting codec streaming state.",
+                        self._batched_streaming_request_ids,
+                        request_ids,
+                    )
                 self._exit_batched_streaming()
             else:
                 return
 
         if self._streaming_states:
-            logger.warning(
-                "[MossTTS Decoder] Switching from per-request streaming to "
-                "batched streaming; resetting %d active single-request states.",
-                len(self._streaming_states),
-            )
+            if _decoder_debug_enabled():
+                logger.warning(
+                    "[MossTTS Decoder] Switching from per-request streaming to "
+                    "batched streaming; resetting %d active single-request states.",
+                    len(self._streaming_states),
+                )
             self._reset_streaming_topology()
 
         stack = ExitStack()
@@ -414,12 +420,13 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
                 if request_id is not None:
                     # Streaming path: maintain causal KV-cache across chunks.
                     if self._batched_streaming_stack is not None:
-                        logger.warning(
-                            "[MossTTS Decoder] Switching from batched "
-                            "streaming to per-request streaming for %s; "
-                            "resetting codec streaming state.",
-                            request_id,
-                        )
+                        if _decoder_debug_enabled():
+                            logger.warning(
+                                "[MossTTS Decoder] Switching from batched "
+                                "streaming to per-request streaming for %s; "
+                                "resetting codec streaming state.",
+                                request_id,
+                            )
                         self._reset_streaming_topology()
                     self._enter_streaming(request_id)
                     codec = self._codec.codec
@@ -453,25 +460,27 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
     ) -> list[torch.Tensor]:
         """Decode multiple requests, using per-request streaming state when available."""
         empty = torch.zeros(0, dtype=torch.float32)
-        logger.info(
-            "[MossTTS Decoder][DEBUG] _batch_decode num_req=%d request_ids=%s "
-            "finished=%s batched_streaming_active=%s single_streams=%d",
-            len(request_codes_list),
-            request_ids,
-            finished_flags,
-            self._batched_streaming_stack is not None,
-            len(self._streaming_states),
-        )
+        if _decoder_debug_enabled():
+            logger.info(
+                "[MossTTS Decoder][DEBUG] _batch_decode num_req=%d request_ids=%s "
+                "finished=%s batched_streaming_active=%s single_streams=%d",
+                len(request_codes_list),
+                request_ids,
+                finished_flags,
+                self._batched_streaming_stack is not None,
+                len(self._streaming_states),
+            )
 
         if (
             request_ids
             and all(isinstance(rid, str) and rid for rid in request_ids)
         ):
-            logger.info(
-                "[MossTTS Decoder][DEBUG] taking batched streaming path for "
-                "request_ids=%s",
-                request_ids,
-            )
+            if _decoder_debug_enabled():
+                logger.info(
+                    "[MossTTS Decoder][DEBUG] taking batched streaming path for "
+                    "request_ids=%s",
+                    request_ids,
+                )
             return self._batch_decode_streaming(
                 request_codes_list,
                 [rid for rid in request_ids if isinstance(rid, str)],
@@ -479,25 +488,27 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
             )
 
         if self._batched_streaming_stack is not None:
-            logger.warning(
-                "[MossTTS Decoder] Falling back to non-batched decode for %d "
-                "request(s); resetting active batched streaming state.",
-                len(request_codes_list),
-            )
+            if _decoder_debug_enabled():
+                logger.warning(
+                    "[MossTTS Decoder] Falling back to non-batched decode for %d "
+                    "request(s); resetting active batched streaming state.",
+                    len(request_codes_list),
+                )
             self._reset_streaming_topology()
 
         results: list[torch.Tensor] = []
         for i, req_codes in enumerate(request_codes_list):
             req_id = request_ids[i] if request_ids else None
             finished = finished_flags[i] if finished_flags else False
-            logger.info(
-                "[MossTTS Decoder][DEBUG] taking per-request path idx=%d "
-                "request_id=%s finished=%s numel=%d",
-                i,
-                req_id,
-                finished,
-                int(req_codes.numel()) if req_codes is not None else -1,
-            )
+            if _decoder_debug_enabled():
+                logger.info(
+                    "[MossTTS Decoder][DEBUG] taking per-request path idx=%d "
+                    "request_id=%s finished=%s numel=%d",
+                    i,
+                    req_id,
+                    finished,
+                    int(req_codes.numel()) if req_codes is not None else -1,
+                )
             wav = self._decode_one_request(req_codes, request_id=req_id, is_finished=finished)
             results.append(wav if wav.numel() > 0 else empty)
         return results
@@ -529,13 +540,14 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
             parsed_codes.append(parsed)
             lengths.append(int(parsed.shape[-1]))
 
-        logger.info(
-            "[MossTTS Decoder][DEBUG] batched stream request_ids=%s lengths=%s "
-            "finished=%s",
-            request_ids,
-            lengths,
-            finished_flags,
-        )
+        if _decoder_debug_enabled():
+            logger.info(
+                "[MossTTS Decoder][DEBUG] batched stream request_ids=%s lengths=%s "
+                "finished=%s",
+                request_ids,
+                lengths,
+                finished_flags,
+            )
 
         if max(lengths, default=0) == 0:
             if all(finished_flags):
@@ -683,7 +695,7 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
                         if isinstance(fin, torch.Tensor):
                             fin = bool(fin.item())
                         finished_flags.append(bool(fin) if fin is not None else False)
-                    if not getattr(self, "_dumped_info_keys", False):
+                    if _decoder_debug_enabled() and not getattr(self, "_dumped_info_keys", False):
                         self._dumped_info_keys = True
                         for idx, info in enumerate(runtime_additional_information):
                             if isinstance(info, dict):
