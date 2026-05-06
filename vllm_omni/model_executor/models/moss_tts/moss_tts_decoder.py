@@ -453,12 +453,26 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
     ) -> list[torch.Tensor]:
         """Decode multiple requests, using per-request streaming state when available."""
         empty = torch.zeros(0, dtype=torch.float32)
+        logger.info(
+            "[MossTTS Decoder][DEBUG] _batch_decode num_req=%d request_ids=%s "
+            "finished=%s batched_streaming_active=%s single_streams=%d",
+            len(request_codes_list),
+            request_ids,
+            finished_flags,
+            self._batched_streaming_stack is not None,
+            len(self._streaming_states),
+        )
 
         if (
             request_ids
             and len(request_codes_list) > 1
             and all(isinstance(rid, str) and rid for rid in request_ids)
         ):
+            logger.info(
+                "[MossTTS Decoder][DEBUG] taking batched streaming path for "
+                "request_ids=%s",
+                request_ids,
+            )
             return self._batch_decode_streaming(
                 request_codes_list,
                 [rid for rid in request_ids if isinstance(rid, str)],
@@ -477,6 +491,14 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         for i, req_codes in enumerate(request_codes_list):
             req_id = request_ids[i] if request_ids else None
             finished = finished_flags[i] if finished_flags else False
+            logger.info(
+                "[MossTTS Decoder][DEBUG] taking per-request path idx=%d "
+                "request_id=%s finished=%s numel=%d",
+                i,
+                req_id,
+                finished,
+                int(req_codes.numel()) if req_codes is not None else -1,
+            )
             wav = self._decode_one_request(req_codes, request_id=req_id, is_finished=finished)
             results.append(wav if wav.numel() > 0 else empty)
         return results
@@ -507,6 +529,14 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
                     parsed = torch.zeros(self.n_vq, 0, dtype=torch.long)
             parsed_codes.append(parsed)
             lengths.append(int(parsed.shape[-1]))
+
+        logger.info(
+            "[MossTTS Decoder][DEBUG] batched stream request_ids=%s lengths=%s "
+            "finished=%s",
+            request_ids,
+            lengths,
+            finished_flags,
+        )
 
         if max(lengths, default=0) == 0:
             if all(finished_flags):
