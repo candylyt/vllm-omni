@@ -201,6 +201,16 @@ def main():
                 print(f"[{rid}] No audio in output — check AR stage generated gen_slot tokens.")
                 continue
 
+            if isinstance(audio_tensor, list):
+                chunks = [
+                    t for t in audio_tensor
+                    if isinstance(t, torch.Tensor) and t.numel() > 0
+                ]
+                if not chunks:
+                    print(f"[{rid}] No audio chunks in output.")
+                    continue
+                audio_tensor = torch.cat(chunks, dim=0)
+
             audio_np = audio_tensor.float().detach().cpu().numpy()
             if audio_np.ndim > 1:
                 audio_np = audio_np.flatten()
