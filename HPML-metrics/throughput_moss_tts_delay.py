@@ -186,7 +186,7 @@ def run_benchmark(args):
             "fixed_text": FIXED_TEXT,
             "max_ar_tokens": MAX_AR_TOKENS,
             "max_decoder_tokens": MAX_DECODER_TOKENS,
-            "batch_sizes": BATCH_SIZES,
+            "batch_sizes": args.batch_sizes,
             "n_repeats": N_REPEATS})
 
     print(f"  Model: MOSS-TTS-DELAY")
@@ -202,7 +202,7 @@ def run_benchmark(args):
     res = []
     tp0 = None
 
-    for bs in BATCH_SIZES:
+    for bs in args.batch_sizes:
         walls, audios, tps = [], [], []
 
         for _ in range(N_REPEATS):
@@ -265,8 +265,7 @@ def main():
     parser.add_argument("--max-num-batched-tokens", type=int, default=None)
     args = parser.parse_args()
 
-    global BATCH_SIZES
-    BATCH_SIZES = args.batch_sizes
+  
     os.environ["VLLM_LOGGING_LEVEL"] = os.environ.get("VLLM_LOGGING_LEVEL", "WARNING")
 
     run_benchmark(args)

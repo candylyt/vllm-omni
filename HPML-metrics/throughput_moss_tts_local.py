@@ -126,7 +126,7 @@ def run_benchmark(args):
     #initialize the wandbrun
     wandbRun = wandb.init(project="hpml-final-project", name= "vllm-local-throughput", 
                         config={"model": "vllm-local", "fixed_text": FIXED_TEXT,  "max_ar_tokens": MAX_AR_TOKENS,
-                                "batch_sizes": BATCH_SIZES,
+                                "batch_sizes": args.batch_sizes,
                                 "n_repeats": N_REPEATS})
 
     # build prompts and sampling params
@@ -146,7 +146,7 @@ def run_benchmark(args):
 
     tp0 = None
 
-    for bs in BATCH_SIZES:
+    for bs in args.batch_sizes:
         walls, audios, tps = [], [], []
 
         for _ in range(N_REPEATS):
@@ -186,11 +186,6 @@ def main():
     p.add_argument("--max-num-batched-tokens", type=int, default=None)
     args = p.parse_args()
     
-    global BATCH_SIZES
-
-
-
-    BATCH_SIZES = args.batch_sizes
     os.environ["VLLM_LOGGING_LEVEL"] = os.environ.get("VLLM_LOGGING_LEVEL", "WARNING")
 
     run_benchmark(args)
