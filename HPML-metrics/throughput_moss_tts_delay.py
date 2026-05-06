@@ -31,7 +31,7 @@ from uni_functions import build_tts_prompt
 
 
 FIXED_TEXT = "The weather is so nice today and the birds are singing in the trees."
-BATCH_SIZES = [1, 2, 4]
+BATCH_SIZES = [1, 2, 4, 16, 32, 64, 128, 256]
 N_REPEATS = 1
 MAX_AR_TOKENS = 900
 MAX_DECODER_TOKENS = 32768

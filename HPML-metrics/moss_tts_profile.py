@@ -17,7 +17,7 @@ Usage:
     --model-type  delay \
     --model       ${MOSS_TTS_DELAY_PATH} \
     --repo        ${REPO} \
-    --n           20 \
+    --n           2 \
     --min-words   10 \
     --max-words   60 \
     --output-dir  ./profiling_results
