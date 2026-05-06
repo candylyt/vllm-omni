@@ -33,7 +33,7 @@ from uni_functions import build_tts_prompt, get_stop_ids
 
 
 FIXED_TEXT  = "The weather is so nice today and the birds are singing in the trees."
-BATCH_SIZES = [1, 4, 8, 16, 64, 128, 256]
+
 N_REPEATS   = 1
 MAX_AR_TOKENS = 200
 INIT_SLEEP_S  = 30
@@ -180,7 +180,7 @@ def main():
     p.add_argument("--repo", required=True)
     p.add_argument("--mode", default="async", choices=["async", "sync"])
     p.add_argument("--init-sleep-seconds", type=int, default=INIT_SLEEP_S)
-    p.add_argument("--batch-sizes", nargs="+", type=int, default=[1, 2, 4])
+    p.add_argument("--batch-sizes", nargs="+", type=int, default=[1, 2, 4, 16, 32, 64, 128, 256])
     p.add_argument("--gpu-mem-stage0", type=float, default=None)
     p.add_argument("--gpu-mem-stage1", type=float, default=None)
     p.add_argument("--max-num-batched-tokens", type=int, default=None)
