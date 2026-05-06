@@ -8,7 +8,6 @@ Usage:
   python3 throughput_moss_tts_local.py \
     --model  ${MOSS_TTS_LOCAL_PATH} \
     --repo   ${REPO} \
-    --output-dir ./throughput_results_vllm_local
 """
 
 import wandb
