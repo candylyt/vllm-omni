@@ -101,21 +101,4 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 # Expected: 2.x.x  True
 
 
-```
-
-## 8. Profiling Execution
-```bash
-# Local/ Delay would be the same thing but DELAY path and delay model type
-PYTHONPATH=${REPO} \
-MOSS_AUDIO_TOKENIZER_PATH=${MOSS_AUDIO_TOKENIZER_PATH} \
-CUDA_VISIBLE_DEVICES=0 \
-python moss_tts_profile.py \
-  --model    ${MOSS_TTS_LOCAL_PATH} \
-  --model-type local \
-  --repo     ${REPO} \
-  --n        20 \
-  --min-words 10 \
-  --max-words 50 \
-  --output-dir ./profiling_results_local \
-  --init-sleep-seconds 30
-```
+``'
