@@ -54,6 +54,10 @@ logger = logging.getLogger(__name__)
 _TIMER = get_timer()
 
 
+def _decoder_debug_enabled() -> bool:
+    return os.environ.get("MOSS_TTS_DECODER_DEBUG", "0") == "1"
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CAT Codec worker (singleton per process / device)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -250,6 +254,11 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         # KV-cache context.  Entries are created on the first chunk for a
         # request and closed when ``is_finished=True`` is observed.
         self._streaming_states: dict[str, ExitStack] = {}
+        # Batched streaming state for multi-request async decode.  The CAT
+        # codec exposes a single global streaming mode per codec instance, so
+        # concurrent requests must share one batch-sized streaming context.
+        self._batched_streaming_stack: ExitStack | None = None
+        self._batched_streaming_request_ids: list[str] | None = None
 
         # Synthetic request-id tracking (workaround: the SharedMemoryConnector
         # strips the processor's ``request_id`` / ``finished`` keys, so Stage 1
@@ -322,6 +331,52 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         if stack is not None:
             stack.close()
 
+    def _reset_streaming_topology(self) -> None:
+        """Close any active codec streaming sessions before switching modes."""
+        for request_id in list(self._streaming_states.keys()):
+            self._exit_streaming(request_id)
+        self._exit_batched_streaming()
+
+    def _enter_batched_streaming(self, request_ids: list[str]) -> None:
+        """Enter one shared codec streaming context for a multi-request batch."""
+        if self._batched_streaming_stack is not None:
+            if self._batched_streaming_request_ids != request_ids:
+                if _decoder_debug_enabled():
+                    logger.warning(
+                        "[MossTTS Decoder] Batched streaming request set changed "
+                        "from %s to %s; resetting codec streaming state.",
+                        self._batched_streaming_request_ids,
+                        request_ids,
+                    )
+                self._exit_batched_streaming()
+            else:
+                return
+
+        if self._streaming_states:
+            if _decoder_debug_enabled():
+                logger.warning(
+                    "[MossTTS Decoder] Switching from per-request streaming to "
+                    "batched streaming; resetting %d active single-request states.",
+                    len(self._streaming_states),
+                )
+            self._reset_streaming_topology()
+
+        stack = ExitStack()
+        codec = self._codec.codec
+        batch_size = len(request_ids)
+        for decoder_module in codec.decoder:
+            if hasattr(decoder_module, "streaming") and callable(decoder_module.streaming):
+                stack.enter_context(decoder_module.streaming(batch_size=batch_size))
+        self._batched_streaming_stack = stack
+        self._batched_streaming_request_ids = list(request_ids)
+
+    def _exit_batched_streaming(self) -> None:
+        """Exit the shared codec streaming context for a multi-request batch."""
+        if self._batched_streaming_stack is not None:
+            self._batched_streaming_stack.close()
+        self._batched_streaming_stack = None
+        self._batched_streaming_request_ids = None
+
     def _decode_one_request(
         self,
         flat_codes: torch.Tensor,
@@ -364,6 +419,15 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
             try:
                 if request_id is not None:
                     # Streaming path: maintain causal KV-cache across chunks.
+                    if self._batched_streaming_stack is not None:
+                        if _decoder_debug_enabled():
+                            logger.warning(
+                                "[MossTTS Decoder] Switching from batched "
+                                "streaming to per-request streaming for %s; "
+                                "resetting codec streaming state.",
+                                request_id,
+                            )
+                        self._reset_streaming_topology()
                     self._enter_streaming(request_id)
                     codec = self._codec.codec
                     codes_3d = codes.unsqueeze(1).to(self.device)   # [n_vq, 1, T]
@@ -396,12 +460,136 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
     ) -> list[torch.Tensor]:
         """Decode multiple requests, using per-request streaming state when available."""
         empty = torch.zeros(0, dtype=torch.float32)
+        if _decoder_debug_enabled():
+            logger.info(
+                "[MossTTS Decoder][DEBUG] _batch_decode num_req=%d request_ids=%s "
+                "finished=%s batched_streaming_active=%s single_streams=%d",
+                len(request_codes_list),
+                request_ids,
+                finished_flags,
+                self._batched_streaming_stack is not None,
+                len(self._streaming_states),
+            )
+
+        if (
+            request_ids
+            and all(isinstance(rid, str) and rid for rid in request_ids)
+        ):
+            if _decoder_debug_enabled():
+                logger.info(
+                    "[MossTTS Decoder][DEBUG] taking batched streaming path for "
+                    "request_ids=%s",
+                    request_ids,
+                )
+            return self._batch_decode_streaming(
+                request_codes_list,
+                [rid for rid in request_ids if isinstance(rid, str)],
+                finished_flags or [False] * len(request_codes_list),
+            )
+
+        if self._batched_streaming_stack is not None:
+            if _decoder_debug_enabled():
+                logger.warning(
+                    "[MossTTS Decoder] Falling back to non-batched decode for %d "
+                    "request(s); resetting active batched streaming state.",
+                    len(request_codes_list),
+                )
+            self._reset_streaming_topology()
+
         results: list[torch.Tensor] = []
         for i, req_codes in enumerate(request_codes_list):
             req_id = request_ids[i] if request_ids else None
             finished = finished_flags[i] if finished_flags else False
+            if _decoder_debug_enabled():
+                logger.info(
+                    "[MossTTS Decoder][DEBUG] taking per-request path idx=%d "
+                    "request_id=%s finished=%s numel=%d",
+                    i,
+                    req_id,
+                    finished,
+                    int(req_codes.numel()) if req_codes is not None else -1,
+                )
             wav = self._decode_one_request(req_codes, request_id=req_id, is_finished=finished)
             results.append(wav if wav.numel() > 0 else empty)
+        return results
+
+    def _batch_decode_streaming(
+        self,
+        request_codes_list: list[torch.Tensor],
+        request_ids: list[str],
+        finished_flags: list[bool],
+    ) -> list[torch.Tensor]:
+        """Decode multiple active requests through one batched codec stream."""
+        empty = torch.zeros(0, dtype=torch.float32)
+
+        if len(request_codes_list) != len(request_ids):
+            raise ValueError(
+                "request_codes_list and request_ids must have the same length "
+                f"(got {len(request_codes_list)} vs {len(request_ids)})."
+            )
+
+        parsed_codes: list[torch.Tensor] = []
+        lengths: list[int] = []
+        for flat_codes in request_codes_list:
+            if flat_codes is None or flat_codes.numel() == 0:
+                parsed = torch.zeros(self.n_vq, 0, dtype=torch.long)
+            else:
+                parsed = _parse_flat_codes(flat_codes, self.n_vq)
+                if parsed is None:
+                    parsed = torch.zeros(self.n_vq, 0, dtype=torch.long)
+            parsed_codes.append(parsed)
+            lengths.append(int(parsed.shape[-1]))
+
+        if _decoder_debug_enabled():
+            logger.info(
+                "[MossTTS Decoder][DEBUG] batched stream request_ids=%s lengths=%s "
+                "finished=%s",
+                request_ids,
+                lengths,
+                finished_flags,
+            )
+
+        if max(lengths, default=0) == 0:
+            if all(finished_flags):
+                self._exit_batched_streaming()
+            return [empty for _ in request_codes_list]
+
+        self._enter_batched_streaming(request_ids)
+
+        max_len = max(lengths)
+        batch_size = len(request_ids)
+        padded = torch.zeros(
+            self.n_vq,
+            batch_size,
+            max_len,
+            dtype=torch.long,
+            device=self.device,
+        )
+        for idx, (codes, code_len) in enumerate(zip(parsed_codes, lengths)):
+            if code_len > 0:
+                padded[:, idx, :code_len] = codes.to(self.device)
+
+        lengths_t = torch.tensor(lengths, device=self.device, dtype=torch.long)
+
+        try:
+            result = self._codec.codec._decode_frame(padded, lengths_t)
+            wav_batch = result.audio[:, 0].float().cpu()
+            audio_lengths = result.audio_lengths
+            results: list[torch.Tensor] = []
+            for idx, req_id in enumerate(request_ids):
+                wav_len = int(audio_lengths[idx].item()) if audio_lengths.numel() > idx else int(wav_batch.shape[-1])
+                wav = wav_batch[idx, :wav_len]
+                if wav.numel() > 0:
+                    self._record_first_chunk(req_id)
+                results.append(wav if wav.numel() > 0 else empty)
+        except Exception:
+            if all(finished_flags):
+                self._exit_batched_streaming()
+            raise
+
+        if all(finished_flags):
+            self._exit_batched_streaming()
+
         return results
 
     # ══════════════════════════════════════════════════════════════════
@@ -507,7 +695,7 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
                         if isinstance(fin, torch.Tensor):
                             fin = bool(fin.item())
                         finished_flags.append(bool(fin) if fin is not None else False)
-                    if not getattr(self, "_dumped_info_keys", False):
+                    if _decoder_debug_enabled() and not getattr(self, "_dumped_info_keys", False):
                         self._dumped_info_keys = True
                         for idx, info in enumerate(runtime_additional_information):
                             if isinstance(info, dict):
