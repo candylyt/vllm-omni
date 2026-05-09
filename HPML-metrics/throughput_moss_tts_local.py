@@ -77,7 +77,7 @@ def make_yaml(base_yaml_path, max_num_seqs, gpu_mem_stage0=None, gpu_mem_stage1=
 
 
 def run_batch(model, repo, mode, bs, prompt, ar_params, decoder_params, init_sleep, gpu_mem_stage0=None, gpu_mem_stage1=None, max_num_batched_tokens=None):
-    yaml = "moss_tts_async.yaml" if mode == "async" else "moss_tts.yaml"
+    yaml = "moss_tts_local_async.yaml" if mode == "async" else "moss_tts_local.yaml"
     baseYAML = os.path.join(repo, f"vllm_omni/model_executor/stage_configs/{yaml}")
     pathYAML = make_yaml(baseYAML, max_num_seqs=bs, gpu_mem_stage0=gpu_mem_stage0, gpu_mem_stage1=gpu_mem_stage1, max_num_batched_tokens=max_num_batched_tokens)
 

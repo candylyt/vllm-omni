@@ -67,7 +67,7 @@ def main():
     mode = args.mode
     print(f"\nmode: {mode}")
 
-    yamlName = "moss_tts_async.yaml" if mode == "async" else "moss_tts.yaml"
+    yamlName = "moss_tts_local_async.yaml" if mode == "async" else "moss_tts_local.yaml"
     stageCfg = os.path.join(args.repo, f"vllm_omni/model_executor/stage_configs/{yamlName}")
 
     modeTraceDir = os.path.join(args.trace_dir, mode)

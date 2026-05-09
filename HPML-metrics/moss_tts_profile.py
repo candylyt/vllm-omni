@@ -140,12 +140,8 @@ def profile_mode(mode, sentences, model, repo, output_base, init_sleep, mtype):
     if mtype == "delay":
         yaml = "moss_tts_delay_async.yaml" if mode == "async" else "moss_tts_delay.yaml"
         stage_cfg = os.path.join(repo, f"vllm_omni/model_executor/stage_configs/{yaml}")
-        
-        if not os.path.exists(stage_cfg):
-            yaml = "moss_tts_async.yaml" if mode == "async" else "moss_tts.yaml"
-            stage_cfg = os.path.join(repo, f"vllm_omni/model_executor/stage_configs/{yaml}")
     else:
-        yaml = "moss_tts_async.yaml" if mode == "async" else "moss_tts.yaml"
+        yaml = "moss_tts_local_async.yaml" if mode == "async" else "moss_tts_local.yaml"
         stage_cfg = os.path.join(repo, f"vllm_omni/model_executor/stage_configs/{yaml}")
 
     out = output_base / f"raw_{mode}"
