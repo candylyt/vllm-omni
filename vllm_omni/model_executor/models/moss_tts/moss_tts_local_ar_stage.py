@@ -1,52 +1,4 @@
-# Copyright 2025 OpenMOSS / vllm-omni contributors.
-#
-# Licensed under the Apache License, Version 2.0.
-"""
-Stage 0 of MOSS-TTS-Local: text → 32-channel RVQ codes.
-
-This module documents Stage 0 in isolation: how the
-global Qwen3 backbone and the local transformer cooperate to produce one
-audio frame per decode step.
-
-Per-step architecture
----------------------
-
-    ┌───────────────────────────────────────────────────────────┐
-    │  Global: Qwen3-1.7B backbone (paged attn via vllm)        │
-    │    input_ids → multi-channel embedding → Qwen3Model       │
-    │    → hidden_states [L, D_global]                          │
-    │                           │                               │
-    │  Local (per decode step): │                               │
-    │    global_hidden[step]    │                               │
-    │        ↓ speech_embedding_to_local_mlp                    │
-    │    for ch in 0..32:                                       │
-    │        append to local_ctx  [B, ch, D_local]              │
-    │        local_transformer forward                          │
-    │        local_to_speech_mlp + norm + lm_head[ch]           │
-    │        sample next_token[ch]                              │
-    │        embed → next local input                           │
-    │    → code_predictor_codes [B, 1, n_vq=32, 1]              │
-    └───────────────────────────────────────────────────────────┘
-
-The mode is gated by a per-request FSM (see `MossTTSLocalRequestState` and
-`_advance_state_with_text_token`).  Outside of audio mode the global backbone
-runs as a normal text LM; inside audio mode the local transformer is invoked
-to predict 32 RVQ codes per step, and the text head's logits are masked so
-vLLM's sampler can only pick `gen_slot` (continue audio) or `audio_end`
-(terminate).  The single output every consumer downstream cares about is
-`code_predictor_codes` of shape [B, 1, n_vq, 1].
-
-Weight key mapping (HF checkpoint → this module):
-    model.language_model.*            → backbone.*
-    model.embedding_list.{i}.weight   → embedding_list.{i}.weight
-    local_transformer.*               → local_transformer.*
-    speech_embedding_to_local_mlp.*   → speech_embedding_to_local_mlp.*
-    local_to_speech_embedding_mlps.*  → local_to_speech_embedding_mlps.*
-    layer_norm_before_lm_heads.*      → layer_norm_before_lm_heads.*
-    lm_heads.*                        → lm_heads.*
-
-The mapping is implemented in `MossTTSARStageModel.load_weights`.
-"""
+# Stage 0 of MOSS-TTS-Local: text to 32-channel RVQ codes.
 
 import copy
 import logging
@@ -68,24 +20,20 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
-from vllm_omni.model_executor.models.moss_tts._stage0_timing import get_timer
+from vllm_omni.model_executor.models.moss_tts._local_stage0_timing import get_timer
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
-# Per-process Stage-0 timer.  No-op unless MOSS_TTS_TIMING=1 is set in env.
-# See _stage0_timing.py for the helper API and report format.
+# Record the time for each process if MOSS_TTS_TIMING=1 is set in env.
 _TIMER = get_timer()
 
 logger = logging.getLogger(__name__)
 _LOCAL_KV_DEBUG = os.environ.get("MOSS_TTS_LOCAL_KV_DEBUG", "0") == "1"
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Lightweight modules cloned from MOSS-TTS (kept identical for weight compat)
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# =======================================================================================
+#  Lightweight modules cloned from MOSS-TTS - MUST be identical for weight compatibility
+# =======================================================================================
 class MossTTSRMSNorm(nn.Module):
-    """Root-mean-square layer norm (identical to original)."""
-
+    # Root-mean-square layer norm
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
@@ -94,10 +42,8 @@ class MossTTSRMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
 
-
 class MossTTSMLP(nn.Module):
-    """SwiGLU feed-forward network (identical to original)."""
-
+    # SwiGLU feed-forward network
     def __init__(self, input_size: int, ffn_hidden_size: int, output_size: int):
         super().__init__()
         self.gate_proj = nn.Linear(input_size, ffn_hidden_size, bias=False)
@@ -107,91 +53,10 @@ class MossTTSMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
-
 class MossTTSLocalTransformerWrapper(nn.Module):
-    """
-    Thin wrapper around MossTTSLocalTransformer from the HF repo.
-
-    We instantiate it from a plain Qwen3Config (the local sub-config) so the
-    weight shapes match the original checkpoint exactly.  The local transformer
-    has no absolute positional embeddings and no token embeddings — it only
-    processes input_embeds of shape ``(B, t, local_hidden_size)``.
-
-    KV-cache support
-    ----------------
-    The wrapper supports two calling conventions:
-
-    * Recompute (legacy)
-        ``forward(inputs_embeds=[B, t, D])`` — full re-forward over the
-        whole context.  Returns ``(hidden_states[B, t, D], None)``.
-
-    * Incremental (KV cache)
-        ``forward(inputs_embeds=[B, 1, D], past_key_values=prev_kv,
-                  use_cache=True)`` — feeds only the new token and reuses
-        prior K/V from the cache.  Returns
-        ``(hidden_states[B, 1, D], new_past_key_values)``.
-
-    The incremental path passes explicit ``position_ids`` / ``cache_position``
-    derived from the cache length so that the underlying transformer's RoPE
-    layer rotates the new token at its correct absolute position rather than
-    defaulting to position 0 every call (which would corrupt attention).
-
-    The HF MossTTSLocalTransformer is loaded via trust_remote_code, so we
-    detect at init time which kwargs its forward signature accepts.  Variants
-    that don't accept the cache kwargs fall back to the recompute path
-    automatically.
-
-    Why a patch is needed
-    ---------------------
-    The shipped ``MossTTSLocalTransformer.forward`` accepts ``use_cache`` and
-    ``past_key_values`` in its signature but contains three lines that defeat
-    the cache entirely:
-
-        use_cache = False                                # forced override
-        assert not use_cache                             # ensures cache stays off
-        if use_cache and past_key_values is None:
-            assert False                                 # blocks DynamicCache init
-            past_key_values = DynamicCache()
-
-    and the per-layer call passes ``past_key_value=None`` and
-    ``cache_position=None`` regardless of what the caller provided, so the
-    decoder layers never see any cache state.  Result: every "incremental"
-    call is actually a stateless single-token forward, with no memory of
-    earlier channels — the source of the garbage-audio symptom we saw.
-
-    Cache support must also exist in the per-layer attention implementation.
-    Some MOSS remote-code revisions expose ``past_key_values`` / ``use_cache``
-    on the outer transformer signature but still contain
-    ``assert past_key_value is None`` inside ``self_attn.forward``.  For those
-    builds we monkey-patch both the outer transformer forward and every
-    decoder layer's self-attention forward so cache state is threaded all the
-    way down to ``Cache.update(...)``.
-
-    On wrapper init, when the cache is opted in, ``_install_cache_patch``
-    monkey-patches ``self.transformer.forward`` with a corrected version
-    that drops those overrides and threads the cache args through to the
-    decoder layers.  The patched forward preserves all other behaviour
-    bit-for-bit (same causal-mask construction, same ordering, same return
-    shape) so the recompute path remains unchanged.
-
-    Because the underlying attention class is
-    ``MossTTSAttentionWithoutPositionalEmbedding`` (RoPE deleted in
-    __init__), no position-handling subtlety is involved — Q attends to
-    K/V via positionless dot-product attention, which is mathematically
-    equivalent under recompute vs. cache for autoregressive decoding.
-
-    Kill switch
-    -----------
-    Set ``MOSS_TTS_LOCAL_KV_CACHE=0`` to skip the patch entirely and force
-    the legacy recompute path.
-    """
-
+    # Default MOSS_TTS_LOCAL_KV_CACHE=1, can be disabled to disable KV cache 
     def __init__(self, local_qwen3_config, model_path: str | None = None):
         super().__init__()
-        # Trust-remote-code must be enabled; the HF repo provides the class.
-        # Try direct import first (works if moss_tts_local is pip-installed).
-        # Fall back to transformers' dynamic module loader, which loads the
-        # modeling file from the checkpoint directory (trust_remote_code path).
         try:
             from moss_tts_local.modeling_moss_tts import MossTTSLocalTransformer
         except ModuleNotFoundError:
@@ -206,11 +71,6 @@ class MossTTSLocalTransformerWrapper(nn.Module):
         self.transformer = MossTTSLocalTransformer(local_qwen3_config)
 
         # Detect which forward kwargs the underlying transformer accepts.
-        # Required for the incremental path:
-        #   past_key_values + use_cache
-        # Required for correctness on RoPE-based models — without explicit
-        # positions, every cached token gets position 0:
-        #   position_ids and/or cache_position
         import inspect
         try:
             sig_params = inspect.signature(self.transformer.forward).parameters
@@ -224,16 +84,12 @@ class MossTTSLocalTransformerWrapper(nn.Module):
             self._has_position_ids = False
             self._has_cache_position = False
 
-        # Kill switch: MOSS_TTS_LOCAL_KV_CACHE=0 forces the legacy recompute
-        # path (skips the patch installation below).  Default is enabled.
+
         import os
         if os.environ.get("MOSS_TTS_LOCAL_KV_CACHE", "1") == "0" and self.supports_kv_cache:
             self.supports_kv_cache = False
 
-        # Install the forward-method patch that fixes the cache-disabling
-        # overrides in the shipped MossTTSLocalTransformer.  See the class
-        # docstring for the exact lines being patched.  If the patch fails
-        # to install (e.g. import errors), fall back to the recompute path.
+        # patch is required to override the original MossTTSLocalTransformer which disabled KV cache support
         if self.supports_kv_cache:
             if not self._install_cache_patch():
                 self.supports_kv_cache = False
@@ -248,7 +104,7 @@ class MossTTSLocalTransformerWrapper(nn.Module):
             )
 
     def _attention_supports_kv_cache(self) -> bool:
-        """Return True when decoder self-attention is patchable for caching."""
+        # return True when decoder self-attention is patchable for caching
         import inspect
 
         try:
@@ -272,14 +128,6 @@ class MossTTSLocalTransformerWrapper(nn.Module):
         return True
 
     def _install_cache_patch(self) -> bool:
-        """Replace MossTTSLocalTransformer.forward with a version that
-        actually honors ``use_cache=True`` and threads ``past_key_values`` /
-        ``cache_position`` through to each decoder layer.
-
-        Returns True on success, False if any required transformers symbol
-        cannot be imported (in which case the wrapper falls back to the
-        legacy recompute path).
-        """
         try:
             import types
             from transformers.cache_utils import Cache, DynamicCache
@@ -379,7 +227,7 @@ class MossTTSLocalTransformerWrapper(nn.Module):
             patch_attention_forward(decoder_layer.self_attn)
 
         def patched_forward(
-            t,                                    # bound transformer instance
+            t,                                   
             input_ids=None,
             attention_mask=None,
             position_ids=None,
@@ -391,26 +239,6 @@ class MossTTSLocalTransformerWrapper(nn.Module):
             cache_position=None,
             **flash_attn_kwargs,
         ):
-            """Drop-in replacement for MossTTSLocalTransformer.forward.
-
-            Diff from the original (line-for-line where they differ):
-
-                ORIGINAL:                                 PATCHED:
-                ─────────                                 ────────
-                use_cache = False                         (removed)
-                assert not use_cache                      (removed)
-                if use_cache and past_key_values is None:
-                    assert False                          (removed)
-                    past_key_values = DynamicCache()      (kept; now reachable)
-
-                decoder_layer(...,                        decoder_layer(...,
-                    past_key_value=None,                      past_key_value=past_key_values,
-                    cache_position=None,                      cache_position=cache_position,
-                    ...)                                      ...)
-
-            Everything else (causal-mask construction, layer iteration,
-            final norm, return shape) is preserved verbatim.
-            """
             output_attentions = (
                 output_attentions if output_attentions is not None
                 else t.config.output_attentions
@@ -433,9 +261,6 @@ class MossTTSLocalTransformerWrapper(nn.Module):
                 )
 
             if inputs_embeds is None:
-                # Note: original __init__ deletes self.embed_tokens, so this
-                # branch will fail if input_ids is ever provided.  Our wrapper
-                # always passes inputs_embeds, so this is fine.
                 inputs_embeds = t.embed_tokens(input_ids)
 
             # PATCH: original had `assert False` blocking this initialisation.
@@ -506,9 +331,7 @@ class MossTTSLocalTransformerWrapper(nn.Module):
                 attentions=all_self_attns,
             )
 
-        # Bind the function as a method on the transformer instance.  This
-        # patches only this one instance; other models in the process are
-        # unaffected.
+        # This patches only affect this specific instance
         self.transformer.forward = types.MethodType(patched_forward, self.transformer)
         logger.info(
             "[MossTTS Local] Cache patch installed on local transformer "
@@ -518,12 +341,6 @@ class MossTTSLocalTransformerWrapper(nn.Module):
 
     @staticmethod
     def _cache_length(past_key_values: Any) -> int:
-        """Return the number of cached tokens in a past_key_values object.
-
-        Handles both the modern ``Cache`` interface (HF transformers ≥ 4.36)
-        and the legacy tuple-of-tuples format ``((k0, v0), (k1, v1), …)``.
-        Returns 0 when ``past_key_values`` is ``None`` or unparseable.
-        """
         if past_key_values is None:
             return 0
         # Modern HF Cache object
@@ -547,37 +364,6 @@ class MossTTSLocalTransformerWrapper(nn.Module):
         past_key_values: Any = None,
         use_cache: bool = False,
     ) -> tuple[torch.Tensor, Any]:
-        """
-        Run one forward pass through the local transformer.
-
-        Two calling conventions:
-
-        * Recompute (legacy)
-            ``forward(inputs_embeds=[B, t, D])`` with t ≥ 1.
-            Returns ``(hidden_states[B, t, D], None)``.
-
-        * Incremental (KV cache)
-            ``forward(inputs_embeds=[B, 1, D], past_key_values=prev_kv,
-                      use_cache=True)``.
-            Returns ``(hidden_states[B, 1, D], new_past_key_values)`` where
-            ``new_past_key_values`` is the cache after appending this token.
-
-        Position handling
-        -----------------
-        When in incremental mode, we explicitly compute the absolute
-        position of the new token(s) as ``[past_length, past_length + t)``
-        and pass it via ``position_ids`` and/or ``cache_position`` if the
-        model accepts them.  This is critical for RoPE-based attention:
-        without it the model receives positions ``[0, 1, …, t-1)`` for
-        every call and applies the wrong rotary embeddings, producing
-        garbage outputs that are still numerically valid (so no error is
-        raised — the audio just turns into noise).
-
-        If the underlying HF model does not advertise cache support
-        (``self.supports_kv_cache is False``) the cache kwargs are silently
-        dropped and the call behaves like the recompute path — callers can
-        always pass them and the second tuple element will simply be ``None``.
-        """
         want_cache = use_cache or past_key_values is not None
         if want_cache and self.supports_kv_cache:
             B, t, _ = inputs_embeds.shape
@@ -605,18 +391,11 @@ class MossTTSLocalTransformerWrapper(nn.Module):
         out = self.transformer(input_ids=None, inputs_embeds=inputs_embeds)
         return out.last_hidden_state, None
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
+# =======================================================================================
 #  Per-request FSM state
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# =======================================================================================
 @dataclass
 class MossTTSLocalRequestState:
-    """Per-request FSM tracking whether the model is currently emitting audio.
-
-    All n_vq codes are emitted together at every audio step.
-    """
-
     n_vq: int
     audio_pad_code: int
     is_audio: bool = False
@@ -624,46 +403,21 @@ class MossTTSLocalRequestState:
     pending_audio_row: torch.Tensor = field(init=False)
 
     def __post_init__(self) -> None:
-        # Initialised to pad so it is a no-op on prefill / non-audio decode steps.
+        # init to pad so it is a no-op on prefill or non-audio decode steps.
         self.pending_audio_row = torch.full(
             (self.n_vq,), self.audio_pad_code, dtype=torch.long
         )
 
     def store_next_audio_row(self, row: torch.Tensor) -> None:
-        """Cache the [n_vq] codes just sampled, to be summed into the next decode embedding."""
+        # cache the [n_vq] codes just sampled, to be summed into the next decode embedding.
         self.pending_audio_row = row.detach().to(torch.long).cpu().reshape(self.n_vq)
         self.audio_steps_generated += 1
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# =======================================================================================
 #  AR Stage Model
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# =======================================================================================
 class MossTTSARStageModel(nn.Module, SupportsPP):
-    """
-    Stage 0: autoregressive stage for MOSS-TTS-Local.
-
-    Inference flow per decode step
-    --------------------------------
-    1. embed_input_ids()
-         text_embed(input_ids)
-         + Σ audio_embed[i](cached_codes[i])   for gen-slot positions
-       → inputs_embeds [L, D_global]
-
-    2. forward()
-         vllm Qwen3 backbone (paged attention, KV cache)
-       → hidden_states [L, D_global]
-
-    3. _local_forward()  (decode steps only)
-         for ch in 0 … 32:
-           ctx ← [ctx | project(prev_embed)]
-           local_transformer(ctx) → mlp → norm → lm_head[ch] → sample
-       → code_predictor_codes [B, 1, n_vq, 1]
-
-    4. compute_logits() + sample()
-         Global text token sampled by vllm's standard sampler from lm_heads[0].
-    """
-
     have_multimodal_outputs = True
 
     def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
@@ -671,52 +425,30 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         self.vllm_config = vllm_config
         cfg = vllm_config.model_config.hf_config
         self.config = cfg
+        self.n_vq: int            = cfg.n_vq                             
+        self.channels: int        = 1 + self.n_vq                       
+        self.audio_vocab_size: int = cfg.audio_vocab_size                 
+        self.audio_pad_code: int  = cfg.audio_pad_code                   
+        self.gen_slot_id: int     = cfg.audio_assistant_gen_slot_token_id 
+        self.audio_end_id: int    = cfg.audio_end_token_id               
 
-        # ── Scalar constants ────────────────────────────────────────────
-        # All values come from the HF model config so they can never drift
-        # away from the checkpoint they were trained with.  The numbers in
-        # the trailing comments are the verified values for the Phase-1
-        # MOSS-TTS-Local checkpoint and are shown for reader convenience —
-        # do NOT use them as fallbacks; let the cfg fail loudly if missing.
-        #
-        #   n_vq                 RVQ depth (32 codebooks per audio frame).
-        #   channels             1 (text) + n_vq audio channels = 33.
-        #   audio_vocab_size     codebook size; valid codes are 0..1023.
-        #   audio_pad_code       the (vocab_size)-th index = pad sentinel,
-        #                        embedded with padding_idx=audio_pad_code.
-        #   gen_slot_id          placeholder text token forced by the FSM
-        #                        every step the model is producing audio.
-        #   audio_end_id         text token that exits audio mode when
-        #                        sampled (after MIN_AUDIO_FRAMES).
-        self.n_vq: int            = cfg.n_vq                              # 32
-        self.channels: int        = 1 + self.n_vq                        # 33
-        self.audio_vocab_size: int = cfg.audio_vocab_size                 # 1024
-        self.audio_pad_code: int  = cfg.audio_pad_code                   # 1024
-        self.gen_slot_id: int     = cfg.audio_assistant_gen_slot_token_id # 151656
-        self.audio_end_id: int    = cfg.audio_end_token_id               # 151653
-
-        # Tokens needed by the FSM / logits gating.
-        # All optional — if a config doesn't carry them we just skip the
-        # corresponding gating branch (defensive against config drift).
+        # Tokens needed by the FSM / logits gating
         self.pad_token_id: int          = getattr(cfg, "pad_token_id", -1)
         self.im_end_token_id: int       = getattr(cfg, "im_end_token_id", -1)
         self.audio_start_token_id: int  = getattr(cfg, "audio_start_token_id", -1)
         self.audio_user_slot_token_id: int = getattr(
             cfg, "audio_user_slot_token_id", -1
         )
-        logger.info(
-            "[MossTTS Local] FSM token ids: pad=%d im_end=%d audio_start=%d "
-            "gen_slot=%d audio_end=%d",
-            self.pad_token_id, self.im_end_token_id,
-            self.audio_start_token_id, self.gen_slot_id, self.audio_end_id,
-        )
-
-        lang_cfg = cfg.language_config          # Qwen3Config
+        # logger.info(
+        #     "[MossTTS Local] FSM token ids: pad=%d im_end=%d audio_start=%d "
+        #     "gen_slot=%d audio_end=%d",
+        #     self.pad_token_id, self.im_end_token_id,
+        #     self.audio_start_token_id, self.gen_slot_id, self.audio_end_id,
+        # )
+        lang_cfg = cfg.language_config # Qwen3Config
         self.hidden_size: int = lang_cfg.hidden_size
 
-        # ── Global Qwen3 backbone ────────────────────────────────────────
-        # Substitute the embedded Qwen3Config into a copy of VllmConfig so
-        # vllm's Qwen3 model initialises with the correct dimensions.
+        # Global Qwen3 backbone 
         qwen3_vllm_config = copy.deepcopy(vllm_config)
         object.__setattr__(qwen3_vllm_config.model_config, "hf_config", lang_cfg)
 
@@ -727,10 +459,7 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
             prefix=backbone_prefix,
         )
 
-        # ── Multi-channel embeddings ─────────────────────────────────────
-        # [0]    : text token embedding  (vocab_size  × D_global)
-        # [1..32]: audio code embedding  ((audio_vocab_size+1) × D_global)
-        #          index audio_vocab_size (=1024) is the pad sentinel
+        # Multi-channel embeddings
         self.embedding_list = nn.ModuleList()
         self.embedding_list.append(
             nn.Embedding(
@@ -748,38 +477,23 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                 )
             )
 
-        # ── Local transformer ────────────────────────────────────────────
-        # Build the local Qwen3 sub-config (4 blocks, 1536 hidden).
-        #
-        # MOSS-TTS's modeling_moss_tts.py builds local_transformer_config by
-        # deepcopying language_config and ONLY overriding these three fields.
-        # num_attention_heads (16) is intentionally inherited unchanged, giving:
-        #   head_dim = local_hidden_size / num_attention_heads = 1536 / 16 = 96
-        #
-        # Verified from checkpoint:
-        #   config.local_hidden_size              = 1536
-        #   config.language_config.num_attention_heads = 16
-        #   → head_dim                            = 96
+        # Local Transformer - built using the local Qwen3 sub-config (4 blocks, 1536 hidden).
         local_cfg = copy.deepcopy(lang_cfg)
-        local_cfg.num_hidden_layers = cfg.local_num_layers       # 4
-        local_cfg.hidden_size       = cfg.local_hidden_size      # 1536
-        local_cfg.intermediate_size = cfg.local_ffn_hidden_size  # 8960
-        # num_attention_heads = 16 (inherited from lang_cfg — do NOT override)
-        # num_key_value_heads inherited as-is from lang_cfg (respects GQA if any)
+        local_cfg.num_hidden_layers = cfg.local_num_layers      
+        local_cfg.hidden_size       = cfg.local_hidden_size      
+        local_cfg.intermediate_size = cfg.local_ffn_hidden_size  
         self.local_transformer = MossTTSLocalTransformerWrapper(
             local_cfg, model_path=vllm_config.model_config.model
         )
 
-        # ── Projection: global hidden → local hidden ─────────────────────
-        # Used BOTH to project global backbone output and to re-project audio
-        # embeddings before feeding them into the local transformer context.
+        # Projection: global hidden to local hidden 
         self.speech_embedding_to_local_mlp = MossTTSMLP(
             input_size=self.hidden_size,
-            ffn_hidden_size=cfg.additional_mlp_ffn_hidden_size,  # 2048
-            output_size=cfg.local_hidden_size,                   # 1536
+            ffn_hidden_size=cfg.additional_mlp_ffn_hidden_size, 
+            output_size=cfg.local_hidden_size,                  
         )
 
-        # ── Per-channel: local hidden → global hidden (for LM head) ──────
+        # local hidden to global hidden
         self.local_to_speech_embedding_mlps = nn.ModuleList([
             MossTTSMLP(
                 input_size=cfg.local_hidden_size,
@@ -789,14 +503,10 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
             for _ in range(self.channels)
         ])
 
-        # ── Per-channel layer norms ───────────────────────────────────────
         self.layer_norm_before_lm_heads = nn.ModuleList([
             MossTTSRMSNorm(self.hidden_size) for _ in range(self.channels)
         ])
 
-        # ── Per-channel LM heads ──────────────────────────────────────────
-        # lm_heads[0]   : text  → vocab_size
-        # lm_heads[1:] : audio → audio_vocab_size + 1
         self.lm_heads = nn.ModuleList()
         self.lm_heads.append(nn.Linear(self.hidden_size, lang_cfg.vocab_size, bias=False))
         for _ in range(self.n_vq):
@@ -804,29 +514,20 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                 nn.Linear(self.hidden_size, self.audio_vocab_size + 1, bias=False)
             )
 
-        # ── vllm sampler for text channel ────────────────────────────────
+        # vllm sampler for text channel
         self.logits_processor = LogitsProcessor(lang_cfg.vocab_size)
         self.sampler = Sampler()
 
-        # ── Per-request FSM state ─────────────────────────────────────────
-        # Replaces the old single-slot `_last_codes_slot` cache. Each request
-        # carries its own `MossTTSLocalRequestState` that knows whether the
-        # decoder is currently in audio mode and what audio codes were emitted
-        # on the previous step (for next-step embedding contribution).
+        # each request has its own FSM state tracking to check audio mode and prev audio codes
         self._request_states: dict[str, MossTTSLocalRequestState] = {}
         self._last_request_ids: list[str] = []
         self._last_seq_lens: list[int] = []
 
-        # Per-step text-channel logits captured from the local pipeline's
-        # channel-0 path. Populated by `_local_forward` and consumed by
-        # `compute_logits`. Cleared at the start of every `forward`.
-        # Keyed by request_id; each value is a [vocab_size] tensor on the
-        # same device/dtype as the backbone hidden states.
         self._pending_text_logits: dict[str, torch.Tensor] = {}
 
-    # ══════════════════════════════════════════════════════════════════
+    # =======================================================================================
     #  FSM helpers (per-request audio-mode tracking)
-    # ══════════════════════════════════════════════════════════════════
+    # =======================================================================================
 
     def _new_request_state(self) -> MossTTSLocalRequestState:
         return MossTTSLocalRequestState(
@@ -839,25 +540,8 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         state: MossTTSLocalRequestState,
         token_id: int,
     ) -> None:
-        """Advance the per-request FSM by one observed text-channel token.
-
-        Entry / exit rules:
-          - Not in audio:
-              * `audio_start` / `gen_slot`  → enter audio mode
-              * everything else             → stay outside
-          - In audio:
-              * `gen_slot`                  → stay in audio mode
-              * anything else (including
-                `audio_end` and stray vocab)→ leave audio mode
-
-        The "leave on any non-gen_slot token" rule is the key fix for the
-        trailing-garbage symptom: the original code had no FSM at all and
-        kept generating audio codes for whatever token the text head emitted
-        once the model wanted to stop, producing garbage at the tail.
-        """
-        # In audio mode the only legal text-channel tokens are `gen_slot`
-        # (continue) and `audio_end` (terminate). `compute_logits` enforces
-        # this via masking, so any other id here would indicate a bug.
+        # if currently not in audio mode, enter if "audio_start" or "gen_slot"
+        # if currently in audio mode, exit if anything other than "gen_slot"
         if state.is_audio:
             if token_id == self.audio_end_id:
                 state.is_audio = False
@@ -877,7 +561,6 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         request_id: str,
         prompt_tokens: torch.Tensor,
     ) -> MossTTSLocalRequestState:
-        """Build a fresh FSM state for a request and replay its prompt tokens."""
         state = self._new_request_state()
         tokens = prompt_tokens.reshape(-1).tolist()
 
@@ -901,8 +584,6 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         request_ids: list[str],
         seq_lens: list[int],
     ) -> tuple[list[int], list[MossTTSLocalRequestState]]:
-        """Walk the scheduled batch, prefill-or-decode each request, and return
-        the flat decode positions + their FSM states (in the same order)."""
         decode_positions: list[int] = []
         decode_states: list[MossTTSLocalRequestState] = []
 
@@ -927,27 +608,18 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         self._last_seq_lens = list(seq_lens)
         return decode_positions, decode_states
 
-    # ══════════════════════════════════════════════════════════════════
-    #  Embedding
-    # ══════════════════════════════════════════════════════════════════
+    # =======================================================================================
+    #  Build multi-channel embeddings
+    # =======================================================================================
 
     def embed_input_ids(
         self,
-        input_ids: torch.Tensor,             # [L] flat 1-D token IDs (text channel)
+        input_ids: torch.Tensor, # [L] flat 1-D token IDs (text channel)
         multimodal_embeddings=None,
         is_multimodal: bool = False,
         request_ids: Optional[list[str]] = None,
         seq_lens: Optional[list[int]] = None,
     ) -> torch.Tensor:
-        """
-        Build multi-channel embeddings.
-
-        For each decode-step position that is *currently in audio mode*
-        (per per-request FSM), the previously-emitted [n_vq] audio codes are
-        embedded and summed into the text-channel embedding. Decode steps
-        outside audio mode get only the text embedding (no audio contamination).
-        Prefill positions also get only the text embedding.
-        """
         # Channel 0: text embedding
         embeds = self.embedding_list[0](input_ids)  # [L, D]
 
@@ -962,9 +634,7 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         for request_id, slen in zip(request_ids, seq_lens):
             if slen == 1:
                 state = self._request_states.get(request_id)
-                # Only inject audio embeddings if the request is currently
-                # producing audio. Otherwise the cached pad row is a no-op,
-                # but skipping the loop entirely is cheaper.
+                # inject audio embeddings if the request is currently producing audio
                 if state is not None and state.is_audio:
                     row = state.pending_audio_row.to(embeds.device)
                     for ch_idx in range(self.n_vq):
@@ -975,68 +645,32 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
 
         return embeds
 
-    # ══════════════════════════════════════════════════════════════════
+    # =======================================================================================
     #  Local transformer: predict n_vq RVQ codes from one global step
-    # ══════════════════════════════════════════════════════════════════
+    # =======================================================================================
 
     @torch.no_grad()
     def _local_forward(
         self,
-        global_hidden: torch.Tensor,   # [B, D_global]  (B = num decode seqs)
+        global_hidden: torch.Tensor, # [B, D_global]  (B = num decode seqs)
         forced_text_token_id: int,
         temperature: float = 1.0,
         top_k: int = 50,
         top_p: float = 0.95,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Autoregressively predict (1 text token + 32 audio codes) per batch element.
-
-        Mirrors the inner loop of `CustomMixin._sample` in modeling_moss_tts.py:
-        every channel (text + n_vq audio) is run through the local transformer
-        pipeline before its LM head. The channel-0 ("text") logits are returned
-        so the caller can route them into vllm's sampler via `compute_logits`
-        — applying `lm_heads[0]` to the raw global hidden state directly is an
-        off-distribution shortcut that destroys text conditioning.
-
-        For ch == 1's input we embed `forced_text_token_id` (the token vllm's
-        sampler will pick — we force gen_slot via masking) instead of running
-        an internal sample on channel 0. This keeps the local transformer's
-        per-channel context in sync with what the next decode step will see.
-
-        KV-cache fast path
-        ------------------
-        When the wrapped transformer advertises ``supports_kv_cache=True``
-        (the common case on modern HF Qwen3-based remote code), we feed only
-        the new token at each iteration and let the transformer's incremental
-        cache hold prior K/V.  This collapses the per-frame attention cost
-        from O(channels²) to O(channels): for n_vq=32, ~17× fewer attended
-        token-positions across the 33-channel loop.  When the wrapper falls
-        back to recompute, the original growing-context path is taken so
-        behaviour is preserved exactly.
-
-        The KV cache is local to one frame (one ``_local_forward`` call) and
-        is discarded on return — there is no inter-frame dependency for the
-        local transformer; the global Qwen3 backbone provides cross-frame
-        context.
-
-        Returns
-        -------
-        audio_codes : Tensor [B, n_vq]   (long)  predicted RVQ codes
-        text_logits : Tensor [B, V_text] (model dtype) channel-0 logits
-        """
         B     = global_hidden.shape[0]
         dev   = global_hidden.device
         dtype = global_hidden.dtype
         local_dim = self.config.local_hidden_size
 
-        # Project global hidden state → first local transformer input
-        current_proj = self.speech_embedding_to_local_mlp(global_hidden)  # [B, local_D]
+        # Project global hidden state to first local transformer input
+        current_proj = self.speech_embedding_to_local_mlp(global_hidden) # [B, local_D]
 
         use_cache_path = self.local_transformer.supports_kv_cache
 
-        # Cache-mode state: incremental K/V across the 33-channel loop.
+        # init past_kv to prepare for cache-mode state: incremental K/V across the 33-channel loop
         past_kv: Any = None
-        # Recompute-mode state: growing local context (only used in fallback).
+        # fallback to recompute-mode input construction if cache path is not available
         local_ctx: torch.Tensor | None = (
             None
             if use_cache_path
@@ -1048,12 +682,13 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         debug_input_lengths: list[int] | None = [] if _LOCAL_KV_DEBUG else None
         debug_cache_lengths: list[int] | None = [] if _LOCAL_KV_DEBUG else None
 
-        for ch in range(self.channels):   # ch = 0 (text), 1..32 (audio)
+        # ch = 0 (text), 1..32 (audio)
+        for ch in range(self.channels):   
             with record_function(f"local/ch_{ch:02d}_transformer"), \
                  _TIMER.gpu("local/transformer_per_ch"):
                 if use_cache_path:
-                    # Incremental path: feed only the new token, reuse past K/V.
-                    new_input = current_proj.unsqueeze(1)              # [B, 1, local_D]
+                    # incremental path: feed only the new token, reuse past K/V.
+                    new_input = current_proj.unsqueeze(1)        
                     if debug_input_lengths is not None and debug_cache_lengths is not None:
                         debug_input_lengths.append(int(new_input.shape[1]))
                         debug_cache_lengths.append(
@@ -1061,35 +696,29 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                         )
                     local_out, past_kv = self.local_transformer(
                         new_input, past_key_values=past_kv, use_cache=True,
-                    )                                                  # [B, 1, local_D]
-                    last_h = local_out[:, 0, :]                        # [B, local_D]
+                    )                                                
+                    last_h = local_out[:, 0, :]                      
                 else:
-                    # Legacy recompute path: full re-forward over growing context.
+                    # recompute path: feed the entire context so far at each step
                     local_ctx = torch.cat(
                         [local_ctx, current_proj.unsqueeze(1)], dim=1
-                    )                                                  # [B, ch+1, local_D]
+                    )                                                  
                     if debug_input_lengths is not None and debug_cache_lengths is not None:
                         debug_input_lengths.append(int(local_ctx.shape[1]))
                         debug_cache_lengths.append(0)
-                    local_out, _ = self.local_transformer(local_ctx)   # [B, ch+1, local_D]
-                    last_h = local_out[:, -1, :]                       # [B, local_D]
+                    local_out, _ = self.local_transformer(local_ctx)   
+                    last_h = local_out[:, -1, :]                     
 
-            # Per-channel projection + norm + LM head → logits
             with record_function(f"local/ch_{ch:02d}_head"), \
                  _TIMER.gpu("local/proj_norm_head_per_ch"):
-                proj_out = self.local_to_speech_embedding_mlps[ch](last_h)  # [B, D_global]
-                normed   = self.layer_norm_before_lm_heads[ch](proj_out)     # [B, D_global]
-                logits   = self.lm_heads[ch](normed)                         # [B, V]
+                proj_out = self.local_to_speech_embedding_mlps[ch](last_h)  
+                normed   = self.layer_norm_before_lm_heads[ch](proj_out)     
+                logits   = self.lm_heads[ch](normed)                         
 
             with record_function(f"local/ch_{ch:02d}_sample"), \
                  _TIMER.gpu("local/sample_per_ch"):
                 if ch == 0:
-                    # Capture channel-0 logits for vllm's sampler. Defer the
-                    # actual sampling to `compute_logits` so the user's
-                    # SamplingParams (temp/top-k/top-p, masking) take effect.
-                    # Use the forced text token (gen_slot) to drive the next
-                    # local step's input — matches what vllm will append to the
-                    # global stream after sampling.
+                    # Text channel
                     text_logits = logits
                     next_token = torch.full(
                         (B,), forced_text_token_id, dtype=torch.long, device=dev,
@@ -1103,18 +732,18 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                             top_k_vals = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1).values
                             logits[logits < top_k_vals[..., -1:]] = float("-inf")
                         probs      = torch.softmax(logits, dim=-1)
-                        next_token = torch.multinomial(probs, num_samples=1).squeeze(1)  # [B]
+                        next_token = torch.multinomial(probs, num_samples=1).squeeze(1)  
                     else:
-                        next_token = logits.argmax(dim=-1)  # [B]
+                        next_token = logits.argmax(dim=-1)  
                     audio_codes.append(next_token)
 
-            # Re-embed sampled token → next local step's input
+            # Re-embed sampled token for next local step's input
             with record_function(f"local/ch_{ch:02d}_embed"), \
                  _TIMER.gpu("local/embed_next_per_ch"):
-                emb          = self.embedding_list[ch](next_token)             # [B, D_global]
-                current_proj = self.speech_embedding_to_local_mlp(emb)        # [B, local_D]
+                emb          = self.embedding_list[ch](next_token)             
+                current_proj = self.speech_embedding_to_local_mlp(emb)        
 
-        # Stack: [B, n_vq]
+        # stack: [B, n_vq]
         if audio_codes:
             codes = torch.stack(audio_codes, dim=1).to(torch.long)
         else:
@@ -1137,23 +766,10 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
 
         return codes, text_logits
 
-    # ══════════════════════════════════════════════════════════════════
-    #  Request-info helpers (vLLM v0.19+)
-    # ══════════════════════════════════════════════════════════════════
-
     def _extract_request_info(
         self,
         runtime_additional_information: Optional[list[dict]] = None,
     ) -> tuple[list[str], list[int], list[int]]:
-        """
-        Derive per-request schedule info from the vLLM forward context (v0.19+).
-
-        Returns
-        -------
-        request_ids      : list[str] — req_id for each scheduled request
-        seq_lens         : list[int] — #tokens scheduled per request
-        decode_positions : list[int] — flat positions of decode-phase requests
-        """
         try:
             from vllm.forward_context import get_forward_context
             ctx = get_forward_context()
@@ -1188,9 +804,9 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         # Drop warmup samples so the post-warmup timing report is clean.
         _TIMER.reset()
 
-    # ══════════════════════════════════════════════════════════════════
-    #  Forward
-    # ══════════════════════════════════════════════════════════════════
+    # =======================================================================================
+    #  Forward Pass
+    # =======================================================================================
 
     def forward(
         self,
@@ -1203,17 +819,14 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         **kwargs,
     ) -> OmniOutput:
         with record_function("stage0/forward"), _TIMER.gpu("stage0/forward_total"):
-            # ── 0. Derive per-request schedule info from vLLM forward context ─
+            # Step 0: obtain information from vLLM context
             with record_function("stage0/extract_info"), _TIMER.cpu("stage0/extract_info"):
                 request_ids, seq_lens_per_req, decode_positions = self._extract_request_info(
                     kwargs.get("runtime_additional_information"),
                 )
-
-            # Reset per-step text-logit cache. Populated below by `_local_forward`
-            # for any audio-mode decode positions, then consumed by `compute_logits`.
             self._pending_text_logits = {}
 
-            # ── 1. Per-request FSM bookkeeping ────────────────────────────
+            # Step 1. Per-request FSM bookkeeping
             with record_function("stage0/fsm_prep"), _TIMER.cpu("stage0/fsm_prep"):
                 decode_states: list[MossTTSLocalRequestState] = []
                 if request_ids and seq_lens_per_req and input_ids is not None:
@@ -1223,7 +836,7 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                         seq_lens=seq_lens_per_req,
                     )
 
-            # ── 2. Build embeddings (multi-channel) ───────────────────────
+            # Step 2. Build multi-channel embeddings
             with record_function("stage0/embed"), _TIMER.gpu("stage0/embed"):
                 if inputs_embeds is None and input_ids is not None:
                     inputs_embeds = self.embed_input_ids(
@@ -1233,19 +846,16 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                         seq_lens=seq_lens_per_req if seq_lens_per_req else None,
                     )
 
-            # ── 3. Global Qwen3 backbone ──────────────────────────────────
+            # Step 3. Global Qwen3 backbone
             with record_function("stage0/backbone"), _TIMER.gpu("stage0/backbone"):
                 hidden_states = self.backbone(
                     input_ids=None,
                     positions=positions,
                     intermediate_tensors=intermediate_tensors,
                     inputs_embeds=inputs_embeds,
-                )  # [L, D_global]
+                )
 
-            # ── 4. Local transformer — only for decode steps in audio mode ─
-            # Outside of audio mode the local transformer's output is garbage
-            # for our purposes (downstream Stage 1 would treat it as audio codes).
-            # Restrict execution to FSM positions that are currently `is_audio`.
+            # Step 4. Local transformer
             multimodal_outputs: dict[str, Any] = {}
 
             if decode_positions and decode_states and not torch.cuda.is_current_stream_capturing():
@@ -1263,7 +873,7 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
 
                 if audio_positions:
                     pos_t = torch.tensor(audio_positions, device=hidden_states.device)
-                    decode_hidden = hidden_states[pos_t]  # [B_audio, D_global]
+                    decode_hidden = hidden_states[pos_t]
 
                     with record_function("stage0/local_forward"), _TIMER.gpu("stage0/local_forward"):
                         codes, text_logits = self._local_forward(
@@ -1272,24 +882,17 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                             temperature=kwargs.get("audio_temperature", 1.0),
                             top_k=kwargs.get("audio_top_k", 50),
                             top_p=kwargs.get("audio_top_p", 0.95),
-                        )  # [B_audio, n_vq], [B_audio, V_text]
+                        ) 
 
                     with record_function("stage0/store_codes"), _TIMER.gpu("stage0/store_codes"):
-                        # Cache codes per-request for the NEXT decode step's
-                        # multi-channel embedding contribution.  Note: this
-                        # currently performs a GPU→CPU sync per request (see
-                        # store_next_audio_row); look for the spike in this
-                        # phase to confirm the known overhead.
                         for state, row in zip(audio_states, codes):
                             state.store_next_audio_row(row)
 
-                        # Cache channel-0 text logits so `compute_logits` can return
-                        # the local-pipeline-processed distribution rather than
+                        # Cache channel-0 text logits so `compute_logits` can return the local-pipeline-processed distribution rather than
                         # reapplying lm_heads[0] to the raw global hidden state.
                         for req_id, tl in zip(audio_request_ids, text_logits):
                             self._pending_text_logits[req_id] = tl
 
-                    # Shape convention: [B_audio, 1, n_vq, 1]
                     B = codes.shape[0]
                     multimodal_outputs = {
                         "code_predictor_codes": codes.reshape(B, 1, self.n_vq, 1),
@@ -1301,22 +904,7 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                 multimodal_outputs=multimodal_outputs,
             )
 
-    # ══════════════════════════════════════════════════════════════════
-    #  vllm model protocol
-    # ══════════════════════════════════════════════════════════════════
-
-    # Minimum number of audio frames to emit before allowing the model to
-    # sample `audio_end`. Without this guard the model terminates audio
-    # generation almost immediately: empirically the unconstrained text head
-    # in vllm-omni's setup does NOT favor `gen_slot` after `<|audio_start|>`
-    # (it leans toward random vocab tokens), and once both `gen_slot` and
-    # `audio_end` are made the only legal options, `audio_end`'s raw logit
-    # tends to win at the boundary.
-    #
-    # Rough sizing: codec is 24kHz with ~12.5 frames/sec, so 150 frames
-    # caps the forced-audio period at ~12 seconds. For longer utterances
-    # bump this higher; for very short ones the trailing silence will be
-    # modest (and can be trimmed downstream).
+    # Minimum number of audio frames to emit before allowing the model to sample `audio_end`
     MIN_AUDIO_FRAMES: int = 10
 
     def compute_logits(
@@ -1324,25 +912,6 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata | None = None,
     ) -> torch.Tensor:
-        """Text channel logits (channel-0 LM head), with FSM-driven gating.
-
-        For audio-mode rows we substitute the channel-0 logits captured by
-        `_local_forward` (computed via the full local pipeline:
-        speech_embedding_to_local_mlp → local_transformer →
-        local_to_speech_embedding_mlps[0] → layer_norm_before_lm_heads[0] →
-        lm_heads[0]). Applying lm_heads[0] directly to the raw global hidden
-        state — which is what we did originally — is off-distribution and
-        produces a degraded "want to stop" signal that fires regardless of
-        text length.
-
-        Masking:
-          - Audio mode, steps < MIN_AUDIO_FRAMES → force `gen_slot` (warm-up
-            guard against premature termination right after `<|audio_start|>`).
-          - Audio mode, steps ≥ MIN_AUDIO_FRAMES → unmask only
-            `{gen_slot, audio_end}` so vllm's sampler picks freely between
-            "continue" and "stop" using the corrected logits.
-          - Outside audio mode → mask audio-control tokens.
-        """
         with record_function("stage0/compute_logits"), _TIMER.gpu("stage0/compute_logits"):
             logits = self.lm_heads[0](hidden_states)   # [L, vocab_size]
             if not self._last_request_ids:
@@ -1398,43 +967,21 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
             multimodal_outputs={"model_outputs": [empty]},
         )
 
-    # ══════════════════════════════════════════════════════════════════
-    #  Weight loading
-    # ══════════════════════════════════════════════════════════════════
+    # =======================================================================================
+    #  Load Weights
+    # =======================================================================================
 
     def load_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
         **kwargs,
     ) -> set[str]:
-        """
-        Load from a MOSS-TTS-Local HuggingFace checkpoint.
-
-        Returns a set of THIS MODULE's parameter names (as in self.named_parameters())
-        that were successfully initialised.  The caller (MossTTSForConditionalGeneration)
-        prepends "_model." so that vLLM's default_loader can verify coverage.
-
-        Checkpoint key → this module's parameter name:
-            model.language_model.*           → backbone.*
-            model.embedding_list.{i}.weight  → embedding_list.{i}.weight
-            local_transformer.*              → local_transformer.transformer.*
-            speech_embedding_to_local_mlp.*  → speech_embedding_to_local_mlp.*
-            local_to_speech_embedding_mlps.* → local_to_speech_embedding_mlps.*
-            layer_norm_before_lm_heads.*     → layer_norm_before_lm_heads.*
-            lm_heads.*                       → lm_heads.*
-
-        For the Qwen3 backbone, vLLM merges Q/K/V into qkv_proj and
-        gate/up into gate_up_proj.  We use each param's weight_loader
-        (registered by MergedColumnParallelLinear / QKVParallelLinear)
-        to handle the merging correctly.
-        """
         from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
         params: dict[str, torch.nn.Parameter] = dict(self.named_parameters())
         loaded_module_names: set[str] = set()
 
-        # Qwen3 backbone: checkpoint has separate q/k/v and gate/up projections;
-        # vLLM merges them.  Map (checkpoint suffix → model suffix, shard_id).
+        # Qwen3 backbone: checkpoint has separate q/k/v and gate/up projections but vLLM merges them.
         BACKBONE_STACKED = [
             ("self_attn.q_proj", "self_attn.qkv_proj", "q"),
             ("self_attn.k_proj", "self_attn.qkv_proj", "k"),

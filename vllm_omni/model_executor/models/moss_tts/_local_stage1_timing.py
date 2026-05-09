@@ -1,12 +1,4 @@
-# Copyright 2025 OpenMOSS / vllm-omni contributors.
-#
-# Licensed under the Apache License, Version 2.0.
-"""
-Per-phase timing instrumentation for MOSS-TTS-Local Stage 1.
-
-This mirrors ``_stage0_timing.py`` but prints a Stage-1-specific title so the
-CAT codec decoder can report its own timing table at worker shutdown.
-"""
+# this module will be activated if MOSS_TTS_TIMING=1 to record per-phase timing in Stage 1
 
 from __future__ import annotations
 
@@ -21,10 +13,7 @@ import torch
 
 _TIMING_ENABLED: bool = os.environ.get("MOSS_TTS_TIMING", "0") == "1"
 
-
 class _Stage1Timing:
-    """Per-phase timing aggregator for one Stage-1 worker process."""
-
     def __init__(self) -> None:
         self._gpu_events: dict[str, list[tuple[Any, Any]]] = defaultdict(list)
         self._cpu_ms: dict[str, list[float]] = defaultdict(list)
@@ -117,9 +106,7 @@ class _Stage1Timing:
 
 _TIMER = _Stage1Timing()
 
-
 def get_timer() -> _Stage1Timing:
     return _TIMER
-
 
 atexit.register(_TIMER.dump)

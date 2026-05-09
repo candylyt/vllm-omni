@@ -118,7 +118,6 @@ _OMNI_MODELS = {
         "mimo_audio_code2wav",
         "MiMoAudioToken2WavForConditionalGenerationVLLM",
     ),
-    ## moss_tts_local
     "moss_tts_delay": (
         "moss_tts",
         "moss_tts",

@@ -1,37 +1,25 @@
+# Measure latency of MOSS-TTS-Local in async_chunk vs sync mode.
 """
-Latency benchmark: async_chunk vs sync (batch) mode for MOSS-TTS-Local.
-
-Measures the wall-clock cost of a single TTS request under each pipeline mode
-and reports:
-  - total_time  : omni.generate() wall-clock duration
-  - audio_dur   : length of the generated waveform (seconds)
-  - RTF         : total_time / audio_dur  (< 1.0 = faster-than-real-time)
-  - num_chunks  : how many audio chunks arrived (async_chunk > 1; sync = 1)
-
 Usage (run each mode separately; each needs its own Omni process):
 
-  # async_chunk mode (streaming pipelined Stage 0 → Stage 1):
-  MOSS_AUDIO_TOKENIZER_PATH=.../moss-audio-tokenizer \\
-  python benchmark_async_chunk.py \\
+# async_chunk mode:
+MOSS_AUDIO_TOKENIZER_PATH=.../moss-audio-tokenizer \\
+python benchmark_async_chunk.py \\
     --model .../moss-tts-local \\
     --mode async \\
-    --stage-configs-path ../../../vllm_omni/model_executor/stage_configs/moss_tts_async.yaml \\
+    --stage-configs-path ../../../vllm_omni/model_executor/stage_configs/moss_tts_local_async.yaml \\
     --text "The weather is so nice today." \\
     --output-dir ./output_async
 
-  # sync (batch) mode:
-  MOSS_AUDIO_TOKENIZER_PATH=.../moss-audio-tokenizer \\
-  python benchmark_async_chunk.py \\
+# sync (batch) mode:
+MOSS_AUDIO_TOKENIZER_PATH=.../moss-audio-tokenizer \\
+python benchmark_async_chunk.py \\
     --model .../moss-tts-local \\
     --mode sync \\
-    --stage-configs-path ../../../vllm_omni/model_executor/stage_configs/moss_tts.yaml \\
+    --stage-configs-path ../../../vllm_omni/model_executor/stage_configs/moss_tts_local.yaml \\
     --text "The weather is so nice today." \\
     --output-dir ./output_sync
 
-Comparing the two results shows:
-  async_chunk  →  num_chunks > 1, Stage-1 starts decoding before Stage 0 ends,
-                  first-audio latency drops.
-  sync         →  num_chunks == 1, Stage-1 is called only AFTER Stage 0 finishes.
 """
 
 from __future__ import annotations
@@ -122,15 +110,15 @@ def main() -> None:
     parser.add_argument("--model", default="/workspace/vllm-omni/weights/moss-tts-local")
     parser.add_argument(
         "--stage-configs-path",
-        default="../../../vllm_omni/model_executor/stage_configs/moss_tts_async.yaml",
+        default="../../../vllm_omni/model_executor/stage_configs/moss_tts_local_async.yaml",
     )
     parser.add_argument(
         "--mode",
         choices=["async", "sync"],
         default="async",
         help=(
-            "async → use moss_tts_async.yaml (async_chunk=true); "
-            "sync  → use moss_tts.yaml       (async_chunk=false). "
+            "async use moss_tts_local_async.yaml (async_chunk=true); "
+            "sync use moss_tts_local.yaml (async_chunk=false). "
             "Pass the matching --stage-configs-path for each mode."
         ),
     )
@@ -143,7 +131,6 @@ def main() -> None:
     parser.add_argument("--shm-threshold-bytes", type=int, default=65536)
     args = parser.parse_args()
 
-    # ── Codec path auto-resolve ─────────────────────────────────────────
     if not os.environ.get("MOSS_AUDIO_TOKENIZER_PATH"):
         sibling = os.path.join(
             os.path.dirname(os.path.abspath(args.model)),
@@ -157,12 +144,8 @@ def main() -> None:
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Instrument first-chunk latency via a shared timestamp dir.  The Stage-1
-    # decoder (different process) writes a file the first time it produces
-    # a non-empty waveform for each request_id; we read those back below.
     first_chunk_dir = os.path.abspath(os.path.join(args.output_dir, "_first_chunk"))
     os.makedirs(first_chunk_dir, exist_ok=True)
-    # Clear any stale timestamp files from a previous run.
     for _stale in os.listdir(first_chunk_dir):
         if _stale.endswith(".first_chunk.ts"):
             try:
@@ -172,24 +155,28 @@ def main() -> None:
     os.environ["MOSS_FIRST_CHUNK_DIR"] = first_chunk_dir
 
     prompt = build_tts_prompt(args.text, args.model)
-    print(f"[Info] Mode:   {args.mode}")
+    print(f"[Info] Mode: {args.mode}")
     print(f"[Info] Config: {args.stage_configs_path}")
     print(f"[Info] Prompt ({len(prompt)} chars):\n{prompt}\n")
 
     ar_stop_ids = _resolve_stop_ids(args.model)
     print(f"[Info] AR stop token IDs: {ar_stop_ids}")
 
-    # AR stage: gen_slot token must repeat every step — do NOT apply a
-    # repetition_penalty.  Stage-1 flat codes cap at max_model_len=18192,
-    # so max_ar_tokens ≤ floor(18192 / 32) = 568; 500 is a safe ceiling.
     ar_params = SamplingParams(
-        temperature=0.6, top_p=0.95, top_k=50,
-        max_tokens=500, seed=SEED,
+        temperature=0.6, 
+        top_p=0.95, 
+        top_k=50,
+        max_tokens=500, 
+        seed=SEED,
         stop_token_ids=ar_stop_ids if ar_stop_ids else None,
     )
     decoder_params = SamplingParams(
-        temperature=0.0, top_p=1.0, top_k=-1,
-        max_tokens=18192, seed=SEED, detokenize=False,
+        temperature=0.0, 
+        top_p=1.0, 
+        top_k=-1,
+        max_tokens=18192, 
+        seed=SEED, 
+        detokenize=False,
     )
 
     omni = Omni(
@@ -203,17 +190,13 @@ def main() -> None:
 
     prompts = [copy.deepcopy({"prompt": prompt}) for _ in range(args.num_prompts)]
 
-    # ── Benchmark ───────────────────────────────────────────────────────
     print(f"[Info] Running {len(prompts)} prompt(s) in {args.mode} mode ...")
-    # Use both a monotonic clock (for total_time accuracy) and a wall-clock
-    # reference (shared with the Stage-1 decoder subprocess for first-chunk).
     t_start_wall = time.time()
     t_start = time.perf_counter()
     omni_outputs = omni.generate(prompts, [ar_params, decoder_params])
     t_end = time.perf_counter()
     total_time = t_end - t_start
 
-    # ── Collect results ─────────────────────────────────────────────────
     results = []
     for stage_outputs in omni_outputs:
         output = stage_outputs.request_output
@@ -248,10 +231,6 @@ def main() -> None:
         audio_dur = len(audio_np) / 24000
         rtf = total_time / audio_dur if audio_dur > 0 else float("inf")
 
-        # Read first-chunk timestamp written by the Stage-1 decoder process.
-        # Try the real request_id first; fall back to the generic "first"
-        # key that the decoder writes when request_id wasn't propagated
-        # through the connector payload (single-request benchmarks).
         first_chunk_latency: float = total_time
         for key in (request_id, "first"):
             first_chunk_path = os.path.join(first_chunk_dir, f"{key}.first_chunk.ts")
@@ -292,12 +271,10 @@ def main() -> None:
             f"{'='*60}\n"
         )
 
-    # ── Dump JSON summary ───────────────────────────────────────────────
     summary_path = os.path.join(args.output_dir, f"bench_{args.mode}.json")
     with open(summary_path, "w") as f:
         json.dump(results, f, indent=2)
-    print(f"[Info] Summary saved -> {summary_path}")
-
+    print(f"[Info] Summary saved to: {summary_path}")
 
 if __name__ == "__main__":
     main()
