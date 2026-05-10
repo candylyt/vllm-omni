@@ -1,15 +1,15 @@
 # HPML Final Project: MOSS-TTS Integration for vLLM-Omni
 
-> **Course:** COMS E6998 High Performance Machine Learning  
+> **Course:** High Performance Machine Learning  
 > **Semester:** Spring 2026  
 > **Instructor:** Dr. Kaoutar El Maghraoui  
-> **Team:** Omnipresent
 
 This repository is a course-project fork of `vllm-omni` focused on integrating
 the MOSS-TTS model family into vLLM-Omni and benchmarking inference-serving
 performance against native HuggingFace-style baselines.
 
-## Team
+## Team Information
+**Team Name:** Omnipresent
 
 | Member | UNI | Primary contributions |
 | --- | --- | --- |
@@ -18,12 +18,11 @@ performance against native HuggingFace-style baselines.
 | Xingru Lu | xl3602 | MOSS-TTS-Delay async-chunk integration support; profiling; preliminary CUDA Graph work |
 | Yutao Mao | ym3019 | MOSS-TTS-Delay integration; shared Stage 1 decoder optimization |
 
-## Submission Artifacts
-
-- **Repository:** <https://github.com/candylyt/vllm-omni>
+## Submission
+- **GitHub Repository:** <https://github.com/candylyt/vllm-omni>
 - **Final presentation:** [`deliverables/HPML Final Project Presentation.pptx`](deliverables/HPML%20Final%20Project%20Presentation.pptx)
 - **Final report source:** [`deliverables/Report.pdf`](deliverables/Report.pdf)
-- **Experiment tracking:** <https://wandb.ai/ac5905-columbia-university/hpml-final-project/runs/xfa9dt56?nw=nwuserac5905>
+- **Experiment tracking dashboard:** <https://wandb.ai/ac5905-columbia-university/hpml-final-project/runs/xfa9dt56?nw=nwuserac5905>
 
 ## Branch Map
 
@@ -444,7 +443,15 @@ and `WANDB_DISABLED` is not set.
 
 ## AI Use Disclosure
 
-We utilized AI in the following manner: Claude and ChatGPT were used to understand the two-stage pipeline of vLLM-Omni, debugging compatibility issues between vLLM-Omni and MOSS-TTS. It was also used to understand the codebase in general, especially for how profiling was implemented and the internal workings of vLLM/vLLM-Omni. We also utilized AI such as copilot's autofill function for loops, boilerplate code, and cleaning up prose. Also, debugging environment setup for running models on Vast AI. 
+**Did your team use any AI tool in completing this project?**
+- [ ] No, we did not use any AI tool.
+- [x] Yes, we used AI assistance as described below.
+**Tool(s) used:** ChatGPT, Claude, GitHub Copilot
+**Specific purpose:** We used AI tools to understand the two-stage pipeline of vLLM-Omni, debugging compatibility issues between vLLM-Omni and MOSS-TTS. It was also used to understand the codebase in general, especially for how profiling was implemented and the internal workings of vLLM/vLLM-Omni. We also utilized AI such as copilot's autofill function for loops, boilerplate code, and cleaning up prose. Also, debugging environment setup for running models on Vast AI. 
+**Sections affected:** - vllm_omni/model_executor/models/moss_tts/moss_tts_local_ar_stage.py, vllm_omni/model_executor/models/moss_tts/moss_tts_local_decoder.py, vllm_omni/model_executor/models/moss_tts/moss_tts_delay_ar_stage.py, vllm_omni/model_executor/models/moss_tts/moss_tts_decoder.py
+**How we verified correctness:** We validated all AI-assited outputs by manually reviewing the generated code, running and reproducing all experiments ourselves, cross-checking the outputs benchmark results against the actual execution logs.
+
+By submitting this project, the team confirms that the analysis, interpretations, and conclusions are our own, and that any AI assistance is fully disclosed above. The same disclosure block appears as an appendix in the final report.
 
 ## License
 
@@ -459,3 +466,19 @@ released under the Apache License 2.0; see [`LICENSE`](LICENSE).
 - vLLM-Omni paper: <https://arxiv.org/abs/2602.02204>
 - PagedAttention/vLLM paper: <https://arxiv.org/abs/2309.06180>
 - Qwen3-TTS technical report: <https://arxiv.org/abs/2601.15621>
+
+### Citation
+If you build on this work, please cite:
+```bibtex
+@misc{Omnipresent2026hpml,
+title = {MOSS-TTS Integration for vLLM-Omni},
+author = {Chung, Andrew and Liu, Yuting and Lu, Xingru and Mao Yutao},
+year = {2026},
+note = {HPML Spring 2026 Final Project, Columbia University},
+url = {https://github.com/candylyt/vllm-omni}
+}
+```
+### Contact
+Open a GitHub Issue or email *[ym3019@columbia.edu]*.
+---
+*HPML Spring 2026 — Dr. Kaoutar El Maghraoui — Columbia University*
