@@ -78,10 +78,10 @@ chunks while Stage 0 continues generating later audio codes.
 ### Important Files by Branch
 
 #### `main`
-- README.md
-- LICENSE
-- deliverables/HPML_Final_Presentation.pptx
-- deliverables/HPML_Final_Report.pdf
+- `README.md`
+- `LICENSE`
+- `deliverables/HPML_Final_Presentation.pptx`
+- `deliverables/HPML_Final_Report.pdf`
 
 #### `moss-tts-delay`
 
