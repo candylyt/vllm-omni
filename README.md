@@ -224,6 +224,10 @@ chunks while Stage 0 continues generating later audio codes.
 | Local Stage 0 local-transformer CUDA time | before KV-cache | after KV-cache | ~8% lower |
 | Delay AR backbone self CPU time | eager/pre-CUDA-Graph | preliminary CUDA Graph | 44% lower |
 
+**Hardware:** [1× NVIDIA A100 80GB SXM, CUDA 12.8]
+
+**Headline result:** By inferencing the MOSS-TTS-Local and MOSS-TTS-Delay models through vLLM-Omni, leveraging both native vLLM optimizations and newly introduced techniques such as stage-level batching and asynchronous two-stage decoding, we achieved up to 2.8× higher throughput and 39.2× lower first-chunk latency (FCL/TTFA) compared to the original Hugging Face implementations.
+
 ### Throughput Tables
 
 #### MOSS-TTS-Local
@@ -446,9 +450,14 @@ and `WANDB_DISABLED` is not set.
 **Did your team use any AI tool in completing this project?**
 - [ ] No, we did not use any AI tool.
 - [x] Yes, we used AI assistance as described below.
+
 **Tool(s) used:** ChatGPT, Claude, GitHub Copilot
+
 **Specific purpose:** We used AI tools to understand the two-stage pipeline of vLLM-Omni, debugging compatibility issues between vLLM-Omni and MOSS-TTS. It was also used to understand the codebase in general, especially for how profiling was implemented and the internal workings of vLLM/vLLM-Omni. We also utilized AI such as copilot's autofill function for loops, boilerplate code, and cleaning up prose. Also, debugging environment setup for running models on Vast AI. 
-**Sections affected:** - vllm_omni/model_executor/models/moss_tts/moss_tts_local_ar_stage.py, vllm_omni/model_executor/models/moss_tts/moss_tts_local_decoder.py, vllm_omni/model_executor/models/moss_tts/moss_tts_delay_ar_stage.py, vllm_omni/model_executor/models/moss_tts/moss_tts_decoder.py
+
+**Sections affected:** - vllm_omni/model_executor/models/moss_tts/moss_tts_local_ar_stage.py (moss-tts-local branch), vllm_omni/model_executor/models/moss_tts/moss_tts_local_decoder.py (moss-tts-local branch), vllm_omni/model_executor/models/moss_tts/moss_tts_delay_ar_stage.py (moss-tts-delay branch), vllm_omni/model_executor/models/moss_tts/moss_tts_decoder.py (moss-tts-delay branch),
+benchmarking scripts under HPML-metrics (metric-branch)
+
 **How we verified correctness:** We validated all AI-assited outputs by manually reviewing the generated code, running and reproducing all experiments ourselves, cross-checking the outputs benchmark results against the actual execution logs.
 
 By submitting this project, the team confirms that the analysis, interpretations, and conclusions are our own, and that any AI assistance is fully disclosed above. The same disclosure block appears as an appendix in the final report.
