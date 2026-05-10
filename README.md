@@ -444,6 +444,7 @@ and `WANDB_DISABLED` is not set.
 
 ## AI Use Disclosure
 
+We utilized AI in the following manner: Claude and ChatGPT were used to understand the two-stage pipeline of vLLM-Omni, debugging compatibility issues between vLLM-Omni and MOSS-TTS. It was also used to understand the codebase in general, especially for how profiling was implemented and the internal workings of vLLM/vLLM-Omni. We also utilized AI such as copilot's autofill function for loops, boilerplate code, and cleaning up prose. Also, debugging environment setup for running models on Vast AI. 
 
 ## License
 
