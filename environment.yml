@@ -1,0 +1,40 @@
+# Conda environment for the HPML MOSS-TTS/vLLM-Omni experiments.
+#
+# Versions explicitly recorded in the project runbook/report:
+#   - Python 3.11
+#   - CUDA 12.8 runtime/toolkit expected on the host
+#   - vLLM 0.19.1
+#
+# Note: the submitted artifacts did not record exact transitive versions for
+# torch/transformers. In the reported setup, vLLM was installed as
+#   uv pip install vllm==0.19.1 --torch-backend=auto
+# so torch/transformers should be resolved consistently with the vLLM 0.19.1
+# wheel for the target CUDA platform.
+
+name: moss-tts-hpml
+channels:
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip=25.3
+  - cuda-toolkit=12.8
+  - libsndfile=1.2.2
+  - pip:
+      # Core serving stack used for reported vLLM-Omni runs.
+      - vllm==0.19.1
+
+      # Benchmark/profiling scripts in HPML-metrics.
+      - datasets==3.0.1
+      - wandb==0.18.3
+      - soundfile==0.13.1
+      - huggingface-hub==0.25.2
+      - numpy==1.26.4
+      - PyYAML==6.0.1
+
+      # Repo build/install helpers from the runbook.
+      - uv==0.7.13
+      - setuptools-scm==8.1.0
+
+      # Install the local vLLM-Omni fork after vLLM.
+      - -e .

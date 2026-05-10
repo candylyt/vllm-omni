@@ -164,8 +164,8 @@ AGENTS.md
 # cursor
 .cursor/
 
-# scripts
-/scripts/
+# Root scripts are used for reproducibility deliverables.
+/scripts/__pycache__/
 
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
