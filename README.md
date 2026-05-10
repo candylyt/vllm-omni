@@ -20,9 +20,9 @@ performance against native HuggingFace-style baselines.
 
 ## Submission
 - **GitHub Repository:** <https://github.com/candylyt/vllm-omni>
-- **Final presentation:** [`deliverables/HPML_Final_Presentation.pptx`](deliverables/HPML%20Final%20Project%20Presentation.pptx)
-- **Final report source:** [`deliverables/HPML_Final_Report.pdf`](deliverables/HPML_Final_Report.pdf)
-- **Experiment tracking dashboard:** <https://wandb.ai/ac5905-columbia-university/hpml-final-project/runs/xfa9dt56?nw=nwuserac5905>
+- **Final Presentation:** [`deliverables/HPML_Final_Presentation.pptx`](deliverables/HPML_Final_Presentation.pptx)
+- **Final Report:** [`deliverables/HPML_Final_Report.pdf`](deliverables/HPML_Final_Report.pdf)
+- **Experiment Tracking Dashboard:** <https://wandb.ai/ac5905-columbia-university/hpml-final-project/runs/xfa9dt56?nw=nwuserac5905>
 
 ## Branch Map
 
