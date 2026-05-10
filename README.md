@@ -20,8 +20,8 @@ performance against native HuggingFace-style baselines.
 
 ## Submission
 - **GitHub Repository:** <https://github.com/candylyt/vllm-omni>
-- **Final presentation:** [`deliverables/HPML Final Project Presentation.pptx`](deliverables/HPML%20Final%20Project%20Presentation.pptx)
-- **Final report source:** [`deliverables/Report.pdf`](deliverables/Report.pdf)
+- **Final presentation:** [`deliverables/HPML_Final_Presentation.pptx`](deliverables/HPML%20Final%20Project%20Presentation.pptx)
+- **Final report source:** [`deliverables/HPML_Final_Report.pdf`](deliverables/HPML_Final_Report.pdf)
 - **Experiment tracking dashboard:** <https://wandb.ai/ac5905-columbia-university/hpml-final-project/runs/xfa9dt56?nw=nwuserac5905>
 
 ## Branch Map
@@ -76,6 +76,12 @@ full Stage 0 generation. The async configs use `async_chunk: true`, a
 chunks while Stage 0 continues generating later audio codes.
 
 ### Important Files by Branch
+
+#### `main`
+- README.md
+- LICENSE
+- deliverables/HPML_Final_Presentation.pptx
+- deliverables/HPML_Final_Report.pdf
 
 #### `moss-tts-delay`
 
