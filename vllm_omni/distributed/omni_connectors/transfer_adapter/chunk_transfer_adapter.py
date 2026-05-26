@@ -282,6 +282,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:
             cached_ic.pop(external_req_id, None)
+        moss_frames_sent = getattr(self, "_moss_frames_sent", None)
+        if isinstance(moss_frames_sent, dict):
+            moss_frames_sent.pop(external_req_id, None)
 
     def cleanup(
         self,

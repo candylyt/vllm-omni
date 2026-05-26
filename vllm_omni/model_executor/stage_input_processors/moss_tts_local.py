@@ -17,15 +17,10 @@ def _is_codes_empty(codes: Any) -> bool:
     if codes is None:
         return True
     if isinstance(codes, torch.Tensor):
-        return codes.numel() == 0 or not codes.any()
+        return codes.numel() == 0
     if hasattr(codes, "__len__") and len(codes) == 0:
         return True
-    t = (
-        codes
-        if isinstance(codes, torch.Tensor)
-        else torch.tensor(codes, dtype=torch.long)
-    )
-    return not t.any()
+    return False
 
 # payload for final chunk
 def _make_finished_sentinel(
@@ -95,13 +90,6 @@ def llm2decoder(
             logger.warning(
                 "[MossTTS processor] Unexpected codes ndim=%d for request %s — skipping.",
                 codes.ndim,
-                req_idx,
-            )
-            continue
-
-        if not codes.any():
-            logger.warning(
-                "[MossTTS processor] Request %s: all-zero codes — skipping.",
                 req_idx,
             )
             continue

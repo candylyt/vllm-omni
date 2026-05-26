@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import asdict, dataclass
+from inspect import signature
 from time import time
 from typing import Any
 
@@ -25,6 +26,21 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
 from vllm_omni.engine.serialization import deserialize_additional_information
 
 logger = init_logger(__name__)
+
+_ENGINE_CORE_OUTPUT_FIELDS = set(signature(EngineCoreOutput).parameters)
+
+
+def _engine_core_output_cache_kwargs(request: Request, req_id: str) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    if "num_cached_tokens" in _ENGINE_CORE_OUTPUT_FIELDS:
+        num_cached = getattr(request, "num_cached_tokens", request.num_computed_tokens)
+        if num_cached < 0:
+            logger.warning("Negative num_cached_tokens (%d) for request %s, clamping to 0", num_cached, req_id)
+            num_cached = 0
+        kwargs["num_cached_tokens"] = num_cached
+    if "num_external_computed_tokens" in _ENGINE_CORE_OUTPUT_FIELDS:
+        kwargs["num_external_computed_tokens"] = getattr(request, "num_external_computed_tokens", 0)
+    return kwargs
 
 
 @dataclass
@@ -365,10 +381,9 @@ class OmniARScheduler(VLLMScheduler):
                         events=request.take_events(),
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,
-                        num_cached_tokens=request.num_cached_tokens,
-                        num_external_computed_tokens=request.num_external_computed_tokens,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        **_engine_core_output_cache_kwargs(request, req_id),
                     )
                 )
                 if self.chunk_transfer_adapter is not None:
@@ -397,7 +412,7 @@ class OmniARScheduler(VLLMScheduler):
                         finish_reason=request.get_finished_reason(),
                         events=request.take_events(),
                         trace_headers=request.trace_headers,
-                        num_cached_tokens=request.num_cached_tokens,
+                        **_engine_core_output_cache_kwargs(request, request.request_id),
                     )
                 )
                 if self.chunk_transfer_adapter is not None:

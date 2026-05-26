@@ -29,6 +29,22 @@ _TIMER = get_timer()
 logger = logging.getLogger(__name__)
 _LOCAL_KV_DEBUG = os.environ.get("MOSS_TTS_LOCAL_KV_DEBUG", "0") == "1"
 
+
+def _apply_top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
+    if top_p <= 0.0 or top_p >= 1.0:
+        return logits
+    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+    sorted_probs = torch.softmax(sorted_logits, dim=-1)
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+    sorted_mask = cumulative_probs > top_p
+    sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
+    sorted_mask[..., 0] = False
+
+    remove_mask = torch.zeros_like(sorted_mask)
+    remove_mask.scatter_(dim=-1, index=sorted_indices, src=sorted_mask)
+    return logits.masked_fill(remove_mask, float("-inf"))
+
 # =======================================================================================
 #  Lightweight modules cloned from MOSS-TTS - MUST be identical for weight compatibility
 # =======================================================================================
@@ -129,6 +145,7 @@ class MossTTSLocalTransformerWrapper(nn.Module):
 
     def _install_cache_patch(self) -> bool:
         try:
+            import inspect
             import types
             from transformers.cache_utils import Cache, DynamicCache
             from transformers.modeling_outputs import BaseModelOutputWithPast
@@ -143,6 +160,8 @@ class MossTTSLocalTransformerWrapper(nn.Module):
 
         if not self._attention_supports_kv_cache():
             return False
+
+        causal_mask_params = set(inspect.signature(create_causal_mask).parameters)
 
         def patch_attention_forward(layer_self_attn) -> None:
             original_globals = layer_self_attn.forward.__func__.__globals__
@@ -283,12 +302,16 @@ class MossTTSLocalTransformerWrapper(nn.Module):
 
             mask_kwargs = {
                 "config": t.config,
-                "input_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
-                "cache_position": cache_position,
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
             }
+            if "inputs_embeds" in causal_mask_params:
+                mask_kwargs["inputs_embeds"] = inputs_embeds
+            else:
+                mask_kwargs["input_embeds"] = inputs_embeds
+            if "cache_position" in causal_mask_params:
+                mask_kwargs["cache_position"] = cache_position
             causal_mask = create_causal_mask(**mask_kwargs)
 
             hidden_states = inputs_embeds
@@ -556,6 +579,13 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         if token_id in entry_tokens:
             state.is_audio = True
 
+    def _force_token(self, logits: torch.Tensor, token_id: int) -> torch.Tensor:
+        if token_id < 0 or token_id >= logits.shape[-1]:
+            return logits
+        forced = torch.full_like(logits, float("-inf"))
+        forced[:, token_id] = logits[:, token_id]
+        return forced
+
     def _reset_prefill_state(
         self,
         request_id: str,
@@ -731,6 +761,7 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                         if top_k > 0:
                             top_k_vals = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1).values
                             logits[logits < top_k_vals[..., -1:]] = float("-inf")
+                        logits = _apply_top_p_filter(logits, top_p)
                         probs      = torch.softmax(logits, dim=-1)
                         next_token = torch.multinomial(probs, num_samples=1).squeeze(1)  
                     else:
@@ -784,7 +815,13 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
             seq_lens = [qsl[i + 1] - qsl[i] for i in range(num_reqs)]
             decode_positions = [qsl[i] for i, s in enumerate(seq_lens) if s == 1]
         except Exception as exc:
-            logger.debug("[MossTTS AR] _extract_request_info failed: %s", exc)
+            logger.warning(
+                "[MossTTS AR] _extract_request_info failed; falling back to "
+                "ungrouped logits. This may force audio_start to avoid a Local "
+                "FSM deadlock. Error: %r",
+                exc,
+                exc_info=True,
+            )
             return [], [], []
 
         if runtime_additional_information:
@@ -804,6 +841,19 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         # Drop warmup samples so the post-warmup timing report is clean.
         _TIMER.reset()
 
+    def on_requests_finished(self, request_ids) -> None:
+        finished = {str(request_id) for request_id in request_ids}
+        for request_id in finished:
+            self._request_states.pop(request_id, None)
+            self._pending_text_logits.pop(request_id, None)
+        active = [
+            (request_id, seq_len)
+            for request_id, seq_len in zip(self._last_request_ids, self._last_seq_lens)
+            if request_id not in finished
+        ]
+        self._last_request_ids = [request_id for request_id, _ in active]
+        self._last_seq_lens = [seq_len for _, seq_len in active]
+
     # =======================================================================================
     #  Forward Pass
     # =======================================================================================
@@ -822,7 +872,8 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
             # Step 0: obtain information from vLLM context
             with record_function("stage0/extract_info"), _TIMER.cpu("stage0/extract_info"):
                 request_ids, seq_lens_per_req, decode_positions = self._extract_request_info(
-                    kwargs.get("runtime_additional_information"),
+                    kwargs.get("model_intermediate_buffer")
+                    or kwargs.get("runtime_additional_information"),
                 )
             self._pending_text_logits = {}
 
@@ -915,6 +966,12 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         with record_function("stage0/compute_logits"), _TIMER.gpu("stage0/compute_logits"):
             logits = self.lm_heads[0](hidden_states)   # [L, vocab_size]
             if not self._last_request_ids:
+                if self.audio_start_token_id >= 0:
+                    return self._force_token(logits, self.audio_start_token_id)
+                logger.warning(
+                    "[MossTTS AR] compute_logits has no request FSM state and "
+                    "audio_start_token_id is unavailable; returning raw logits."
+                )
                 return logits
 
             neg_inf = float("-inf")
@@ -944,10 +1001,15 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                         row[self.gen_slot_id]  = gen_keep
                         row[self.audio_end_id] = end_keep
                 else:
-                    if self.pad_token_id >= 0:
-                        row[self.pad_token_id] = neg_inf
-                    row[self.gen_slot_id]  = neg_inf
-                    row[self.audio_end_id] = neg_inf
+                    if self.audio_start_token_id >= 0:
+                        keep = row[self.audio_start_token_id].clone()
+                        row.fill_(neg_inf)
+                        row[self.audio_start_token_id] = keep
+                    else:
+                        if self.pad_token_id >= 0:
+                            row[self.pad_token_id] = neg_inf
+                        row[self.gen_slot_id]  = neg_inf
+                        row[self.audio_end_id] = neg_inf
 
             return logits
 

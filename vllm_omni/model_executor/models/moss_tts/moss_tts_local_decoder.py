@@ -280,12 +280,6 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
                     self._exit_streaming(request_id)
                 return empty
 
-            # skip dummy/padding frames
-            if not codes.any():
-                if request_id and is_finished:
-                    self._exit_streaming(request_id)
-                return empty
-
             try:
                 if request_id is not None:
                     # streaming path: maintain causal KV-cache across chunks
@@ -460,6 +454,19 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
             self._exit_batched_streaming()
 
         return results
+
+    def on_requests_finished(self, request_ids) -> None:
+        finished = {str(request_id) for request_id in request_ids}
+        for request_id in finished:
+            self._exit_streaming(request_id)
+        if (
+            self._batched_streaming_request_ids is not None
+            and any(request_id in finished for request_id in self._batched_streaming_request_ids)
+        ):
+            self._exit_batched_streaming()
+        if self._active_key in finished:
+            self._active_key = None
+            self._last_gen_len = None
 
     def forward(
         self,

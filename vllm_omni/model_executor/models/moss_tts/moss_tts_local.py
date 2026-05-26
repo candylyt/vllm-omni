@@ -94,6 +94,10 @@ class MossTTSForConditionalGeneration(nn.Module, SupportsPP):
         if hasattr(self._model, "_clear_warmup_state"):
             self._model._clear_warmup_state()
 
+    def on_requests_finished(self, request_ids) -> None:
+        if hasattr(self._model, "on_requests_finished"):
+            self._model.on_requests_finished(request_ids)
+
     def load_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],

@@ -1,5 +1,7 @@
 import time
 from collections import defaultdict
+from inspect import signature
+from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_events import KVEventBatch
@@ -23,6 +25,21 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
 from vllm_omni.outputs import OmniModelRunnerOutput
 
 logger = init_logger(__name__)
+
+_ENGINE_CORE_OUTPUT_FIELDS = set(signature(EngineCoreOutput).parameters)
+
+
+def _engine_core_output_cache_kwargs(request: Request, req_id: str) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    if "num_cached_tokens" in _ENGINE_CORE_OUTPUT_FIELDS:
+        num_cached = getattr(request, "num_cached_tokens", request.num_computed_tokens)
+        if num_cached < 0:
+            logger.warning("Negative num_cached_tokens (%d) for request %s, clamping to 0", num_cached, req_id)
+            num_cached = 0
+        kwargs["num_cached_tokens"] = num_cached
+    if "num_external_computed_tokens" in _ENGINE_CORE_OUTPUT_FIELDS:
+        kwargs["num_external_computed_tokens"] = getattr(request, "num_external_computed_tokens", 0)
+    return kwargs
 
 
 class OmniGenerationScheduler(VLLMScheduler):
@@ -113,7 +130,7 @@ class OmniGenerationScheduler(VLLMScheduler):
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
             cached_prompt_token_ids[request.request_id] = request.prompt_token_ids
-            if request.num_cached_tokens < 0:
+            if getattr(request, "num_cached_tokens", 0) < 0:
                 request.num_cached_tokens = num_computed_tokens
             cached_additional_information[request.request_id] = getattr(request, "additional_information", None)
             token_budget -= num_new_tokens
@@ -141,7 +158,7 @@ class OmniGenerationScheduler(VLLMScheduler):
                 self.waiting.pop_request()
                 continue
             # Count the number of prefix cached tokens.
-            if request.num_cached_tokens < 0:
+            if getattr(request, "num_cached_tokens", 0) < 0:
                 request.num_cached_tokens = request.num_computed_tokens
 
             # async_chunk: wait for the first upstream chunk (don't start with placeholders).
@@ -184,7 +201,7 @@ class OmniGenerationScheduler(VLLMScheduler):
 
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
-            if request.num_cached_tokens < 0:
+            if getattr(request, "num_cached_tokens", 0) < 0:
                 request.num_cached_tokens = 0
             token_budget -= num_new_tokens
             scheduled_new_reqs.append(request)
@@ -478,10 +495,6 @@ class OmniGenerationScheduler(VLLMScheduler):
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if new_token_ids or pooler_output is not None or kv_transfer_params or stopped:
                 # Add EngineCoreOutput for this Request.
-                num_cached = request.num_cached_tokens
-                if num_cached < 0:
-                    logger.warning("Negative num_cached_tokens (%d) for request %s, clamping to 0", num_cached, req_id)
-                    num_cached = 0
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=req_id,
@@ -494,10 +507,9 @@ class OmniGenerationScheduler(VLLMScheduler):
                         events=request.take_events(),
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,
-                        num_cached_tokens=num_cached,
-                        num_external_computed_tokens=request.num_external_computed_tokens,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        **_engine_core_output_cache_kwargs(request, req_id),
                     )
                 )
             else:
@@ -517,12 +529,6 @@ class OmniGenerationScheduler(VLLMScheduler):
             requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
             self.finish_requests(failed_kv_load_req_ids, RequestStatus.FINISHED_ERROR)
             for request in requests:
-                num_cached = request.num_cached_tokens
-                if num_cached < 0:
-                    logger.warning(
-                        "Negative num_cached_tokens (%d) for request %s, clamping to 0", num_cached, request.request_id
-                    )
-                    num_cached = 0
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=request.request_id,
@@ -530,7 +536,7 @@ class OmniGenerationScheduler(VLLMScheduler):
                         finish_reason=request.get_finished_reason(),
                         events=request.take_events(),
                         trace_headers=request.trace_headers,
-                        num_cached_tokens=num_cached,
+                        **_engine_core_output_cache_kwargs(request, request.request_id),
                     )
                 )
                 if self.chunk_transfer_adapter is not None:
