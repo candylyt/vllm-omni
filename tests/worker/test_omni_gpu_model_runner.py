@@ -250,3 +250,21 @@ def test_maybe_attach_mimo_audio_req_infos_no_req_state_returns_input():
 
     # When no req_state, helper should be a no-op.
     assert result is req_infos
+
+
+def test_gather_runtime_additional_information_adds_request_metadata():
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.input_batch = DummyInputBatch(["r1", "r2"])
+    runner.requests = {
+        "r1": SimpleNamespace(output_token_ids=[1, 2]),
+        "r2": SimpleNamespace(output_token_ids=[]),
+    }
+    runner.model_intermediate_buffer = {"r1": {"left_context_size": 3}}
+
+    infos = OmniGPUModelRunner._gather_runtime_additional_information(runner)
+
+    assert infos == [
+        {"left_context_size": 3, "req_id": "r1", "generated_len": 2},
+        {"req_id": "r2", "generated_len": 0},
+    ]
+    assert runner.model_intermediate_buffer["r1"] == {"left_context_size": 3}

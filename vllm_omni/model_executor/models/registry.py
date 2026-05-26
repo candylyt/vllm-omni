@@ -118,6 +118,22 @@ _OMNI_MODELS = {
         "mimo_audio_code2wav",
         "MiMoAudioToken2WavForConditionalGenerationVLLM",
     ),
+    ## moss_tts
+    "moss_tts_delay": (
+        "moss_tts",
+        "moss_tts",
+        "MossTTSForConditionalGeneration",
+    ),
+    "MossTTSDelayModel": (
+        "moss_tts",
+        "moss_tts",
+        "MossTTSForConditionalGeneration",
+    ),
+    "MossTTSForConditionalGeneration": (
+        "moss_tts",
+        "moss_tts",
+        "MossTTSForConditionalGeneration",
+    ),
     ## glm_image
     "GlmImageForConditionalGeneration": (
         "glm_image",

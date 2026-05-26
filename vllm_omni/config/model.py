@@ -77,10 +77,12 @@ class OmniModelConfig(ModelConfig):
          engine_output_type: Optional output type specification for the engine.
              Used to route outputs to appropriate processors (e.g., "image",
              "audio", "latents"). If None, output type is inferred.
-         stage_connector_config: Stage connector configuration dictionary.
-             Contains "name" (connector name), "extra" (extra connector config).
-         task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
-             If not specified, will be inferred from model path.
+        stage_connector_config: Stage connector configuration dictionary.
+            Contains "name" (connector name), "extra" (extra connector config).
+        task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
+            If not specified, will be inferred from model path.
+        audio_tokenizer_path: Optional local path or HuggingFace repo ID for
+            external audio tokenizer / codec checkpoints used by decoder stages.
 
 
     The correct way to initialize this class is via vLLM config, as most
@@ -112,6 +114,7 @@ class OmniModelConfig(ModelConfig):
     omni_kv_config: dict | None = None
     codec_frame_rate_hz: float | None = None
     task_type: str | None = None
+    audio_tokenizer_path: str | None = None
 
     @property
     def registry(self):

@@ -6,6 +6,7 @@ and also outputs sampled tokens.
 
 from __future__ import annotations
 
+import inspect
 from copy import copy
 from typing import Any, NamedTuple
 
@@ -540,6 +541,16 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
+            bookkeeping_sync = self._bookkeeping_sync
+            bookkeeping_args = [
+                scheduler_output,
+                sampler_output,
+                logits,
+                hidden_states,
+                scheduler_output.total_num_scheduled_tokens,
+            ]
+            if "spec_decode_metadata" in inspect.signature(bookkeeping_sync).parameters:
+                bookkeeping_args.append(spec_decode_metadata)
             (
                 num_nans_in_logits,
                 logprobs_lists,
@@ -548,14 +559,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 req_ids_output_copy,
                 req_id_to_index_output_copy,
                 invalid_req_indices,
-            ) = self._bookkeeping_sync(
-                scheduler_output,
-                sampler_output,
-                logits,
-                hidden_states,
-                scheduler_output.total_num_scheduled_tokens,
-                spec_decode_metadata,
-            )
+            ) = bookkeeping_sync(*bookkeeping_args)
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
@@ -575,7 +579,17 @@ class GPUARModelRunner(OmniGPUModelRunner):
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
-        hidden_states_cpu = hidden_states.detach().to("cpu").contiguous()
+        custom_next_stage_func = getattr(
+            self.vllm_config.model_config,
+            "custom_process_next_stage_input_func",
+            None,
+        )
+        skip_hidden_pooler_output = (
+            custom_next_stage_func
+            == "vllm_omni.model_executor.stage_input_processors.moss_tts.llm2decoder_delay_async_chunk"
+        )
+        hidden_row_count = int(hidden_states.shape[0])
+        hidden_states_cpu = None if skip_hidden_pooler_output else hidden_states.detach().to("cpu").contiguous()
         num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
         if num_scheduled_tokens_np is None:
             req_ids = self.input_batch.req_ids
@@ -594,12 +608,12 @@ class GPUARModelRunner(OmniGPUModelRunner):
         if isinstance(multimodal_outputs, dict) and multimodal_outputs:
             for k, v in multimodal_outputs.items():
                 try:
-                    if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
+                    if isinstance(v, torch.Tensor) and v.shape[0] == hidden_row_count:
                         mm_cpu[k] = v.detach().to("cpu").contiguous()
                     elif isinstance(v, dict):
                         sub_dict: dict[str, torch.Tensor] = {}
                         for sk, sv in v.items():
-                            if isinstance(sv, torch.Tensor) and sv.shape[0] == hidden_states_cpu.shape[0]:
+                            if isinstance(sv, torch.Tensor) and sv.shape[0] == hidden_row_count:
                                 sub_dict[str(sk)] = sv.detach().to("cpu").contiguous()
                         if sub_dict:
                             mm_cpu[k] = sub_dict
@@ -622,12 +636,13 @@ class GPUARModelRunner(OmniGPUModelRunner):
             start = int(self.query_start_loc.cpu[idx])
             sched = int(num_scheduled_tokens_np[idx])
             end = start + sched
-            hidden_slice = hidden_states_cpu[start:end]
-            payload: dict[str, object] = {"hidden": hidden_slice}
+            payload: dict[str, object] = {}
+            if hidden_states_cpu is not None:
+                payload["hidden"] = hidden_states_cpu[start:end]
             if mm_cpu:
                 mm_payload: dict[str, object] = {}
                 for k, v in mm_cpu.items():
-                    if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
+                    if isinstance(v, torch.Tensor) and v.shape[0] == hidden_row_count:
                         mm_payload[k] = v[start:end].contiguous()
                     elif isinstance(v, dict):
                         mm_payload[k] = {sk: sv[start:end].contiguous() for sk, sv in v.items()}

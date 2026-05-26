@@ -105,6 +105,8 @@ class OmniEngineArgs(EngineArgs):
         worker_type: Model Type, e.g., "ar" or "generation"
         task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
             If not specified, will be inferred from model path.
+        audio_tokenizer_path: Optional local path or HuggingFace repo ID for
+            external audio tokenizer / codec checkpoints used by decoder stages.
     """
 
     stage_id: int = 0
@@ -119,6 +121,7 @@ class OmniEngineArgs(EngineArgs):
     quantization_config: Any | None = None
     worker_type: str | None = None
     task_type: str | None = None
+    audio_tokenizer_path: str | None = None
 
     def __post_init__(self) -> None:
         load_omni_general_plugins()
@@ -262,6 +265,7 @@ class OmniEngineArgs(EngineArgs):
             stage_connector_config=stage_connector_config,
             omni_kv_config=self.omni_kv_config,
             task_type=self.task_type,
+            audio_tokenizer_path=self.audio_tokenizer_path,
         )
         return omni_config
 

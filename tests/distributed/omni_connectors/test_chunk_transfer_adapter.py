@@ -41,9 +41,16 @@ def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None)
 
 @pytest.fixture
 def build_adapter(monkeypatch, mocker: MockerFixture):
-    def _build(*, stage_id: int = 1, model_mode: str = "ar", max_num_seqs: int = 2):
+    def _build(
+        *,
+        stage_id: int = 1,
+        model_mode: str = "ar",
+        max_num_seqs: int = 2,
+        connector_extra: dict | None = None,
+    ):
         connector = mocker.MagicMock()
         connector.stage_id = stage_id
+        connector.config = {"extra": connector_extra or {}}
         connector.get.return_value = None
         connector.put.return_value = (True, 1, {})
 
@@ -131,6 +138,40 @@ def test_save_async(build_adapter):
 
     task = adapter._pending_save_reqs.popleft()
     assert task["is_finished"] is False
+
+
+def test_save_async_build_payload_on_submit_skips_empty_payload(build_adapter):
+    adapter, _ = build_adapter(
+        stage_id=1,
+        connector_extra={"build_chunk_payload_on_submit": 1},
+    )
+    request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
+
+    calls = []
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: calls.append(kwargs) or None
+
+    adapter.save_async(pooling_output=None, request=request)
+
+    assert len(calls) == 1
+    assert adapter._pending_save_reqs == deque()
+
+
+def test_save_async_build_payload_on_submit_enqueues_payload_only(build_adapter):
+    adapter, connector = build_adapter(
+        stage_id=1,
+        connector_extra={"build_chunk_payload_on_submit": 1},
+    )
+    request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
+
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: {"x": [1], "finished": False}
+
+    adapter.save_async(pooling_output={"unused": True}, request=request)
+    task = adapter._pending_save_reqs.popleft()
+
+    assert task["pooling_output"] is None
+    assert task["payload_data"] == {"x": [1], "finished": False}
+    adapter._send_single_request(task)
+    connector.put.assert_called_once()
 
 
 def test_update_request_payload(build_adapter):

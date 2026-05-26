@@ -1,0 +1,142 @@
+# Stage config for MOSS-TTS-Delay with async_chunk streaming.
+#
+# Scope
+# -----
+#   - offline / batch mode and async-chunk streaming
+#   - direct TTS prompts
+#   - no reference-audio continuation
+#
+# Async-chunk overview
+# --------------------
+# Stage 0 (delay AR) emits one delay-pattern RVQ row per decode step.
+# llm2decoder_delay_async_chunk() (set via custom_process_next_stage_input_func
+# on Stage 0) accumulates those rows, applies the inverse delay transform on
+# the growing buffer, and flushes codec_chunk_frames newly recovered
+# frame-major codes to Stage 1 (CAT codec) via the shared-memory connector.
+# Stage 1 starts decoding each chunk to 24 kHz audio without waiting for
+# the full generation to finish.
+#
+# De-delay latency note
+# ---------------------
+# With n_vq=32, the first chunk requires:
+#   ramp_up (≈33 all-pad delay-slot rows) + n_vq-1 (fill all quantizers) + codec_chunk_frames
+#   = 33 + 31 + codec_chunk_frames ≈ 64 + codec_chunk_frames delay steps.
+# Keep codec_chunk_frames small (e.g. 3) to minimise initial audio latency.
+#
+# Hardware note
+# -------------
+# The Delay backbone is an 8B flagship model; target 80 GB+ GPU for bf16.
+# The CAT codec stage is shared with MOSS-TTS-Local and reuses the
+# MOSS-Audio-Tokenizer checkpoint.
+
+async_chunk: true
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      process: true
+      devices: "0"
+
+    engine_args:
+      dtype: bfloat16
+      max_num_seqs: 1
+      model_stage: delay_ar_stage
+      model_arch: MossTTSDelayModel
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.72
+      enforce_eager: true
+      trust_remote_code: true
+      enable_prefix_caching: false
+      engine_output_type: latent
+      max_model_len: 4096
+      max_num_batched_tokens: 4096
+      async_scheduling: true
+      # Flush delay-pattern rows to Stage 1 every codec_chunk_frames valid frames.
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.moss_tts.llm2decoder_delay_async_chunk
+
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+
+    is_comprehension: true
+    final_output: true
+    final_output_type: text
+
+    default_sampling_params:
+      temperature: 1.5
+      top_p: 1.0
+      top_k: 50
+      max_tokens: 900
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.0
+
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      process: true
+      devices: "0"
+
+    engine_args:
+      model_stage: decoder
+      # Path or HF repo ID for the separate MOSS-Audio-Tokenizer checkpoint.
+      # Override in production instead of relying on MOSS_AUDIO_TOKENIZER_PATH.
+      audio_tokenizer_path: null
+      max_num_seqs: 1
+      model_arch: MossTTSDelayModel
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.22
+      enforce_eager: true
+      trust_remote_code: true
+      enable_prefix_caching: false
+      engine_output_type: audio
+      max_model_len: 32768
+      max_num_batched_tokens: 32768
+      async_scheduling: true
+
+    engine_input_source: [0]
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    is_comprehension: false
+    final_output: true
+    final_output_type: audio
+
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 32768
+      seed: 42
+      detokenize: false
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1
+
+  connectors:
+    connector_of_shared_memory:
+      name: SharedMemoryConnector
+      extra:
+        shm_threshold_bytes: 65536
+        codec_streaming: true
+        connector_get_sleep_s: 0.01
+        connector_get_max_wait_first_chunk: 3000
+        connector_get_max_wait: 300
+        # First flush stays small for time-to-first-audio. Later flushes are
+        # larger so async throughput is closer to offline/batched decode.
+        initial_codec_chunk_frames: 3
+        codec_chunk_frames: 50
+        # MossTTSDecoderModel does not trim left context, so set to 0.
+        codec_left_context_frames: 0
+        build_chunk_payload_on_submit: true
+
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1

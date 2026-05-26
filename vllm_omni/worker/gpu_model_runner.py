@@ -258,6 +258,13 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.requests.pop(req_id, None)
             self.model_intermediate_buffer.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+        if scheduler_output.finished_req_ids:
+            on_requests_finished = getattr(self.model, "on_requests_finished", None)
+            if callable(on_requests_finished):
+                try:
+                    on_requests_finished(scheduler_output.finished_req_ids)
+                except Exception:
+                    logger.exception("Model request cleanup hook failed.")
         if hasattr(self, "late_interaction_runner"):
             self.late_interaction_runner.on_requests_finished(scheduler_output.finished_req_ids)
         # Remove the finished requests from the persistent batch.
@@ -987,16 +994,14 @@ class OmniGPUModelRunner(GPUModelRunner):
             #   column_id = generated_len % (ar_width + 1)
             # and forces the EOL token when column_id == ar_width.
             generated_len = len(req_state.output_token_ids) if req_state is not None else 0
-            info = self.model_intermediate_buffer.get(req_id, {})
-            if info:
-                info["generated_len"] = generated_len
-                per_req_runtime_info.append(info)
-                if "thinker_reply_part_per_request" in info:
-                    q = info["thinker_reply_part_per_request"]
-                    if hasattr(q, "shape"):
-                        logger.debug(f"[OMNI] req={req_id} has thinker_reply_part_per_request queue shape: {q.shape}")
-            else:
-                per_req_runtime_info.append({})
+            info = dict(self.model_intermediate_buffer.get(req_id, {}))
+            info["req_id"] = req_id
+            info["generated_len"] = generated_len
+            per_req_runtime_info.append(info)
+            if "thinker_reply_part_per_request" in info:
+                q = info["thinker_reply_part_per_request"]
+                if hasattr(q, "shape"):
+                    logger.debug(f"[OMNI] req={req_id} has thinker_reply_part_per_request queue shape: {q.shape}")
         return per_req_runtime_info
 
     def _compute_request_token_spans(self, num_scheduled_tokens_np) -> list[tuple[int, int]]:

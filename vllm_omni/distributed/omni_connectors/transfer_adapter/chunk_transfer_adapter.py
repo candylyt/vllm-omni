@@ -11,7 +11,7 @@ from vllm.v1.request import Request, RequestStatus
 from ..factory import OmniConnectorFactory
 from ..utils.config import ConnectorSpec
 from ..utils.logging import get_connector_logger
-from .base import OmniTransferAdapterBase
+from .base import OmniTransferAdapterBase, _config_bool
 
 logger = get_connector_logger(__name__)
 
@@ -47,6 +47,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             module_path, func_name = custom_process_next_stage_input_func.rsplit(".", 1)
             module = importlib.import_module(module_path)
             self.custom_process_next_stage_input_func = getattr(module, func_name)
+        connector_cfg = getattr(self.connector, "config", {}) or {}
+        connector_extra = connector_cfg.get("extra", connector_cfg) if isinstance(connector_cfg, dict) else {}
+        self.build_chunk_payload_on_submit = _config_bool(
+            connector_extra.get("build_chunk_payload_on_submit")
+        )
         # mapping for request id and chunk id
         self.put_req_chunk: dict[str, int] = defaultdict(int)
         self.get_req_chunk: dict[str, int] = defaultdict(int)
@@ -101,7 +106,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     def save_async(
         self,
-        pooling_output: torch.Tensor | None = None,
+        pooling_output: Any | None = None,
         request: Request | None = None,
     ):
         """Build and enqueue one chunk for asynchronous sending.
@@ -113,12 +118,29 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             pooling_output: Partial pooling output dictionary
             request: Request object
         """
+        is_finished = request.is_finished()
         task = {
             "pooling_output": pooling_output,
             "request": request,
-            "is_finished": request.is_finished(),
+            "external_req_id": request.external_req_id,
+            "is_finished": is_finished,
         }
+        if self.build_chunk_payload_on_submit and self.custom_process_next_stage_input_func:
+            payload_data = self._build_next_stage_payload(
+                pooling_output=pooling_output,
+                request=request,
+                is_finished=is_finished,
+            )
+            if not payload_data:
+                if getattr(self, "_profile_async", False):
+                    self._profile_stats["save_skipped"] += 1
+                return
+            task["payload_data"] = payload_data
+            task["pooling_output"] = None
+
         self._pending_save_reqs.append(task)
+        if getattr(self, "_profile_async", False):
+            self._profile_stats["save_enqueued"] += 1
         with self._save_cond:
             self._save_cond.notify()
 
@@ -165,6 +187,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 request.additional_information = {}
                 if "left_context_size" in payload_data:
                     request.additional_information["left_context_size"] = payload_data["left_context_size"]
+                if "request_id" in payload_data:
+                    request.additional_information["request_id"] = payload_data["request_id"]
+                if "finished" in payload_data:
+                    request.additional_information["finished"] = payload_data["finished"]
                 request.num_computed_tokens = 0
 
                 # Empty chunk with more data expected: keep polling.
@@ -204,28 +230,42 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.request_payload[req_id] = payload_data
         return payload_data
 
+    def _build_next_stage_payload(
+        self,
+        pooling_output: Any | None,
+        request: Request,
+        is_finished: bool,
+    ) -> dict[str, Any] | None:
+        if not self.custom_process_next_stage_input_func:
+            return None
+        try:
+            return self.custom_process_next_stage_input_func(
+                transfer_manager=self,
+                pooling_output=pooling_output,
+                request=request,
+                is_finished=is_finished,
+            )
+        except Exception as e:
+            logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
+            return None
+
     def _send_single_request(self, task: dict):
         pooling_output = task["pooling_output"]
         request = task["request"]
         is_finished = task["is_finished"]
         stage_id = self.connector.stage_id
         next_stage_id = stage_id + 1
-        external_req_id = request.external_req_id
+        external_req_id = task.get("external_req_id", request.external_req_id)
         chunk_id = self.put_req_chunk[external_req_id]
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
         # Process payload in save_loop thread
-        payload_data = None
-        if self.custom_process_next_stage_input_func:
-            try:
-                payload_data = self.custom_process_next_stage_input_func(
-                    transfer_manager=self,
-                    pooling_output=pooling_output,
-                    request=request,
-                    is_finished=is_finished,
-                )
-
-            except Exception as e:
-                logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
+        payload_data = task.get("payload_data")
+        if payload_data is None:
+            payload_data = self._build_next_stage_payload(
+                pooling_output=pooling_output,
+                request=request,
+                is_finished=is_finished,
+            )
 
         if not payload_data:
             return
@@ -276,6 +316,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.put_req_chunk.pop(external_req_id, None)
         self.request_payload.pop(external_req_id, None)
         self.code_prompt_token_ids.pop(external_req_id, None)
+
+        # Some async processors keep bounded per-request state outside the
+        # generic code_prompt_token_ids buffer.
+        for attr in (
+            "_moss_tts_delay_async_states",
+            "_moss_tts_delay_audio_pad_code",
+            "_delay_frames_sent",
+        ):
+            cache = getattr(self, attr, None)
+            if isinstance(cache, dict):
+                cache.pop(external_req_id, None)
 
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:
