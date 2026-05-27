@@ -3,10 +3,9 @@
 import copy
 import logging
 import os
-from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -28,6 +27,7 @@ _TIMER = get_timer()
 
 logger = logging.getLogger(__name__)
 _LOCAL_KV_DEBUG = os.environ.get("MOSS_TTS_LOCAL_KV_DEBUG", "0") == "1"
+_LOCAL_KV_CACHE_ENABLED = os.environ.get("MOSS_TTS_LOCAL_KV_CACHE", "0") == "1"
 
 
 def _apply_top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
@@ -69,317 +69,255 @@ class MossTTSMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
+
+class MossTTSAttentionWithoutPositionalEmbedding(nn.Module):
+    """Qwen3-style local attention without RoPE, matching the MOSS reference."""
+
+    def __init__(self, config: Any, layer_idx: int):
+        super().__init__()
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention
+
+        self.attn = Qwen3Attention(config, layer_idx)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, None]:
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+        from transformers.models.qwen3.modeling_qwen3 import eager_attention_forward
+
+        attn = self.attn
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, attn.head_dim)
+        past_key_values = kwargs.pop("past_key_values", None)
+        use_cache = bool(kwargs.pop("use_cache", False))
+
+        query_states = attn.q_norm(
+            attn.q_proj(hidden_states).view(hidden_shape)
+        ).transpose(1, 2)
+        key_states = attn.k_norm(
+            attn.k_proj(hidden_states).view(hidden_shape)
+        ).transpose(1, 2)
+        value_states = attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        if use_cache:
+            if past_key_values is None:
+                raise RuntimeError(
+                    "MOSS-TTS local transformer cache was requested without "
+                    "a cache object."
+                )
+            key_states, value_states = past_key_values.update(
+                key_states,
+                value_states,
+                attn.layer_idx,
+            )
+
+        attn_impl = getattr(attn.config, "_attn_implementation", None) or "eager"
+        attention_interface = eager_attention_forward
+        if attn_impl != "eager":
+            if (
+                attn_impl == "sdpa"
+                and kwargs.get("output_attentions", False)
+            ):
+                logger.warning(
+                    "`scaled_dot_product_attention` does not support "
+                    "`output_attentions=True`; falling back to eager attention "
+                    "for MOSS-TTS local transformer."
+                )
+            else:
+                if hasattr(ALL_ATTENTION_FUNCTIONS, "get_interface"):
+                    attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+                        attn_impl,
+                        eager_attention_forward,
+                    )
+                else:
+                    attention_interface = ALL_ATTENTION_FUNCTIONS[attn_impl]
+
+        attn_output, _ = attention_interface(
+            attn,
+            query_states,
+            key_states,
+            value_states,
+            is_causal=not use_cache,
+            # The MOSS reference local transformer deliberately ignores the
+            # constructed mask here and lets the attention implementation apply
+            # causal masking. Passing the mask changes local-channel logits.
+            attention_mask=None,
+            dropout=0.0 if not attn.training else attn.attention_dropout,
+            scaling=attn.scaling,
+            sliding_window=attn.sliding_window,
+            **kwargs,
+        )
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        return attn.o_proj(attn_output), None
+
+
+class MossTTSLocalKVCache:
+    """Small per-local-frame KV cache for the MOSS local transformer.
+
+    This cache is intentionally not vLLM PagedAttention state. It only covers
+    the short local channel loop inside one global AR step, then gets discarded.
+    """
+
+    def __init__(self, num_layers: int, max_seq_len: int = 64):
+        self.max_seq_len = max_seq_len
+        self.key_cache: list[torch.Tensor | None] = [None] * num_layers
+        self.value_cache: list[torch.Tensor | None] = [None] * num_layers
+        self.seq_lens: list[int] = [0] * num_layers
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        step = int(key_states.shape[-2])
+        start = self.seq_lens[layer_idx]
+        end = start + step
+        if end > self.max_seq_len:
+            raise RuntimeError(
+                "MOSS-TTS local transformer KV cache exceeded max_seq_len="
+                f"{self.max_seq_len}."
+            )
+
+        key_cache = self.key_cache[layer_idx]
+        value_cache = self.value_cache[layer_idx]
+        if key_cache is None or value_cache is None:
+            cache_shape = (
+                *key_states.shape[:-2],
+                self.max_seq_len,
+                key_states.shape[-1],
+            )
+            key_cache = torch.empty(
+                cache_shape,
+                dtype=key_states.dtype,
+                device=key_states.device,
+            )
+            value_cache = torch.empty(
+                cache_shape,
+                dtype=value_states.dtype,
+                device=value_states.device,
+            )
+            self.key_cache[layer_idx] = key_cache
+            self.value_cache[layer_idx] = value_cache
+
+        key_cache[..., start:end, :].copy_(key_states)
+        value_cache[..., start:end, :].copy_(value_states)
+        self.seq_lens[layer_idx] = end
+        return key_cache[..., :end, :], value_cache[..., :end, :]
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        return self.seq_lens[layer_idx]
+
+
+class MossTTSNativeLocalTransformer(nn.Module):
+    """In-tree local transformer with MOSS reference-equivalent semantics.
+
+    The local channel transformer is a short side computation inside one global
+    AR decode step. It intentionally has no RoPE and does not use vLLM's main
+    scheduler-managed KV blocks. The optional cache path below is a small
+    per-local-frame cache and should remain opt-in until audio parity is proven.
+    """
+
+    supports_kv_cache = True
+
+    def __init__(self, config: Any):
+        super().__init__()
+        from transformers.masking_utils import create_causal_mask
+        from transformers.models.qwen3.modeling_qwen3 import (
+            Qwen3DecoderLayer,
+            Qwen3RMSNorm,
+        )
+
+        self.config = config
+        self.max_cache_len = int(getattr(config, "max_local_cache_len", 64))
+        self.create_causal_mask = create_causal_mask
+        self.layers = nn.ModuleList([
+            Qwen3DecoderLayer(config, layer_idx)
+            for layer_idx in range(config.num_hidden_layers)
+        ])
+        for layer_idx, layer in enumerate(self.layers):
+            layer.self_attn = MossTTSAttentionWithoutPositionalEmbedding(
+                config, layer_idx
+            )
+        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        past_key_values: MossTTSLocalKVCache | None = None,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, MossTTSLocalKVCache | None]:
+        if past_key_values is not None and not use_cache:
+            raise RuntimeError(
+                "MOSS-TTS local transformer received past_key_values with "
+                "use_cache=False."
+            )
+        if use_cache and inputs_embeds.shape[1] != 1:
+            raise RuntimeError(
+                "MOSS-TTS local transformer cache path only supports "
+                "single-token incremental local steps."
+            )
+        if use_cache and past_key_values is None:
+            past_key_values = MossTTSLocalKVCache(
+                self.config.num_hidden_layers,
+                max_seq_len=self.max_cache_len,
+            )
+
+        seq_len = inputs_embeds.shape[1]
+        past_seen_tokens = (
+            past_key_values.get_seq_length() if past_key_values is not None else 0
+        )
+        cache_position = torch.arange(
+            past_seen_tokens,
+            past_seen_tokens + seq_len,
+            device=inputs_embeds.device,
+            dtype=torch.long,
+        )
+        position_ids = cache_position.unsqueeze(0).expand(inputs_embeds.shape[0], -1)
+        mask_kwargs = {
+            "config": self.config,
+            "attention_mask": None,
+            "cache_position": cache_position,
+            "past_key_values": None,
+            "position_ids": position_ids,
+        }
+        import inspect
+
+        if "inputs_embeds" in inspect.signature(self.create_causal_mask).parameters:
+            mask_kwargs["inputs_embeds"] = inputs_embeds
+        else:
+            mask_kwargs["input_embeds"] = inputs_embeds
+        causal_mask = self.create_causal_mask(**mask_kwargs)
+
+        hidden_states = inputs_embeds
+        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=None,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=None,
+            )
+        return self.norm(hidden_states), past_key_values
+
+
 class MossTTSLocalTransformerWrapper(nn.Module):
-    # Default MOSS_TTS_LOCAL_KV_CACHE=1, can be disabled to disable KV cache 
+    # Compatibility holder for the checkpoint prefix used by this branch.
     def __init__(self, local_qwen3_config, model_path: str | None = None):
         super().__init__()
-        try:
-            from moss_tts_local.modeling_moss_tts import MossTTSLocalTransformer
-        except ModuleNotFoundError:
-            if model_path is None:
-                raise
-            from transformers.dynamic_module_utils import get_class_from_dynamic_module
-            MossTTSLocalTransformer = get_class_from_dynamic_module(
-                "modeling_moss_tts.MossTTSLocalTransformer",
-                model_path,
-                code_revision=None,
-            )
-        self.transformer = MossTTSLocalTransformer(local_qwen3_config)
-
-        # Detect which forward kwargs the underlying transformer accepts.
-        import inspect
-        try:
-            sig_params = inspect.signature(self.transformer.forward).parameters
-            self.supports_kv_cache: bool = (
-                "past_key_values" in sig_params and "use_cache" in sig_params
-            )
-            self._has_position_ids: bool = "position_ids" in sig_params
-            self._has_cache_position: bool = "cache_position" in sig_params
-        except (TypeError, ValueError):
-            self.supports_kv_cache = False
-            self._has_position_ids = False
-            self._has_cache_position = False
-
-
-        import os
-        if os.environ.get("MOSS_TTS_LOCAL_KV_CACHE", "1") == "0" and self.supports_kv_cache:
-            self.supports_kv_cache = False
-
-        # patch is required to override the original MossTTSLocalTransformer which disabled KV cache support
-        if self.supports_kv_cache:
-            if not self._install_cache_patch():
-                self.supports_kv_cache = False
-
-        if self.supports_kv_cache:
-            logger.info(
-                "[MossTTS Local] KV cache enabled (patched forward installed)."
-            )
-        else:
-            logger.info(
-                "[MossTTS Local] Using recompute path (KV cache disabled)."
-            )
-
-    def _attention_supports_kv_cache(self) -> bool:
-        # return True when decoder self-attention is patchable for caching
-        import inspect
-
-        try:
-            first_layer = self.transformer.layers[0]
-            self_attn = first_layer.self_attn
-            sig_params = inspect.signature(self_attn.forward).parameters
-        except (AttributeError, IndexError, TypeError, ValueError):
-            logger.info(
-                "[MossTTS Local] Could not inspect self-attention cache "
-                "support; falling back to recompute path."
-            )
-            return False
-
-        if "past_key_value" not in sig_params:
-            logger.info(
-                "[MossTTS Local] Self-attention forward does not accept "
-                "`past_key_value`; falling back to recompute path."
-            )
-            return False
-
-        return True
-
-    def _install_cache_patch(self) -> bool:
-        try:
-            import inspect
-            import types
-            from transformers.cache_utils import Cache, DynamicCache
-            from transformers.modeling_outputs import BaseModelOutputWithPast
-            from transformers.masking_utils import create_causal_mask
-        except ImportError as exc:
-            logger.warning(
-                "[MossTTS Local] Could not import cache patch dependencies "
-                "(%s); falling back to recompute path.",
-                exc,
-            )
-            return False
-
-        if not self._attention_supports_kv_cache():
-            return False
-
-        causal_mask_params = set(inspect.signature(create_causal_mask).parameters)
-
-        def patch_attention_forward(layer_self_attn) -> None:
-            original_globals = layer_self_attn.forward.__func__.__globals__
-            eager_attention_forward = original_globals["eager_attention_forward"]
-            all_attention_functions = original_globals["ALL_ATTENTION_FUNCTIONS"]
-
-            def patched_attention_forward(
-                attn,
-                hidden_states: torch.Tensor,
-                position_embeddings=None,
-                attention_mask: Optional[torch.Tensor] = None,
-                past_key_value: Optional[Cache] = None,
-                cache_position: Optional[torch.LongTensor] = None,
-                **kwargs,
-            ):
-                input_shape = hidden_states.shape[:-1]
-                hidden_shape = (*input_shape, -1, attn.head_dim)
-
-                query_states = attn.q_norm(
-                    attn.q_proj(hidden_states).view(hidden_shape)
-                ).transpose(1, 2)
-                key_states = attn.k_norm(
-                    attn.k_proj(hidden_states).view(hidden_shape)
-                ).transpose(1, 2)
-                value_states = attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-                if past_key_value is not None:
-                    cache_kwargs: dict[str, Any] = {}
-                    if cache_position is not None:
-                        cache_kwargs["cache_position"] = cache_position
-                    key_states, value_states = past_key_value.update(
-                        key_states,
-                        value_states,
-                        attn.layer_idx,
-                        cache_kwargs,
-                    )
-
-                attention_interface = eager_attention_forward
-                if attn.config._attn_implementation != "eager":
-                    if (
-                        attn.config._attn_implementation == "sdpa"
-                        and kwargs.get("output_attentions", False)
-                    ):
-                        logger.warning(
-                            "`scaled_dot_product_attention` does not support "
-                            "`output_attentions=True`; falling back to eager "
-                            "attention for MOSS-TTS local transformer."
-                        )
-                    else:
-                        if hasattr(all_attention_functions, "get_interface"):
-                            attention_interface = all_attention_functions.get_interface(
-                                attn.config._attn_implementation,
-                                eager_attention_forward,
-                            )
-                        else:
-                            attention_interface = all_attention_functions[
-                                attn.config._attn_implementation
-                            ]
-
-                attn_output, attn_weights = attention_interface(
-                    attn,
-                    query_states,
-                    key_states,
-                    value_states,
-                    is_causal=True,
-                    attention_mask=attention_mask,
-                    dropout=0.0 if not attn.training else attn.attention_dropout,
-                    scaling=attn.scaling,
-                    sliding_window=attn.sliding_window,
-                    **kwargs,
-                )
-
-                attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-                attn_output = attn.o_proj(attn_output)
-                return attn_output, attn_weights
-
-            layer_self_attn.forward = types.MethodType(
-                patched_attention_forward, layer_self_attn
-            )
-
-        for decoder_layer in self.transformer.layers[: self.transformer.config.num_hidden_layers]:
-            patch_attention_forward(decoder_layer.self_attn)
-
-        def patched_forward(
-            t,                                   
-            input_ids=None,
-            attention_mask=None,
-            position_ids=None,
-            past_key_values=None,
-            inputs_embeds=None,
-            use_cache=None,
-            output_attentions=None,
-            output_hidden_states=None,
-            cache_position=None,
-            **flash_attn_kwargs,
-        ):
-            output_attentions = (
-                output_attentions if output_attentions is not None
-                else t.config.output_attentions
-            )
-            output_hidden_states = (
-                output_hidden_states if output_hidden_states is not None
-                else t.config.output_hidden_states
-            )
-            use_cache = use_cache if use_cache is not None else t.config.use_cache
-            # PATCH: original forced `use_cache = False; assert not use_cache` here.
-
-            if (input_ids is None) ^ (inputs_embeds is not None):
-                raise ValueError(
-                    "You must specify exactly one of input_ids or inputs_embeds"
-                )
-
-            if not isinstance(past_key_values, (type(None), Cache)):
-                raise ValueError(
-                    "The `past_key_values` should be either a `Cache` object or `None`."
-                )
-
-            if inputs_embeds is None:
-                inputs_embeds = t.embed_tokens(input_ids)
-
-            # PATCH: original had `assert False` blocking this initialisation.
-            if use_cache and past_key_values is None:
-                past_key_values = DynamicCache()
-
-            if cache_position is None:
-                past_seen_tokens = (
-                    past_key_values.get_seq_length()
-                    if past_key_values is not None else 0
-                )
-                cache_position = torch.arange(
-                    past_seen_tokens,
-                    past_seen_tokens + inputs_embeds.shape[1],
-                    device=inputs_embeds.device,
-                )
-
-            if position_ids is None:
-                position_ids = cache_position.unsqueeze(0)
-
-            mask_kwargs = {
-                "config": t.config,
-                "attention_mask": attention_mask,
-                "past_key_values": past_key_values,
-                "position_ids": position_ids,
-            }
-            if "inputs_embeds" in causal_mask_params:
-                mask_kwargs["inputs_embeds"] = inputs_embeds
-            else:
-                mask_kwargs["input_embeds"] = inputs_embeds
-            if "cache_position" in causal_mask_params:
-                mask_kwargs["cache_position"] = cache_position
-            causal_mask = create_causal_mask(**mask_kwargs)
-
-            hidden_states = inputs_embeds
-
-            all_hidden_states = () if output_hidden_states else None
-            all_self_attns = () if output_attentions else None
-
-            for decoder_layer in t.layers[: t.config.num_hidden_layers]:
-                if output_hidden_states:
-                    all_hidden_states += (hidden_states,)
-
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=None,
-                    # PATCH: original passed past_key_value=None unconditionally.
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    # PATCH: original passed cache_position=None unconditionally.
-                    cache_position=cache_position,
-                    position_embeddings=None,
-                    **flash_attn_kwargs,
-                )
-
-                hidden_states = layer_outputs
-
-                if output_attentions:
-                    all_self_attns += (layer_outputs[1],)
-
-            hidden_states = t.norm(hidden_states)
-
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            return BaseModelOutputWithPast(
-                last_hidden_state=hidden_states,
-                past_key_values=past_key_values if use_cache else None,
-                hidden_states=all_hidden_states,
-                attentions=all_self_attns,
-            )
-
-        # This patches only affect this specific instance
-        self.transformer.forward = types.MethodType(patched_forward, self.transformer)
+        self.transformer = MossTTSNativeLocalTransformer(local_qwen3_config)
+        self.supports_kv_cache = _LOCAL_KV_CACHE_ENABLED
         logger.info(
-            "[MossTTS Local] Cache patch installed on local transformer "
-            "and attention layers."
+            "[MossTTS Local] Using in-tree local transformer; local KV cache "
+            "enabled=%s.",
+            self.supports_kv_cache,
         )
-        return True
-
-    @staticmethod
-    def _cache_length(past_key_values: Any) -> int:
-        if past_key_values is None:
-            return 0
-        # Modern HF Cache object
-        if hasattr(past_key_values, "get_seq_length"):
-            try:
-                return int(past_key_values.get_seq_length())
-            except Exception:
-                pass
-        # Legacy tuple-of-tuples: ((k0, v0), (k1, v1), …) where each k/v has
-        # shape [B, num_heads, seq_len, head_dim].
-        try:
-            first_layer = past_key_values[0]
-            k = first_layer[0] if isinstance(first_layer, (tuple, list)) else first_layer
-            return int(k.shape[-2])
-        except (TypeError, IndexError, AttributeError):
-            return 0
 
     def forward(
         self,
@@ -387,32 +325,11 @@ class MossTTSLocalTransformerWrapper(nn.Module):
         past_key_values: Any = None,
         use_cache: bool = False,
     ) -> tuple[torch.Tensor, Any]:
-        want_cache = use_cache or past_key_values is not None
-        if want_cache and self.supports_kv_cache:
-            B, t, _ = inputs_embeds.shape
-            past_length = self._cache_length(past_key_values)
-            cache_position = torch.arange(
-                past_length, past_length + t,
-                device=inputs_embeds.device,
-                dtype=torch.long,
-            )
-
-            extra: dict[str, Any] = {}
-            if self._has_cache_position:
-                extra["cache_position"] = cache_position
-            if self._has_position_ids:
-                extra["position_ids"] = cache_position.unsqueeze(0).expand(B, -1)
-
-            out = self.transformer(
-                input_ids=None,
-                inputs_embeds=inputs_embeds,
-                past_key_values=past_key_values,
-                use_cache=True,
-                **extra,
-            )
-            return out.last_hidden_state, out.past_key_values
-        out = self.transformer(input_ids=None, inputs_embeds=inputs_embeds)
-        return out.last_hidden_state, None
+        return self.transformer(
+            inputs_embeds,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+        )
 
 # =======================================================================================
 #  Per-request FSM state
@@ -433,7 +350,7 @@ class MossTTSLocalRequestState:
 
     def store_next_audio_row(self, row: torch.Tensor) -> None:
         # cache the [n_vq] codes just sampled, to be summed into the next decode embedding.
-        self.pending_audio_row = row.detach().to(torch.long).cpu().reshape(self.n_vq)
+        self.pending_audio_row = row.detach().to(dtype=torch.long).reshape(self.n_vq)
         self.audio_steps_generated += 1
 
 
@@ -448,12 +365,12 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         self.vllm_config = vllm_config
         cfg = vllm_config.model_config.hf_config
         self.config = cfg
-        self.n_vq: int            = cfg.n_vq                             
-        self.channels: int        = 1 + self.n_vq                       
-        self.audio_vocab_size: int = cfg.audio_vocab_size                 
-        self.audio_pad_code: int  = cfg.audio_pad_code                   
-        self.gen_slot_id: int     = cfg.audio_assistant_gen_slot_token_id 
-        self.audio_end_id: int    = cfg.audio_end_token_id               
+        self.n_vq: int            = cfg.n_vq
+        self.channels: int        = 1 + self.n_vq
+        self.audio_vocab_size: int = cfg.audio_vocab_size
+        self.audio_pad_code: int  = cfg.audio_pad_code
+        self.gen_slot_id: int     = cfg.audio_assistant_gen_slot_token_id
+        self.audio_end_id: int    = cfg.audio_end_token_id
 
         # Tokens needed by the FSM / logits gating
         self.pad_token_id: int          = getattr(cfg, "pad_token_id", -1)
@@ -471,7 +388,7 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         lang_cfg = cfg.language_config # Qwen3Config
         self.hidden_size: int = lang_cfg.hidden_size
 
-        # Global Qwen3 backbone 
+        # Global Qwen3 backbone
         qwen3_vllm_config = copy.deepcopy(vllm_config)
         object.__setattr__(qwen3_vllm_config.model_config, "hf_config", lang_cfg)
 
@@ -502,18 +419,19 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
 
         # Local Transformer - built using the local Qwen3 sub-config (4 blocks, 1536 hidden).
         local_cfg = copy.deepcopy(lang_cfg)
-        local_cfg.num_hidden_layers = cfg.local_num_layers      
-        local_cfg.hidden_size       = cfg.local_hidden_size      
-        local_cfg.intermediate_size = cfg.local_ffn_hidden_size  
+        local_cfg.num_hidden_layers = cfg.local_num_layers
+        local_cfg.hidden_size       = cfg.local_hidden_size
+        local_cfg.intermediate_size = cfg.local_ffn_hidden_size
+        local_cfg.max_local_cache_len = self.channels
         self.local_transformer = MossTTSLocalTransformerWrapper(
             local_cfg, model_path=vllm_config.model_config.model
         )
 
-        # Projection: global hidden to local hidden 
+        # Projection: global hidden to local hidden
         self.speech_embedding_to_local_mlp = MossTTSMLP(
             input_size=self.hidden_size,
-            ffn_hidden_size=cfg.additional_mlp_ffn_hidden_size, 
-            output_size=cfg.local_hidden_size,                  
+            ffn_hidden_size=cfg.additional_mlp_ffn_hidden_size,
+            output_size=cfg.local_hidden_size,
         )
 
         # local hidden to global hidden
@@ -568,8 +486,10 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         if state.is_audio:
             if token_id == self.audio_end_id:
                 state.is_audio = False
-                state.pending_audio_row = torch.full(
-                    (self.n_vq,), self.audio_pad_code, dtype=torch.long
+                state.pending_audio_row = torch.full_like(
+                    state.pending_audio_row,
+                    self.audio_pad_code,
+                    dtype=torch.long,
                 )
             return
 
@@ -647,8 +567,8 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         input_ids: torch.Tensor, # [L] flat 1-D token IDs (text channel)
         multimodal_embeddings=None,
         is_multimodal: bool = False,
-        request_ids: Optional[list[str]] = None,
-        seq_lens: Optional[list[int]] = None,
+        request_ids: list[str] | None = None,
+        seq_lens: list[int] | None = None,
     ) -> torch.Tensor:
         # Channel 0: text embedding
         embeds = self.embedding_list[0](input_ids)  # [L, D]
@@ -696,54 +616,52 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         # Project global hidden state to first local transformer input
         current_proj = self.speech_embedding_to_local_mlp(global_hidden) # [B, local_D]
 
-        use_cache_path = self.local_transformer.supports_kv_cache
-
-        # init past_kv to prepare for cache-mode state: incremental K/V across the 33-channel loop
-        past_kv: Any = None
-        # fallback to recompute-mode input construction if cache path is not available
-        local_ctx: torch.Tensor | None = (
-            None
-            if use_cache_path
-            else torch.zeros(B, 0, local_dim, device=dev, dtype=dtype)
+        local_ctx = torch.zeros(B, 0, local_dim, device=dev, dtype=dtype)
+        local_cache: MossTTSLocalKVCache | None = None
+        use_local_cache = bool(
+            getattr(self.local_transformer, "supports_kv_cache", False)
         )
 
         audio_codes: list[torch.Tensor] = []
         text_logits: torch.Tensor | None = None
         debug_input_lengths: list[int] | None = [] if _LOCAL_KV_DEBUG else None
-        debug_cache_lengths: list[int] | None = [] if _LOCAL_KV_DEBUG else None
 
         # ch = 0 (text), 1..32 (audio)
-        for ch in range(self.channels):   
+        for ch in range(self.channels):
             with record_function(f"local/ch_{ch:02d}_transformer"), \
                  _TIMER.gpu("local/transformer_per_ch"):
-                if use_cache_path:
-                    # incremental path: feed only the new token, reuse past K/V.
-                    new_input = current_proj.unsqueeze(1)        
-                    if debug_input_lengths is not None and debug_cache_lengths is not None:
-                        debug_input_lengths.append(int(new_input.shape[1]))
-                        debug_cache_lengths.append(
-                            self.local_transformer._cache_length(past_kv)
+                if use_local_cache:
+                    # Incremental path: cache K/V inside this one global AR
+                    # frame. The cache is reset before the next audio frame.
+                    local_out, local_cache = self.local_transformer(
+                        current_proj.unsqueeze(1),
+                        past_key_values=local_cache,
+                        use_cache=True,
+                    )
+                    if debug_input_lengths is not None:
+                        cache_len = (
+                            local_cache.get_seq_length()
+                            if local_cache is not None
+                            else ch + 1
                         )
-                    local_out, past_kv = self.local_transformer(
-                        new_input, past_key_values=past_kv, use_cache=True,
-                    )                                                
-                    last_h = local_out[:, 0, :]                      
+                        debug_input_lengths.append(cache_len)
                 else:
-                    # recompute path: feed the entire context so far at each step
+                    # Recompute path: feed the entire local channel context so far.
+                    # This is slower than an incremental cache path, but matches the
+                    # MOSS reference and avoids the previously non-equivalent audio.
                     local_ctx = torch.cat(
                         [local_ctx, current_proj.unsqueeze(1)], dim=1
-                    )                                                  
-                    if debug_input_lengths is not None and debug_cache_lengths is not None:
+                    )
+                    if debug_input_lengths is not None:
                         debug_input_lengths.append(int(local_ctx.shape[1]))
-                        debug_cache_lengths.append(0)
-                    local_out, _ = self.local_transformer(local_ctx)   
-                    last_h = local_out[:, -1, :]                     
+                    local_out, _ = self.local_transformer(local_ctx)
+                last_h = local_out[:, -1, :]
 
             with record_function(f"local/ch_{ch:02d}_head"), \
                  _TIMER.gpu("local/proj_norm_head_per_ch"):
-                proj_out = self.local_to_speech_embedding_mlps[ch](last_h)  
-                normed   = self.layer_norm_before_lm_heads[ch](proj_out)     
-                logits   = self.lm_heads[ch](normed)                         
+                proj_out = self.local_to_speech_embedding_mlps[ch](last_h)
+                normed   = self.layer_norm_before_lm_heads[ch](proj_out)
+                logits   = self.lm_heads[ch](normed)
 
             with record_function(f"local/ch_{ch:02d}_sample"), \
                  _TIMER.gpu("local/sample_per_ch"):
@@ -763,16 +681,16 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                             logits[logits < top_k_vals[..., -1:]] = float("-inf")
                         logits = _apply_top_p_filter(logits, top_p)
                         probs      = torch.softmax(logits, dim=-1)
-                        next_token = torch.multinomial(probs, num_samples=1).squeeze(1)  
+                        next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
                     else:
-                        next_token = logits.argmax(dim=-1)  
+                        next_token = logits.argmax(dim=-1)
                     audio_codes.append(next_token)
 
             # Re-embed sampled token for next local step's input
             with record_function(f"local/ch_{ch:02d}_embed"), \
                  _TIMER.gpu("local/embed_next_per_ch"):
-                emb          = self.embedding_list[ch](next_token)             
-                current_proj = self.speech_embedding_to_local_mlp(emb)        
+                emb          = self.embedding_list[ch](next_token)
+                current_proj = self.speech_embedding_to_local_mlp(emb)
 
         # stack: [B, n_vq]
         if audio_codes:
@@ -783,23 +701,20 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         if text_logits is None:
             text_logits = torch.zeros(B, self.lm_heads[0].out_features, device=dev, dtype=dtype)
 
-        if debug_input_lengths is not None and debug_cache_lengths is not None:
+        if debug_input_lengths is not None:
             logger.info(
-                "[MossTTS Local KV] mode=%s channels=%d input_lengths=%s "
-                "cache_lengths=%s total_input_tokens=%d total_cache_tokens=%d",
-                "cache" if use_cache_path else "recompute",
+                "[MossTTS Local] mode=recompute channels=%d input_lengths=%s "
+                "total_input_tokens=%d",
                 self.channels,
                 debug_input_lengths,
-                debug_cache_lengths,
                 sum(debug_input_lengths),
-                sum(debug_cache_lengths),
             )
 
         return codes, text_logits
 
     def _extract_request_info(
         self,
-        runtime_additional_information: Optional[list[dict]] = None,
+        runtime_additional_information: list[dict] | None = None,
     ) -> tuple[list[str], list[int], list[int]]:
         try:
             from vllm.forward_context import get_forward_context
@@ -860,12 +775,12 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
 
     def forward(
         self,
-        input_ids: Optional[torch.Tensor]              = None,
-        positions: Optional[torch.Tensor]              = None,
-        kv_caches: Optional[list]                      = None,
+        input_ids: torch.Tensor | None              = None,
+        positions: torch.Tensor | None              = None,
+        kv_caches: list | None                      = None,
         attn_metadata                                  = None,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor]          = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None          = None,
         **kwargs,
     ) -> OmniOutput:
         with record_function("stage0/forward"), _TIMER.gpu("stage0/forward_total"):
@@ -933,14 +848,14 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                             temperature=kwargs.get("audio_temperature", 1.0),
                             top_k=kwargs.get("audio_top_k", 50),
                             top_p=kwargs.get("audio_top_p", 0.95),
-                        ) 
+                        )
 
                     with record_function("stage0/store_codes"), _TIMER.gpu("stage0/store_codes"):
                         for state, row in zip(audio_states, codes):
                             state.store_next_audio_row(row)
 
-                        # Cache channel-0 text logits so `compute_logits` can return the local-pipeline-processed distribution rather than
-                        # reapplying lm_heads[0] to the raw global hidden state.
+                        # Cache channel-0 text logits so `compute_logits`
+                        # returns the local-pipeline-processed distribution.
                         for req_id, tl in zip(audio_request_ids, text_logits):
                             self._pending_text_logits[req_id] = tl
 
@@ -1017,7 +932,7 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
+    ) -> SamplerOutput | None:
         return self.sampler(logits, sampling_metadata)
 
     def make_omni_output(self, model_output: Any, **kwargs) -> OmniOutput:
@@ -1071,7 +986,10 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                 mapped = "embedding_list." + ckpt_name[len("model.embedding_list."):]
 
             elif ckpt_name.startswith("local_transformer."):
-                mapped = "local_transformer.transformer." + ckpt_name[len("local_transformer."):]
+                relative = ckpt_name[len("local_transformer."):]
+                if ".self_attn." in relative:
+                    relative = relative.replace(".self_attn.", ".self_attn.attn.")
+                mapped = "local_transformer.transformer." + relative
 
             else:
                 # speech_embedding_to_local_mlp.*, local_to_speech_embedding_mlps.*,

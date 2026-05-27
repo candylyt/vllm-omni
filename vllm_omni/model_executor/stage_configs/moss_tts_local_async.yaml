@@ -11,7 +11,7 @@ stage_args:
 
     engine_args:
       dtype: bfloat16
-      max_num_seqs: 1
+      max_num_seqs: 4
       model_stage: ar_stage
       model_arch: MossTTSForConditionalGeneration
       worker_type: ar
@@ -84,7 +84,7 @@ runtime:
   enabled: true
   defaults:
     window_size: -1
-    max_inflight: 1
+    max_inflight: 4
 
   connectors:
     connector_of_shared_memory:
@@ -92,6 +92,12 @@ runtime:
       extra:
         shm_threshold_bytes: 65536
         codec_streaming: true
+        next_stage_metadata_keys:
+          - code_flat_numel
+          - codec_chunk_frames
+          - left_context_size
+          - request_id
+          - finished
         connector_get_sleep_s: 0.01
         connector_get_max_wait_first_chunk: 3000
         connector_get_max_wait: 300

@@ -11,7 +11,7 @@ stage_args:
 
     engine_args:
       dtype: bfloat16
-      max_num_seqs: 1
+      max_num_seqs: 4
       model_stage: ar_stage
       model_arch: MossTTSForConditionalGeneration
       worker_type: ar

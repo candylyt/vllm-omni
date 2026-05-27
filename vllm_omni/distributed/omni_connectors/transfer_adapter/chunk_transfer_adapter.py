@@ -40,6 +40,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.connector = self.create_connector(model_config)
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
+        self.next_stage_metadata_keys = self._get_next_stage_metadata_keys(
+            getattr(model_config, "stage_connector_config", None)
+        )
         # State specific to Chunk management
         self.custom_process_next_stage_input_func = None
         custom_process_next_stage_input_func = getattr(model_config, "custom_process_next_stage_input_func", None)
@@ -58,6 +61,28 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
         self.requests_with_ready_chunks = set()
+
+    @staticmethod
+    def _get_next_stage_metadata_keys(connector_config: Any) -> tuple[str, ...]:
+        """Metadata keys to forward beside code tokens for non-AR stages.
+
+        Historically chunk transfer forwarded only left_context_size for
+        code2wav/generation stages. Models that need more per-chunk metadata
+        should opt in via connector extra instead of widening the contract for
+        every SharedMemoryConnector user.
+        """
+        extra: dict[str, Any] = {}
+        if isinstance(connector_config, dict):
+            extra = connector_config.get("extra", {}) or {}
+        elif connector_config is not None:
+            extra = getattr(connector_config, "extra", {}) or {}
+
+        keys = extra.get("next_stage_metadata_keys")
+        if keys is None:
+            return ("left_context_size",)
+        if isinstance(keys, str):
+            return (keys,)
+        return tuple(str(key) for key in keys)
 
     @classmethod
     def create_connector(cls, model_config: Any):
@@ -160,12 +185,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
                 new_ids = payload_data.get("code_predictor_codes", [])
                 request.prompt_token_ids = new_ids
-                # Testing-only: preserve chunk metadata end-to-end so Stage 1
-                # can receive request_id / finished / code_flat_numel instead
-                # of only left_context_size.
+                # Preserve only metadata explicitly allowed for this connector.
                 request.additional_information = {
                     k: v for k, v in payload_data.items()
-                    if k != "code_predictor_codes"
+                    if k in self.next_stage_metadata_keys
                 }
                 request.num_computed_tokens = 0
 

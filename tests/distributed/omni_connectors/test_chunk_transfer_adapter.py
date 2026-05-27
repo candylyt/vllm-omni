@@ -41,7 +41,13 @@ def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None)
 
 @pytest.fixture
 def build_adapter(monkeypatch, mocker: MockerFixture):
-    def _build(*, stage_id: int = 1, model_mode: str = "ar", max_num_seqs: int = 2):
+    def _build(
+        *,
+        stage_id: int = 1,
+        model_mode: str = "ar",
+        max_num_seqs: int = 2,
+        connector_extra: dict | None = None,
+    ):
         connector = mocker.MagicMock()
         connector.stage_id = stage_id
         connector.get.return_value = None
@@ -65,7 +71,10 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
             classmethod(lambda cls, _model_config: connector),
         )
 
-        model_config = SimpleNamespace(worker_type=model_mode)
+        model_config = SimpleNamespace(
+            worker_type=model_mode,
+            stage_connector_config=SimpleNamespace(extra=connector_extra or {}),
+        )
         scheduler_config = SimpleNamespace(max_num_seqs=max_num_seqs)
         adapter = OmniChunkTransferAdapter(
             SimpleNamespace(model_config=model_config, scheduler_config=scheduler_config)
@@ -118,6 +127,59 @@ def test_load_poll(build_adapter):
     assert "req-1" in adapter._finished_load_reqs
     assert "req-1" in adapter.finished_requests
     assert "req-1" not in adapter._pending_load_reqs
+
+
+def test_non_ar_poll_forwards_only_left_context_by_default(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
+    request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
+
+    payload = {
+        "code_predictor_codes": [1, 2, 3],
+        "left_context_size": 4,
+        "request_id": "external-1",
+        "finished": True,
+        "code_flat_numel": 3,
+    }
+    connector.get.return_value = (payload, 16)
+    adapter._poll_single_request(request)
+
+    assert request.prompt_token_ids == [1, 2, 3]
+    assert request.additional_information == {"left_context_size": 4}
+
+
+def test_non_ar_poll_forwards_opted_in_metadata_keys(build_adapter):
+    adapter, connector = build_adapter(
+        stage_id=2,
+        model_mode="generation",
+        connector_extra={
+            "next_stage_metadata_keys": [
+                "left_context_size",
+                "request_id",
+                "finished",
+                "code_flat_numel",
+            ]
+        },
+    )
+    request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
+
+    payload = {
+        "code_predictor_codes": [1, 2, 3],
+        "left_context_size": 4,
+        "request_id": "external-1",
+        "finished": True,
+        "code_flat_numel": 3,
+        "unexpected": "not forwarded",
+    }
+    connector.get.return_value = (payload, 16)
+    adapter._poll_single_request(request)
+
+    assert request.prompt_token_ids == [1, 2, 3]
+    assert request.additional_information == {
+        "left_context_size": 4,
+        "request_id": "external-1",
+        "finished": True,
+        "code_flat_numel": 3,
+    }
 
 
 def test_save_async(build_adapter):
