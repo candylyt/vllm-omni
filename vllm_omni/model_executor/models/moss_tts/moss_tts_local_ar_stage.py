@@ -287,10 +287,15 @@ class MossTTSNativeLocalTransformer(nn.Module):
         }
         import inspect
 
-        if "inputs_embeds" in inspect.signature(self.create_causal_mask).parameters:
+        mask_params = inspect.signature(self.create_causal_mask).parameters
+        if "inputs_embeds" in mask_params:
             mask_kwargs["inputs_embeds"] = inputs_embeds
         else:
             mask_kwargs["input_embeds"] = inputs_embeds
+        mask_kwargs = {
+            key: value for key, value in mask_kwargs.items()
+            if key in mask_params
+        }
         causal_mask = self.create_causal_mask(**mask_kwargs)
 
         hidden_states = inputs_embeds

@@ -554,7 +554,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 logits,
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
-                spec_decode_metadata,
             )
 
         if propose_drafts_after_bookkeeping:
