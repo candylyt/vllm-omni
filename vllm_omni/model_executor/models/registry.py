@@ -120,7 +120,7 @@ _OMNI_MODELS = {
     ),
     "moss_tts_delay": (
         "moss_tts",
-        "moss_tts",
+        "moss_tts_local",
         "MossTTSForConditionalGeneration",
     ),
     "MossTTSForConditionalGeneration": (
