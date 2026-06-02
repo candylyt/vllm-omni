@@ -163,6 +163,10 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         # Batched streaming state for multi-request async decode
         self._batched_streaming_stack: ExitStack | None = None
         self._batched_streaming_request_ids: list[str] | None = None
+        # Async correctness path: accumulate per-request codec codes and
+        # statelessly decode the full prefix each chunk, then emit audio delta.
+        self._request_code_buffers: dict[str, list[torch.Tensor]] = {}
+        self._request_audio_offsets: dict[str, int] = {}
 
         # workaround for handling request boundaries when the connector doesn't propagate request_id / finished flags
         self._active_key: Optional[str] = None
@@ -272,36 +276,41 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
             if flat_codes is None or flat_codes.numel() == 0:
                 if request_id and is_finished:
                     self._exit_streaming(request_id)
+                    self._request_code_buffers.pop(request_id, None)
+                    self._request_audio_offsets.pop(request_id, None)
                 return empty
 
             codes = _parse_flat_codes(flat_codes, self.n_vq) 
             if codes is None:
                 if request_id and is_finished:
                     self._exit_streaming(request_id)
+                    self._request_code_buffers.pop(request_id, None)
+                    self._request_audio_offsets.pop(request_id, None)
                 return empty
 
             try:
                 if request_id is not None:
-                    # streaming path: maintain causal KV-cache across chunks
-                    if self._batched_streaming_stack is not None:
-                        if _decoder_debug_enabled():
-                            logger.warning(
-                                "[MossTTS Decoder] Switching from batched "
-                                "streaming to per-request streaming for %s; "
-                                "resetting codec streaming state.",
-                                request_id,
-                            )
-                        self._reset_streaming_topology()
-                    self._enter_streaming(request_id)
-                    codec = self._codec.codec
-                    codes_3d = codes.unsqueeze(1).to(self.device) 
-                    lengths = torch.tensor(
-                        [codes_3d.shape[-1]], device=self.device, dtype=torch.long
-                    )
-                    result = codec._decode_frame(codes_3d, lengths)
-                    wav = result.audio[0, 0, : result.audio_lengths[0]].float().cpu()
+                    # The CAT codec's streaming context is module-global and
+                    # cannot hold independent interleaved request states. For
+                    # async chunks, decode the full per-request code prefix
+                    # statelessly and emit only the new audio suffix.
+                    code_buffers = self._request_code_buffers.setdefault(request_id, [])
+                    code_buffers.append(flat_codes.reshape(-1).detach().cpu().to(torch.long))
+                    all_codes = torch.cat(code_buffers, dim=0)
+                    full_codes = _parse_flat_codes(all_codes, self.n_vq)
+                    if full_codes is None:
+                        wav = empty
+                    else:
+                        full_wav = self._codec.decode(full_codes)
+                        offset = self._request_audio_offsets.get(request_id, 0)
+                        if full_wav.numel() > offset:
+                            wav = full_wav[offset:]
+                            self._request_audio_offsets[request_id] = int(full_wav.numel())
+                        else:
+                            wav = empty
                     if is_finished:
-                        self._exit_streaming(request_id)
+                        self._request_code_buffers.pop(request_id, None)
+                        self._request_audio_offsets.pop(request_id, None)
                 else:
                     # fallback to stateless single-call decoder
                     wav = self._codec.decode(codes)
@@ -336,6 +345,7 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
 
         if (
             request_ids
+            and len(request_ids) > 1
             and all(isinstance(rid, str) and rid for rid in request_ids)
         ):
             if _decoder_debug_enabled():
@@ -459,6 +469,8 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         finished = {str(request_id) for request_id in request_ids}
         for request_id in finished:
             self._exit_streaming(request_id)
+            self._request_code_buffers.pop(request_id, None)
+            self._request_audio_offsets.pop(request_id, None)
         if (
             self._batched_streaming_request_ids is not None
             and any(request_id in finished for request_id in self._batched_streaming_request_ids)
