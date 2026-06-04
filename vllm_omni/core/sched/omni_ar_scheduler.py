@@ -98,6 +98,12 @@ class OmniARScheduler(VLLMScheduler):
                 return getattr(omni_kv_config, "kv_transfer_criteria", None)
         return None
 
+    def _get_omni_routed_experts(self, request: Request):
+        get_routed_experts = getattr(super(), "_get_routed_experts", None)
+        if get_routed_experts is None:
+            return None
+        return get_routed_experts(request)
+
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
         """
         Check triggers and process side effects (marking transfer).
@@ -324,7 +330,7 @@ class OmniARScheduler(VLLMScheduler):
                 stopped = True
 
             if stopped:
-                routed_experts = self._get_routed_experts(request)
+                routed_experts = self._get_omni_routed_experts(request)
 
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.

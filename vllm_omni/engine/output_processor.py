@@ -1,3 +1,4 @@
+from inspect import signature
 from typing import Any
 
 import numpy as np
@@ -19,6 +20,9 @@ from vllm.v1.metrics.stats import IterationStats
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+_BASE_MAKE_REQUEST_OUTPUT_PARAMS = set(signature(RequestState.make_request_output).parameters)
+_BASE_NEW_COMPLETION_OUTPUT_PARAMS = set(signature(RequestState._new_completion_output).parameters)
 
 
 class OmniRequestState(RequestState):
@@ -170,14 +174,16 @@ class OmniRequestState(RequestState):
         """
         # Pooling-only requests should follow base behavior.
         if self.detokenizer is None and pooling_output is not None:
-            return super().make_request_output(
+            args = [
                 new_token_ids,
                 pooling_output,
                 finish_reason,
                 stop_reason,
                 kv_transfer_params,
-                routed_experts,
-            )
+            ]
+            if "routed_experts" in _BASE_MAKE_REQUEST_OUTPUT_PARAMS:
+                args.append(routed_experts)
+            return super().make_request_output(*args)
 
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
@@ -230,7 +236,10 @@ class OmniRequestState(RequestState):
         routed_experts: np.ndarray | None = None,
     ) -> Any:
         # Reuse base text/logprobs logic, then annotate with pooling_result.
-        base_output = super()._new_completion_output(token_ids, finish_reason, stop_reason, routed_experts)
+        args = [token_ids, finish_reason, stop_reason]
+        if "routed_experts" in _BASE_NEW_COMPLETION_OUTPUT_PARAMS:
+            args.append(routed_experts)
+        base_output = super()._new_completion_output(*args)
         try:
             if self.mm_accumulated is not None:
                 # Attach accumulated multimodal dict on the completion output

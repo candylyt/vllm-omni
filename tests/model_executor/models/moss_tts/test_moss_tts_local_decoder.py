@@ -135,3 +135,36 @@ def test_multi_request_with_ids_uses_batched_streaming(monkeypatch):
     assert batch_calls[0][1:] == (["req-0", "req-1"], [False, True])
     assert torch.equal(out[0], torch.full((2,), 1.0))
     assert torch.equal(out[1], torch.full((2,), 2.0))
+
+
+def test_batch_decode_streaming_uses_codec_worker_batch_decode(monkeypatch):
+    model = object.__new__(MossTTSDecoderModel)
+    model.n_vq = 3
+    model.device = torch.device("cpu")
+    model._first_chunk_dir = None
+    model._first_chunk_seen = set()
+
+    monkeypatch.setattr(model, "_enter_batched_streaming", lambda request_ids: None)
+    monkeypatch.setattr(model, "_exit_batched_streaming", lambda: None)
+    model._codec = SimpleNamespace(
+        decode_batch=Mock(
+            return_value=[
+                torch.full((2,), 1.0),
+                torch.full((4,), 2.0),
+            ]
+        )
+    )
+
+    out = MossTTSDecoderModel._batch_decode_streaming(
+        model,
+        [torch.arange(6), torch.arange(6, 15)],
+        request_ids=["req-0", "req-1"],
+        finished_flags=[False, True],
+    )
+
+    model._codec.decode_batch.assert_called_once()
+    padded, lengths = model._codec.decode_batch.call_args.args
+    assert padded.shape == (3, 2, 3)
+    assert torch.equal(lengths, torch.tensor([2, 3]))
+    assert torch.equal(out[0], torch.full((2,), 1.0))
+    assert torch.equal(out[1], torch.full((4,), 2.0))

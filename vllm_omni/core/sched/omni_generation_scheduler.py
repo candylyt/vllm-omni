@@ -50,6 +50,12 @@ class OmniGenerationScheduler(VLLMScheduler):
         if getattr(model_config, "async_chunk", False):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
 
+    def _get_omni_routed_experts(self, request: Request):
+        get_routed_experts = getattr(super(), "_get_routed_experts", None)
+        if get_routed_experts is None:
+            return None
+        return get_routed_experts(request)
+
     def schedule(self) -> SchedulerOutput:
         """Diffusion fast path:
         - Feed all input tokens of the request at once
@@ -459,7 +465,7 @@ class OmniGenerationScheduler(VLLMScheduler):
                 stopped = True
 
             if stopped:
-                routed_experts = self._get_routed_experts(request)
+                routed_experts = self._get_omni_routed_experts(request)
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 if finished:

@@ -8,6 +8,7 @@ import os
 import time
 from collections.abc import Iterable
 from contextlib import ExitStack
+from pathlib import Path
 from typing import Any, Optional
 
 import torch
@@ -36,39 +37,164 @@ def _decoder_debug_enabled() -> bool:
 # =======================================================================================
 
 class CATCodecWorker:
+    _DEFAULT_CHUNK_DURATION = 8.0
+
     def __init__(self, device_str: str, codec_path: str):
         self.device = torch.device(device_str)
         if os.path.exists(codec_path):
             codec_path = os.path.realpath(codec_path)
         logger.info("[MossTTS Decoder] Loading CAT codec from %s on %s", codec_path, device_str)
 
-        import transformers.configuration_utils as _cfg_utils
-        if not hasattr(_cfg_utils, "PreTrainedConfig"):
-            from transformers import PretrainedConfig as _ptc
-            _cfg_utils.PreTrainedConfig = _ptc
-
-        from transformers import AutoModel
-        self.codec = AutoModel.from_pretrained(
-            codec_path,
-            trust_remote_code=True,
-        )
+        self.codec = self._load_codec_from_local_repo(codec_path)
         self.codec = self.codec.to(self.device).eval().float()
 
         self.sample_rate: int = getattr(self.codec.config, "sampling_rate", 24_000)
         self.n_vq: int = getattr(self.codec.config, "num_quantizers", 32)
+        self.downsample_rate: int = getattr(self.codec.config, "downsample_rate", 1_920)
+        self.chunk_frame_length = self._get_chunk_frame_length()
 
         logger.info(
-            "[MossTTS Decoder] CAT codec loaded: sample_rate=%d, n_vq=%d",
+            "[MossTTS Decoder] CAT codec loaded: sample_rate=%d, n_vq=%d, "
+            "chunk_frame_length=%d",
             self.sample_rate,
             self.n_vq,
+            self.chunk_frame_length,
         )
+
+    def _load_codec_from_local_repo(self, codec_path: str) -> nn.Module:
+        if not os.path.isdir(codec_path):
+            raise ValueError(
+                "MOSS_AUDIO_TOKENIZER_PATH must point to a local "
+                "MOSS-Audio-Tokenizer snapshot for the vLLM-Omni native "
+                f"loader. Got: {codec_path!r}"
+            )
+
+        from safetensors.torch import load_file
+
+        from vllm_omni.model_executor.models.moss_tts.configuration_moss_audio_tokenizer import (
+            MossAudioTokenizerConfig,
+        )
+        from vllm_omni.model_executor.models.moss_tts.modeling_moss_audio_tokenizer import (
+            MossAudioTokenizerModel,
+        )
+
+        root = Path(codec_path)
+        config = MossAudioTokenizerConfig.from_pretrained(str(root))
+        codec = MossAudioTokenizerModel(config)
+
+        shard_paths = sorted(root.glob("model-*.safetensors"))
+        if not shard_paths:
+            single_path = root / "model.safetensors"
+            if single_path.exists():
+                shard_paths = [single_path]
+        if not shard_paths:
+            raise FileNotFoundError(
+                f"No safetensors checkpoint shards found under {root}."
+            )
+
+        state_dict: dict[str, torch.Tensor] = {}
+        for shard_path in shard_paths:
+            state_dict.update(load_file(str(shard_path), device="cpu"))
+        missing, unexpected = codec.load_state_dict(state_dict, strict=False)
+        if missing:
+            logger.warning(
+                "[MossTTS Decoder] Native codec loader missing %d keys; first keys: %s",
+                len(missing),
+                list(missing)[:10],
+            )
+        if unexpected:
+            logger.warning(
+                "[MossTTS Decoder] Native codec loader found %d unexpected keys; first keys: %s",
+                len(unexpected),
+                list(unexpected)[:10],
+            )
+        return codec
+
+    def _get_chunk_frame_length(self) -> int:
+        chunk_duration = min(
+            self._DEFAULT_CHUNK_DURATION,
+            float(getattr(self.codec.config, "causal_transformer_context_duration", 10.0)),
+        )
+        chunk_length = int(round(chunk_duration * self.sample_rate))
+        if chunk_length <= 0:
+            return 0
+        return max(1, chunk_length // self.downsample_rate)
+
+    def _streaming_context(self, batch_size: int) -> ExitStack:
+        stack = ExitStack()
+        for decoder_module in self.codec.decoder:
+            if hasattr(decoder_module, "streaming") and callable(decoder_module.streaming):
+                stack.enter_context(decoder_module.streaming(batch_size=batch_size))
+        return stack
+
+    def _decode_frame_to_cpu(
+        self,
+        codes: torch.Tensor,
+        code_lengths: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        result = self.codec._decode_frame(codes, code_lengths)
+        if result.audio is None or result.audio_lengths is None:
+            raise RuntimeError("Internal error: `_decode_frame` returned empty audio.")
+
+        wav_batch = result.audio[:, 0].float().cpu()
+        audio_lengths = result.audio_lengths.cpu()
+        outputs: list[torch.Tensor] = []
+        for idx in range(wav_batch.shape[0]):
+            wav_len = (
+                int(audio_lengths[idx].item())
+                if audio_lengths.numel() > idx
+                else int(wav_batch.shape[-1])
+            )
+            outputs.append(wav_batch[idx, :wav_len])
+        return outputs
+
+    @torch.inference_mode()
+    def decode_batch(
+        self,
+        padded_codes: torch.Tensor,
+        code_lengths: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        padded_codes = padded_codes.to(self.device, dtype=torch.long, non_blocking=True)
+        code_lengths = code_lengths.to(self.device, dtype=torch.long, non_blocking=True)
+        return self._decode_frame_to_cpu(padded_codes, code_lengths)
 
     @torch.inference_mode()
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
-        codes = codes.to(self.device)
-        out = self.codec.decode(codes, chunk_duration=8)  
-        wav = out.audio[0, 0]              
-        return wav.float().cpu()
+        codes = codes.to(self.device, dtype=torch.long, non_blocking=True)
+        if codes.dim() == 2:
+            codes = codes.unsqueeze(1)
+        if codes.dim() != 3:
+            raise ValueError(
+                "Expected CAT codec codes with shape [nq, T] or [nq, B, T], "
+                f"got {tuple(codes.shape)}."
+            )
+        if codes.shape[1] != 1:
+            raise ValueError(
+                "CATCodecWorker.decode() handles one request. Use decode_batch() "
+                f"for batch_size={codes.shape[1]}."
+            )
+
+        code_length = int(codes.shape[-1])
+        if code_length == 0:
+            return torch.zeros(0, dtype=torch.float32)
+
+        chunk_frame_length = self.chunk_frame_length
+        if chunk_frame_length <= 0 or code_length <= chunk_frame_length:
+            lengths = torch.tensor([code_length], device=self.device, dtype=torch.long)
+            return self._decode_frame_to_cpu(codes, lengths)[0]
+
+        wav_chunks: list[torch.Tensor] = []
+        with self._streaming_context(batch_size=1):
+            for start_idx in range(0, code_length, chunk_frame_length):
+                code_length_i = min(chunk_frame_length, code_length - start_idx)
+                if code_length_i <= 0:
+                    break
+                lengths_i = torch.tensor([code_length_i], device=self.device, dtype=torch.long)
+                codes_i = codes[:, :, start_idx: start_idx + code_length_i]
+                wav_chunks.append(self._decode_frame_to_cpu(codes_i, lengths_i)[0])
+        if not wav_chunks:
+            return torch.zeros(0, dtype=torch.float32)
+        return torch.cat(wav_chunks, dim=0)
 
 
 # Module-level cache: (device_type, codec_path) → CATCodecWorker
@@ -445,13 +571,9 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         lengths_t = torch.tensor(lengths, device=self.device, dtype=torch.long)
 
         try:
-            result = self._codec.codec._decode_frame(padded, lengths_t)
-            wav_batch = result.audio[:, 0].float().cpu()
-            audio_lengths = result.audio_lengths
             results: list[torch.Tensor] = []
-            for idx, req_id in enumerate(request_ids):
-                wav_len = int(audio_lengths[idx].item()) if audio_lengths.numel() > idx else int(wav_batch.shape[-1])
-                wav = wav_batch[idx, :wav_len]
+            wav_batch = self._codec.decode_batch(padded, lengths_t)
+            for wav, req_id in zip(wav_batch, request_ids):
                 if wav.numel() > 0:
                     self._record_first_chunk(req_id)
                 results.append(wav if wav.numel() > 0 else empty)
@@ -656,7 +778,8 @@ class MossTTSDecoderModel(nn.Module, SupportsPP):
         weights: Iterable[tuple[str, torch.Tensor]],
         **kwargs,
     ) -> set[str]:
-        # added to support interface but does nothing; the CAT codec is loaded separately via from_pretrained()
+        # Added to support the vLLM model protocol. The CAT codec is loaded
+        # separately by the native vLLM-Omni codec loader in __init__.
         logger.info(
             "[MossTTS Decoder] load_weights() called — CAT codec already "
             "loaded in __init__; nothing to do here."

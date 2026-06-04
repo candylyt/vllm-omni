@@ -103,7 +103,12 @@ def main():
             os.environ["MOSS_AUDIO_TOKENIZER_PATH"] = sibling
             print(f"[Info] MOSS_AUDIO_TOKENIZER_PATH auto-set → {sibling}")
         else:
-            print("[Warn] MOSS_AUDIO_TOKENIZER_PATH not set; will try HF download.")
+            raise SystemExit(
+                "[Error] MOSS_AUDIO_TOKENIZER_PATH must point to a local "
+                "MOSS-Audio-Tokenizer snapshot. Download "
+                "OpenMOSS-Team/MOSS-Audio-Tokenizer first, or place it beside "
+                "the MOSS-TTS-Local model as 'moss-audio-tokenizer'."
+            )
 
     os.makedirs(args.output_dir, exist_ok=True)
 

@@ -27,6 +27,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import statistics
 import time
 
 import torch
@@ -125,6 +126,18 @@ def main() -> None:
     parser.add_argument("--text", default="The weather is so nice today.")
     parser.add_argument("--output-dir", default="./bench_output")
     parser.add_argument("--num-prompts", type=int, default=1)
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=None,
+        help=(
+            "Prompt batch sizes to profile. Defaults to --num-prompts. "
+            "This keeps linyueqian's single-prompt path as the default while "
+            "supporting the HPML throughput sweep shape."
+        ),
+    )
+    parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--init-sleep-seconds", type=int, default=20)
     parser.add_argument("--batch-timeout", type=int, default=5)
     parser.add_argument("--init-timeout", type=int, default=5000)
@@ -140,7 +153,12 @@ def main() -> None:
             os.environ["MOSS_AUDIO_TOKENIZER_PATH"] = sibling
             print(f"[Info] MOSS_AUDIO_TOKENIZER_PATH auto-set -> {sibling}")
         else:
-            print("[Warn] MOSS_AUDIO_TOKENIZER_PATH not set.")
+            raise SystemExit(
+                "[Error] MOSS_AUDIO_TOKENIZER_PATH must point to a local "
+                "MOSS-Audio-Tokenizer snapshot. Download "
+                "OpenMOSS-Team/MOSS-Audio-Tokenizer first, or place it beside "
+                "the MOSS-TTS-Local model as 'moss-audio-tokenizer'."
+            )
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -188,92 +206,183 @@ def main() -> None:
         shm_threshold_bytes=args.shm_threshold_bytes,
     )
 
-    prompts = [copy.deepcopy({"prompt": prompt}) for _ in range(args.num_prompts)]
-
-    print(f"[Info] Running {len(prompts)} prompt(s) in {args.mode} mode ...")
-    t_start_wall = time.time()
-    t_start = time.perf_counter()
-    omni_outputs = omni.generate(prompts, [ar_params, decoder_params])
-    t_end = time.perf_counter()
-    total_time = t_end - t_start
+    batch_sizes = args.batch_sizes or [args.num_prompts]
+    if any(bs <= 0 for bs in batch_sizes):
+        raise ValueError("--batch-sizes values must be positive.")
+    if args.repeats <= 0:
+        raise ValueError("--repeats must be positive.")
 
     results = []
-    for stage_outputs in omni_outputs:
-        output = stage_outputs.request_output
-        request_id = output.request_id
+    aggregate_rows = []
+    for batch_size in batch_sizes:
+        repeat_rows = []
+        for repeat_idx in range(args.repeats):
+            for _stale in os.listdir(first_chunk_dir):
+                if _stale.endswith(".first_chunk.ts"):
+                    try:
+                        os.remove(os.path.join(first_chunk_dir, _stale))
+                    except OSError:
+                        pass
 
-        if stage_outputs.final_output_type == "text":
-            text_out = output.outputs[0].text
-            print(f"[{request_id}] AR text: {text_out[:200]!r}")
-            continue
+            prompts = [copy.deepcopy({"prompt": prompt}) for _ in range(batch_size)]
 
-        if stage_outputs.final_output_type != "audio":
-            continue
+            print(
+                f"[Info] Running batch_size={batch_size}, "
+                f"repeat={repeat_idx + 1}/{args.repeats} in {args.mode} mode ..."
+            )
+            t_start_wall = time.time()
+            t_start = time.perf_counter()
+            omni_outputs = omni.generate(prompts, [ar_params, decoder_params])
+            t_end = time.perf_counter()
+            total_time = t_end - t_start
 
-        audio_tensor = output.outputs[0].multimodal_output.get("audio")
-        if audio_tensor is None:
-            print(f"[{request_id}] No audio in output.")
-            continue
+            run_audio_total = 0.0
+            run_chunks_total = 0
+            run_audio_count = 0
+            run_first_chunk_latency = total_time
 
-        num_chunks = 1
-        if isinstance(audio_tensor, list):
-            chunks = [t for t in audio_tensor if isinstance(t, torch.Tensor) and t.numel() > 0]
-            num_chunks = len(chunks)
-            if not chunks:
-                print(f"[{request_id}] No audio chunks in output.")
-                continue
-            audio_tensor = torch.cat(chunks, dim=0)
+            for stage_outputs in omni_outputs:
+                output = stage_outputs.request_output
+                request_id = output.request_id
 
-        audio_np = audio_tensor.float().detach().cpu().numpy()
-        if audio_np.ndim > 1:
-            audio_np = audio_np.flatten()
-
-        audio_dur = len(audio_np) / 24000
-        rtf = total_time / audio_dur if audio_dur > 0 else float("inf")
-
-        first_chunk_latency: float = total_time
-        for key in (request_id, "first"):
-            first_chunk_path = os.path.join(first_chunk_dir, f"{key}.first_chunk.ts")
-            if os.path.exists(first_chunk_path):
-                try:
-                    with open(first_chunk_path) as f:
-                        ts = float(f.read().strip())
-                    first_chunk_latency = max(0.0, ts - t_start_wall)
-                    break
-                except (OSError, ValueError):
+                if stage_outputs.final_output_type == "text":
+                    text_out = output.outputs[0].text
+                    print(f"[{request_id}] AR text: {text_out[:200]!r}")
                     continue
 
-        wav_path = os.path.join(args.output_dir, f"{request_id}.wav")
-        sf.write(wav_path, audio_np, samplerate=24000, format="WAV")
+                if stage_outputs.final_output_type != "audio":
+                    continue
 
-        results.append({
-            "request_id": request_id,
-            "mode": args.mode,
-            "total_time_s": round(total_time, 3),
-            "audio_dur_s": round(audio_dur, 3),
-            "rtf": round(rtf, 4),
-            "num_chunks": num_chunks,
-            "first_chunk_latency_s": round(first_chunk_latency, 3),
-            "wav": wav_path,
-        })
+                audio_tensor = output.outputs[0].multimodal_output.get("audio")
+                if audio_tensor is None:
+                    print(f"[{request_id}] No audio in output.")
+                    continue
 
+                num_chunks = 1
+                if isinstance(audio_tensor, list):
+                    chunks = [
+                        t for t in audio_tensor
+                        if isinstance(t, torch.Tensor) and t.numel() > 0
+                    ]
+                    num_chunks = len(chunks)
+                    if not chunks:
+                        print(f"[{request_id}] No audio chunks in output.")
+                        continue
+                    audio_tensor = torch.cat(chunks, dim=0)
+
+                audio_np = audio_tensor.float().detach().cpu().numpy()
+                if audio_np.ndim > 1:
+                    audio_np = audio_np.flatten()
+
+                audio_dur = len(audio_np) / 24000
+                run_audio_total += audio_dur
+                run_chunks_total += num_chunks
+                run_audio_count += 1
+
+                first_chunk_latency: float = total_time
+                for key in (request_id, "first"):
+                    first_chunk_path = os.path.join(first_chunk_dir, f"{key}.first_chunk.ts")
+                    if os.path.exists(first_chunk_path):
+                        try:
+                            with open(first_chunk_path) as f:
+                                ts = float(f.read().strip())
+                            first_chunk_latency = max(0.0, ts - t_start_wall)
+                            break
+                        except (OSError, ValueError):
+                            continue
+                run_first_chunk_latency = min(run_first_chunk_latency, first_chunk_latency)
+
+                wav_path = os.path.join(
+                    args.output_dir,
+                    f"bs{batch_size}_rep{repeat_idx}_{request_id}.wav",
+                )
+                sf.write(wav_path, audio_np, samplerate=24000, format="WAV")
+
+                per_request_rtf = total_time / audio_dur if audio_dur > 0 else float("inf")
+                results.append({
+                    "request_id": request_id,
+                    "mode": args.mode,
+                    "batch_size": batch_size,
+                    "repeat": repeat_idx,
+                    "total_time_s": round(total_time, 3),
+                    "audio_dur_s": round(audio_dur, 3),
+                    "rtf": round(per_request_rtf, 4),
+                    "num_chunks": num_chunks,
+                    "first_chunk_latency_s": round(first_chunk_latency, 3),
+                    "wav": wav_path,
+                })
+
+            throughput = run_audio_total / total_time if total_time > 0 else 0.0
+            batch_rtf = total_time / run_audio_total if run_audio_total > 0 else float("inf")
+            repeat_row = {
+                "mode": args.mode,
+                "batch_size": batch_size,
+                "repeat": repeat_idx,
+                "total_time_s": total_time,
+                "audio_total_s": run_audio_total,
+                "audio_count": run_audio_count,
+                "throughput_audio_s_per_s": throughput,
+                "batch_rtf": batch_rtf,
+                "first_chunk_latency_s": run_first_chunk_latency,
+                "num_chunks_total": run_chunks_total,
+            }
+            repeat_rows.append(repeat_row)
+            aggregate_rows.append(repeat_row)
+
+            print(
+                f"\n{'='*60}\n"
+                f"  mode               : {args.mode}\n"
+                f"  batch_size         : {batch_size}\n"
+                f"  repeat             : {repeat_idx + 1}/{args.repeats}\n"
+                f"  total_time         : {total_time:.3f}s\n"
+                f"  total_audio_dur    : {run_audio_total:.3f}s\n"
+                f"  throughput         : {throughput:.4f} audio_s/s\n"
+                f"  batch_RTF          : {batch_rtf:.4f}\n"
+                f"  first_chunk_latency: {run_first_chunk_latency:.3f}s\n"
+                f"  num_chunks_total   : {run_chunks_total}\n"
+                f"{'='*60}\n"
+            )
+
+        mean_wall = statistics.mean(row["total_time_s"] for row in repeat_rows)
+        mean_audio = statistics.mean(row["audio_total_s"] for row in repeat_rows)
+        mean_tput = statistics.mean(row["throughput_audio_s_per_s"] for row in repeat_rows)
+        mean_rtf = statistics.mean(row["batch_rtf"] for row in repeat_rows)
+        mean_fcl = statistics.mean(row["first_chunk_latency_s"] for row in repeat_rows)
         print(
-            f"\n{'='*60}\n"
-            f"  mode              : {args.mode}\n"
-            f"  total_time        : {total_time:.3f}s\n"
-            f"  audio_dur         : {audio_dur:.3f}s\n"
-            f"  RTF               : {rtf:.4f}  ({'faster' if rtf < 1 else 'slower'} than real-time)\n"
-            f"  num_chunks        : {num_chunks}  "
-            f"({'streaming pipelined' if num_chunks > 1 else 'single batch'})\n"
-            f"  first_chunk_latency: {first_chunk_latency:.3f}s  "
-            f"(time from generate() start to first audio sample available)\n"
-            f"  wav               : {wav_path}\n"
-            f"{'='*60}\n"
+            f"[Summary] mode={args.mode} bs={batch_size} "
+            f"wall={mean_wall:.3f}s audio={mean_audio:.3f}s "
+            f"throughput={mean_tput:.4f} audio_s/s "
+            f"batch_RTF={mean_rtf:.4f} first_chunk={mean_fcl:.3f}s"
         )
 
     summary_path = os.path.join(args.output_dir, f"bench_{args.mode}.json")
     with open(summary_path, "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(
+            {
+                "mode": args.mode,
+                "text": args.text,
+                "batch_sizes": batch_sizes,
+                "repeats": args.repeats,
+                "requests": results,
+                "aggregate": [
+                    {
+                        **row,
+                        "total_time_s": round(row["total_time_s"], 6),
+                        "audio_total_s": round(row["audio_total_s"], 6),
+                        "throughput_audio_s_per_s": round(
+                            row["throughput_audio_s_per_s"], 6
+                        ),
+                        "batch_rtf": round(row["batch_rtf"], 6),
+                        "first_chunk_latency_s": round(
+                            row["first_chunk_latency_s"], 6
+                        ),
+                    }
+                    for row in aggregate_rows
+                ],
+            },
+            f,
+            indent=2,
+        )
     print(f"[Info] Summary saved to: {summary_path}")
 
 if __name__ == "__main__":
