@@ -3,6 +3,7 @@
 import copy
 import logging
 import os
+import threading
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -28,6 +29,19 @@ _TIMER = get_timer()
 logger = logging.getLogger(__name__)
 _LOCAL_KV_DEBUG = os.environ.get("MOSS_TTS_LOCAL_KV_DEBUG", "0") == "1"
 _LOCAL_KV_CACHE_ENABLED = os.environ.get("MOSS_TTS_LOCAL_KV_CACHE", "0") == "1"
+_LOCAL_CUDAGRAPH_ENABLED = os.environ.get("MOSS_TTS_LOCAL_CUDAGRAPH", "1") == "1"
+_LOCAL_CUDAGRAPH_BATCH_SIZES: tuple[int, ...] = (1, 2, 4, 8, 16, 32)
+
+
+def _select_local_cudagraph_bucket(
+    batch_size: int,
+    captured_buckets: Iterable[int],
+) -> int | None:
+    captured = set(captured_buckets)
+    for bucket in _LOCAL_CUDAGRAPH_BATCH_SIZES:
+        if batch_size <= bucket and bucket in captured:
+            return bucket
+    return None
 
 
 def _apply_top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
@@ -336,6 +350,103 @@ class MossTTSLocalTransformerWrapper(nn.Module):
             use_cache=use_cache,
         )
 
+
+class MossTTSLocalForwardCudaGraphBuffer:
+    def __init__(self, model: "MossTTSARStageModel", max_batch_size: int) -> None:
+        self.max_batch_size = max_batch_size
+        param = next(model.speech_embedding_to_local_mlp.parameters())
+        self.input_tensor = torch.zeros(
+            (max_batch_size, model.hidden_size),
+            dtype=param.dtype,
+            device=param.device,
+        )
+        self.pool = torch.cuda.graph_pool_handle()
+        self.lock = threading.Lock()
+
+    def prepare(self, global_hidden: torch.Tensor) -> None:
+        batch_size = int(global_hidden.shape[0])
+        if batch_size > self.max_batch_size:
+            raise ValueError(
+                f"Expected batch size <= {self.max_batch_size}, got {batch_size}."
+            )
+        if global_hidden.shape != self.input_tensor[:batch_size].shape:
+            global_hidden = global_hidden.reshape(self.input_tensor[:batch_size].shape)
+        self.input_tensor[:batch_size].copy_(global_hidden)
+        if batch_size < self.max_batch_size:
+            self.input_tensor[batch_size : self.max_batch_size].zero_()
+
+
+class MossTTSLocalForwardCudaGraph:
+    def __init__(
+        self,
+        cuda_graph: torch.cuda.CUDAGraph,
+        buffer: MossTTSLocalForwardCudaGraphBuffer,
+        output_codes: torch.Tensor,
+        output_text_logits: torch.Tensor,
+        batch_size: int,
+    ) -> None:
+        self.cuda_graph = cuda_graph
+        self.buffer = buffer
+        self.output_codes = output_codes
+        self.output_text_logits = output_text_logits
+        self.batch_size = batch_size
+
+    @classmethod
+    def capture(
+        cls,
+        model: "MossTTSARStageModel",
+        buffer: MossTTSLocalForwardCudaGraphBuffer,
+        batch_size: int,
+        *,
+        forced_text_token_id: int,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+    ) -> "MossTTSLocalForwardCudaGraph":
+        static_input = buffer.input_tensor[:batch_size]
+        with torch.no_grad():
+            model._local_forward_eager(
+                static_input,
+                forced_text_token_id=forced_text_token_id,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
+        torch.cuda.synchronize(static_input.device)
+
+        cuda_graph = torch.cuda.CUDAGraph()
+        with torch.no_grad():
+            with torch.cuda.graph(cuda_graph, pool=buffer.pool):
+                output_codes, output_text_logits = model._local_forward_eager(
+                    static_input,
+                    forced_text_token_id=forced_text_token_id,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                )
+
+        return cls(
+            cuda_graph=cuda_graph,
+            buffer=buffer,
+            output_codes=output_codes,
+            output_text_logits=output_text_logits,
+            batch_size=batch_size,
+        )
+
+    def forward(self, global_hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size = int(global_hidden.shape[0])
+        if batch_size > self.batch_size:
+            raise ValueError(
+                f"Expected batch size <= {self.batch_size}, got {batch_size}."
+            )
+        with self.buffer.lock:
+            self.buffer.prepare(global_hidden)
+            self.cuda_graph.replay()
+            return (
+                self.output_codes[:batch_size].clone(),
+                self.output_text_logits[:batch_size].clone(),
+            )
+
 # =======================================================================================
 #  Per-request FSM state
 # =======================================================================================
@@ -470,6 +581,9 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         self._last_seq_lens: list[int] = []
 
         self._pending_text_logits: dict[str, torch.Tensor] = {}
+        self._local_forward_cg_by_bs: dict[int, MossTTSLocalForwardCudaGraph] = {}
+        self._local_forward_cg_params: tuple[int, float, int, float] | None = None
+        self._local_forward_cg_init_attempted = False
 
     # =======================================================================================
     #  FSM helpers (per-request audio-mode tracking)
@@ -605,7 +719,7 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
     # =======================================================================================
 
     @torch.no_grad()
-    def _local_forward(
+    def _local_forward_eager(
         self,
         global_hidden: torch.Tensor, # [B, D_global]  (B = num decode seqs)
         forced_text_token_id: int,
@@ -716,6 +830,133 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
             )
 
         return codes, text_logits
+
+    def _capture_local_forward_cudagraphs(
+        self,
+        *,
+        forced_text_token_id: int,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+    ) -> None:
+        self._local_forward_cg_init_attempted = True
+        self._local_forward_cg_by_bs.clear()
+        self._local_forward_cg_params = (
+            int(forced_text_token_id),
+            float(temperature),
+            int(top_k),
+            float(top_p),
+        )
+
+        if not _LOCAL_CUDAGRAPH_ENABLED:
+            logger.info("[MossTTS Local] CUDA graph disabled by MOSS_TTS_LOCAL_CUDAGRAPH=0.")
+            return
+        if not torch.cuda.is_available():
+            logger.info("[MossTTS Local] CUDA unavailable; using eager local_forward.")
+            return
+        if torch.cuda.is_current_stream_capturing():
+            logger.info("[MossTTS Local] Current CUDA stream is capturing; skip nested capture.")
+            return
+
+        param = next(self.speech_embedding_to_local_mlp.parameters())
+        if param.device.type != "cuda":
+            logger.info(
+                "[MossTTS Local] local_forward parameters are on %s; using eager.",
+                param.device,
+            )
+            return
+
+        logger.info(
+            "[MossTTS Local] Capturing local_forward CUDA graphs for buckets=%s "
+            "params=(forced=%d, temperature=%.4g, top_k=%d, top_p=%.4g).",
+            list(_LOCAL_CUDAGRAPH_BATCH_SIZES),
+            forced_text_token_id,
+            temperature,
+            top_k,
+            top_p,
+        )
+        for batch_size in _LOCAL_CUDAGRAPH_BATCH_SIZES:
+            try:
+                buffer = MossTTSLocalForwardCudaGraphBuffer(self, max_batch_size=batch_size)
+                graph = MossTTSLocalForwardCudaGraph.capture(
+                    self,
+                    buffer,
+                    batch_size,
+                    forced_text_token_id=forced_text_token_id,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                )
+                self._local_forward_cg_by_bs[batch_size] = graph
+                logger.info(
+                    "[MossTTS Local] Captured local_forward CUDA graph bucket=%d.",
+                    batch_size,
+                )
+            except Exception:
+                logger.warning(
+                    "[MossTTS Local] Failed to capture local_forward CUDA graph "
+                    "bucket=%d; this bucket will use eager.",
+                    batch_size,
+                    exc_info=True,
+                )
+
+        if not self._local_forward_cg_by_bs:
+            logger.info("[MossTTS Local] No local_forward CUDA graph buckets captured.")
+
+    @torch.no_grad()
+    def _local_forward(
+        self,
+        global_hidden: torch.Tensor,
+        forced_text_token_id: int,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 0.95,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size = int(global_hidden.shape[0])
+        params = (
+            int(forced_text_token_id),
+            float(temperature),
+            int(top_k),
+            float(top_p),
+        )
+
+        if (
+            _LOCAL_CUDAGRAPH_ENABLED
+            and global_hidden.device.type == "cuda"
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            if (
+                not self._local_forward_cg_init_attempted
+                or self._local_forward_cg_params != params
+            ):
+                self._capture_local_forward_cudagraphs(
+                    forced_text_token_id=forced_text_token_id,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                )
+
+            chosen_bucket = _select_local_cudagraph_bucket(
+                batch_size,
+                self._local_forward_cg_by_bs.keys(),
+            )
+            if chosen_bucket is not None:
+                with record_function("local/cudagraph_replay"), _TIMER.gpu("local/cudagraph_replay"):
+                    return self._local_forward_cg_by_bs[chosen_bucket].forward(global_hidden)
+
+            if self._local_forward_cg_by_bs:
+                logger.debug(
+                    "[MossTTS Local] No CUDA graph bucket for batch_size=%d; using eager.",
+                    batch_size,
+                )
+
+        return self._local_forward_eager(
+            global_hidden,
+            forced_text_token_id=forced_text_token_id,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+        )
 
     def _extract_request_info(
         self,

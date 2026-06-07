@@ -10,6 +10,7 @@ from vllm_omni.model_executor.models.moss_tts.moss_tts_local_ar_stage import (
     MossTTSLocalRequestState,
     MossTTSNativeLocalTransformer,
     _apply_top_p_filter,
+    _select_local_cudagraph_bucket,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -155,3 +156,85 @@ def test_request_state_keeps_pending_audio_row_on_input_device():
 
     assert state.pending_audio_row.device == row.device
     assert state.pending_audio_row.tolist() == [1, 2, 3, 4]
+
+
+def test_local_cudagraph_bucket_selection_covers_32():
+    buckets = {1, 2, 4, 8, 16, 32}
+
+    assert _select_local_cudagraph_bucket(1, buckets) == 1
+    assert _select_local_cudagraph_bucket(3, buckets) == 4
+    assert _select_local_cudagraph_bucket(17, buckets) == 32
+    assert _select_local_cudagraph_bucket(32, buckets) == 32
+    assert _select_local_cudagraph_bucket(33, buckets) is None
+
+
+def test_local_forward_cpu_uses_eager_fallback(monkeypatch):
+    model = object.__new__(MossTTSARStageModel)
+    model._local_forward_cg_by_bs = {1: object()}
+    model._local_forward_cg_params = None
+    model._local_forward_cg_init_attempted = False
+
+    eager_calls = []
+
+    def fake_eager(global_hidden, forced_text_token_id, temperature, top_k, top_p):
+        eager_calls.append((forced_text_token_id, temperature, top_k, top_p))
+        return (
+            torch.ones((global_hidden.shape[0], 4), dtype=torch.long),
+            torch.zeros((global_hidden.shape[0], 8)),
+        )
+
+    def fail_capture(**kwargs):
+        raise AssertionError("CPU fallback must not try to capture CUDA graphs")
+
+    monkeypatch.setattr(model, "_local_forward_eager", fake_eager)
+    monkeypatch.setattr(model, "_capture_local_forward_cudagraphs", fail_capture)
+
+    codes, text_logits = MossTTSARStageModel._local_forward(
+        model,
+        torch.randn(2, 6),
+        forced_text_token_id=5,
+        temperature=0.7,
+        top_k=10,
+        top_p=0.9,
+    )
+
+    assert eager_calls == [(5, 0.7, 10, 0.9)]
+    assert codes.shape == (2, 4)
+    assert text_logits.shape == (2, 8)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_local_forward_cudagraph_replay_path_with_stub(monkeypatch):
+    model = object.__new__(MossTTSARStageModel)
+    torch.nn.Module.__init__(model)
+    model.hidden_size = 4
+    model.speech_embedding_to_local_mlp = torch.nn.Linear(4, 4, bias=False).cuda()
+    model._local_forward_cg_by_bs = {}
+    model._local_forward_cg_params = None
+    model._local_forward_cg_init_attempted = False
+
+    def fake_eager(global_hidden, forced_text_token_id, temperature, top_k, top_p):
+        del forced_text_token_id, temperature, top_k, top_p
+        codes = global_hidden[:, :2].round().to(torch.long)
+        text_logits = global_hidden * 2
+        return codes, text_logits
+
+    monkeypatch.setattr(model, "_local_forward_eager", fake_eager)
+
+    hidden = torch.tensor(
+        [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]],
+        device="cuda",
+    )
+
+    codes, text_logits = MossTTSARStageModel._local_forward(
+        model,
+        hidden,
+        forced_text_token_id=5,
+        temperature=0.0,
+        top_k=-1,
+        top_p=1.0,
+    )
+
+    assert set(model._local_forward_cg_by_bs) == {1, 2, 4, 8, 16, 32}
+    torch.testing.assert_close(codes.cpu(), torch.tensor([[1, 2], [5, 6]]))
+    torch.testing.assert_close(text_logits.cpu(), (hidden * 2).cpu())

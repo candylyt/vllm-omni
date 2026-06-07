@@ -11,7 +11,7 @@ stage_args:
 
     engine_args:
       dtype: bfloat16
-      max_num_seqs: 4
+      max_num_seqs: 32
       model_stage: ar_stage
       model_arch: MossTTSForConditionalGeneration
       worker_type: ar
@@ -51,7 +51,7 @@ stage_args:
 
     engine_args:
       model_stage: decoder
-      max_num_seqs: 1
+      max_num_seqs: 32
       model_arch: MossTTSForConditionalGeneration
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
@@ -84,7 +84,7 @@ runtime:
   enabled: true
   defaults:
     window_size: -1
-    max_inflight: 4
+    max_inflight: 32
 
   connectors:
     connector_of_shared_memory:
