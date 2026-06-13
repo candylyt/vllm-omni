@@ -3,13 +3,18 @@
 
 import pytest
 import torch
+import torch.nn as nn
 
+from vllm_omni.model_executor.models.moss_tts.moss_tts_local_cuda_graph import (
+    MossTTSLocalCUDAGraphManager,
+)
 from vllm_omni.model_executor.models.moss_tts.moss_tts_local_ar_stage import (
     MossTTSARStageModel,
     MossTTSLocalKVCache,
     MossTTSLocalRequestState,
     MossTTSNativeLocalTransformer,
     _apply_top_p_filter,
+    _parse_local_cudagraph_batch_sizes,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -24,6 +29,145 @@ def test_top_p_filter_masks_tokens_outside_nucleus():
     assert torch.isfinite(filtered[0, 1])
     assert torch.isneginf(filtered[0, 2])
     assert torch.isneginf(filtered[0, 3])
+
+
+def test_parse_local_cudagraph_batch_sizes_dedupes_and_ignores_blanks():
+    assert _parse_local_cudagraph_batch_sizes("1, 2,,4,2") == (1, 2, 4)
+
+
+def test_parse_local_cudagraph_batch_sizes_rejects_non_positive_values():
+    with pytest.raises(ValueError, match="positive integers"):
+        _parse_local_cudagraph_batch_sizes("1,0")
+
+
+class _TinyLocalTransformer(nn.Module):
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.proj = nn.Linear(dim, dim, bias=False)
+        self.supports_kv_cache = False
+
+    def forward(self, inputs_embeds, past_key_values=None, use_cache=False):
+        del past_key_values, use_cache
+        return torch.tanh(self.proj(inputs_embeds)), None
+
+
+class _TinyCfg:
+    local_hidden_size = 4
+
+
+def _make_tiny_ar_stage(device: torch.device) -> MossTTSARStageModel:
+    torch.manual_seed(0)
+    model = object.__new__(MossTTSARStageModel)
+    nn.Module.__init__(model)
+    model.config = _TinyCfg()
+    model.channels = 3
+    model.n_vq = 2
+    model.audio_pad_code = 5
+    model.local_transformer = _TinyLocalTransformer(4).to(device).eval()
+    model.speech_embedding_to_local_mlp = nn.Linear(4, 4, bias=False).to(device)
+    model.local_to_speech_embedding_mlps = nn.ModuleList(
+        [nn.Linear(4, 4, bias=False) for _ in range(model.channels)]
+    ).to(device)
+    model.layer_norm_before_lm_heads = nn.ModuleList(
+        [nn.LayerNorm(4) for _ in range(model.channels)]
+    ).to(device)
+    model.lm_heads = nn.ModuleList(
+        [nn.Linear(4, 8, bias=False) for _ in range(model.channels)]
+    ).to(device)
+    model.embedding_list = nn.ModuleList(
+        [nn.Embedding(8, 4) for _ in range(model.channels)]
+    ).to(device)
+    model._local_cudagraphs = None
+    for module in (
+        model.speech_embedding_to_local_mlp,
+        model.local_to_speech_embedding_mlps,
+        model.layer_norm_before_lm_heads,
+        model.lm_heads,
+        model.embedding_list,
+    ):
+        module.eval()
+    return model
+
+
+def test_local_cudagraph_manager_cpu_replays_fallback_to_eager():
+    model = _make_tiny_ar_stage(torch.device("cpu"))
+    manager = MossTTSLocalCUDAGraphManager(model, batch_sizes=(1,), warmups=1)
+    current_proj = torch.randn(1, 4)
+    local_ctx = torch.zeros(1, 0, 4)
+
+    result = manager.replay_channel(
+        channel=0,
+        current_proj=current_proj,
+        local_ctx=local_ctx,
+        logits_dim=8,
+    )
+
+    assert result is None
+
+
+def test_local_cudagraph_manager_selects_smallest_usable_bucket():
+    model = _make_tiny_ar_stage(torch.device("cpu"))
+    manager = MossTTSLocalCUDAGraphManager(model, batch_sizes=(4, 1, 8), warmups=1)
+
+    assert manager._select_bucket(1) == 1
+    assert manager._select_bucket(2) == 4
+    assert manager._select_bucket(4) == 4
+    assert manager._select_bucket(5) == 8
+    assert manager._select_bucket(9) is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_local_cudagraph_replay_matches_eager_logits():
+    device = torch.device("cuda:0")
+    model = _make_tiny_ar_stage(device)
+    manager = MossTTSLocalCUDAGraphManager(model, batch_sizes=(1,), warmups=1)
+    current_proj = torch.randn(1, 4, device=device)
+    local_ctx = torch.zeros(1, 0, 4, device=device)
+
+    eager_logits, eager_ctx = model._local_channel_logits_eager(
+        ch=0,
+        current_proj=current_proj,
+        local_ctx=local_ctx,
+    )
+    graph_result = manager.replay_channel(
+        channel=0,
+        current_proj=current_proj,
+        local_ctx=local_ctx,
+        logits_dim=8,
+    )
+
+    assert graph_result is not None
+    graph_logits, graph_ctx = graph_result
+    torch.testing.assert_close(graph_ctx, eager_ctx)
+    torch.testing.assert_close(graph_logits, eager_logits)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_local_cudagraph_replay_with_larger_bucket_matches_eager_logits():
+    device = torch.device("cuda:0")
+    model = _make_tiny_ar_stage(device)
+    manager = MossTTSLocalCUDAGraphManager(model, batch_sizes=(4,), warmups=1)
+    current_proj = torch.randn(2, 4, device=device)
+    local_ctx = torch.zeros(2, 0, 4, device=device)
+
+    eager_logits, eager_ctx = model._local_channel_logits_eager(
+        ch=0,
+        current_proj=current_proj,
+        local_ctx=local_ctx,
+    )
+    graph_result = manager.replay_channel(
+        channel=0,
+        current_proj=current_proj,
+        local_ctx=local_ctx,
+        logits_dim=8,
+    )
+
+    assert graph_result is not None
+    graph_logits, graph_ctx = graph_result
+    assert graph_logits.shape == eager_logits.shape
+    torch.testing.assert_close(graph_ctx, eager_ctx)
+    torch.testing.assert_close(graph_logits, eager_logits)
 
 
 def test_compute_logits_forces_audio_start_when_fsm_state_missing():

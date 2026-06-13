@@ -30,6 +30,32 @@ _LOCAL_KV_DEBUG = os.environ.get("MOSS_TTS_LOCAL_KV_DEBUG", "0") == "1"
 _LOCAL_KV_CACHE_ENABLED = os.environ.get("MOSS_TTS_LOCAL_KV_CACHE", "0") == "1"
 
 
+def _parse_local_cudagraph_batch_sizes(value: str) -> tuple[int, ...]:
+    batch_sizes: list[int] = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        batch_size = int(item)
+        if batch_size <= 0:
+            raise ValueError(
+                "MOSS_TTS_LOCAL_CUDAGRAPH_BATCH_SIZES must contain positive "
+                f"integers, got {batch_size}."
+            )
+        if batch_size not in batch_sizes:
+            batch_sizes.append(batch_size)
+    return tuple(batch_sizes) or (1,)
+
+
+_LOCAL_CUDAGRAPH_ENABLED = os.environ.get("MOSS_TTS_LOCAL_CUDAGRAPH", "0") == "1"
+_LOCAL_CUDAGRAPH_BATCH_SIZES = _parse_local_cudagraph_batch_sizes(
+    os.environ.get("MOSS_TTS_LOCAL_CUDAGRAPH_BATCH_SIZES", "1,2,4")
+)
+_LOCAL_CUDAGRAPH_WARMUPS = int(
+    os.environ.get("MOSS_TTS_LOCAL_CUDAGRAPH_WARMUPS", "3")
+)
+
+
 def _apply_top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
     if top_p <= 0.0 or top_p >= 1.0:
         return logits
@@ -471,6 +497,23 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
 
         self._pending_text_logits: dict[str, torch.Tensor] = {}
 
+        self._local_cudagraph_enabled = _LOCAL_CUDAGRAPH_ENABLED
+        self._local_cudagraphs = None
+        if self._local_cudagraph_enabled:
+            from vllm_omni.model_executor.models.moss_tts.moss_tts_local_cuda_graph import (
+                MossTTSLocalCUDAGraphManager,
+            )
+
+            self._local_cudagraphs = MossTTSLocalCUDAGraphManager(
+                model=self,
+                batch_sizes=_LOCAL_CUDAGRAPH_BATCH_SIZES,
+                warmups=_LOCAL_CUDAGRAPH_WARMUPS,
+            )
+            logger.info(
+                "[MossTTS Local] Local CUDA graph enabled for batch sizes %s.",
+                _LOCAL_CUDAGRAPH_BATCH_SIZES,
+            )
+
     # =======================================================================================
     #  FSM helpers (per-request audio-mode tracking)
     # =======================================================================================
@@ -604,6 +647,20 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
     #  Local transformer: predict n_vq RVQ codes from one global step
     # =======================================================================================
 
+    def _local_channel_logits_eager(
+        self,
+        ch: int,
+        current_proj: torch.Tensor,
+        local_ctx: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        local_ctx = torch.cat([local_ctx, current_proj.unsqueeze(1)], dim=1)
+        local_out, _ = self.local_transformer(local_ctx)
+        last_h = local_out[:, -1, :]
+        proj_out = self.local_to_speech_embedding_mlps[ch](last_h)
+        normed = self.layer_norm_before_lm_heads[ch](proj_out)
+        logits = self.lm_heads[ch](normed)
+        return logits, local_ctx
+
     @torch.no_grad()
     def _local_forward(
         self,
@@ -633,9 +690,9 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
 
         # ch = 0 (text), 1..32 (audio)
         for ch in range(self.channels):
-            with record_function(f"local/ch_{ch:02d}_transformer"), \
-                 _TIMER.gpu("local/transformer_per_ch"):
-                if use_local_cache:
+            if use_local_cache:
+                with record_function(f"local/ch_{ch:02d}_transformer"), \
+                     _TIMER.gpu("local/transformer_per_ch"):
                     # Incremental path: cache K/V inside this one global AR
                     # frame. The cache is reset before the next audio frame.
                     local_out, local_cache = self.local_transformer(
@@ -650,29 +707,43 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                             else ch + 1
                         )
                         debug_input_lengths.append(cache_len)
-                else:
-                    # Recompute path: feed the entire local channel context so far.
-                    # This is slower than an incremental cache path, but matches the
-                    # MOSS reference and avoids the previously non-equivalent audio.
-                    local_ctx = torch.cat(
-                        [local_ctx, current_proj.unsqueeze(1)], dim=1
-                    )
+
+                last_h = local_out[:, -1, :]
+                with record_function(f"local/ch_{ch:02d}_head"), \
+                     _TIMER.gpu("local/proj_norm_head_per_ch"):
+                    proj_out = self.local_to_speech_embedding_mlps[ch](last_h)
+                    normed   = self.layer_norm_before_lm_heads[ch](proj_out)
+                    logits   = self.lm_heads[ch](normed)
+            else:
+                # Recompute path: feed the entire local channel context so far.
+                # The optional CUDA graph captures only this tensor-only
+                # transformer/head block; sampling remains eager below.
+                with record_function(f"local/ch_{ch:02d}_transformer_head"), \
+                     _TIMER.gpu("local/transformer_head_per_ch"):
+                    graph_result = None
+                    if self._local_cudagraphs is not None:
+                        graph_result = self._local_cudagraphs.replay_channel(
+                            channel=ch,
+                            current_proj=current_proj,
+                            local_ctx=local_ctx,
+                            logits_dim=self.lm_heads[ch].out_features,
+                        )
+                    if graph_result is None:
+                        logits, local_ctx = self._local_channel_logits_eager(
+                            ch=ch,
+                            current_proj=current_proj,
+                            local_ctx=local_ctx,
+                        )
+                    else:
+                        logits, local_ctx = graph_result
                     if debug_input_lengths is not None:
                         debug_input_lengths.append(int(local_ctx.shape[1]))
-                    local_out, _ = self.local_transformer(local_ctx)
-                last_h = local_out[:, -1, :]
-
-            with record_function(f"local/ch_{ch:02d}_head"), \
-                 _TIMER.gpu("local/proj_norm_head_per_ch"):
-                proj_out = self.local_to_speech_embedding_mlps[ch](last_h)
-                normed   = self.layer_norm_before_lm_heads[ch](proj_out)
-                logits   = self.lm_heads[ch](normed)
 
             with record_function(f"local/ch_{ch:02d}_sample"), \
                  _TIMER.gpu("local/sample_per_ch"):
                 if ch == 0:
                     # Text channel
-                    text_logits = logits
+                    text_logits = logits.clone()
                     next_token = torch.full(
                         (B,), forced_text_token_id, dtype=torch.long, device=dev,
                     )
