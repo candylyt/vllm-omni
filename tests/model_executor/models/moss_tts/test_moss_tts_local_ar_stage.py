@@ -5,16 +5,17 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vllm_omni.model_executor.models.moss_tts.moss_tts_local_cuda_graph import (
-    MossTTSLocalCUDAGraphManager,
-)
 from vllm_omni.model_executor.models.moss_tts.moss_tts_local_ar_stage import (
+    _LOCAL_CUDAGRAPH_DEFAULT_BATCH_SIZES,
     MossTTSARStageModel,
     MossTTSLocalKVCache,
     MossTTSLocalRequestState,
     MossTTSNativeLocalTransformer,
     _apply_top_p_filter,
     _parse_local_cudagraph_batch_sizes,
+)
+from vllm_omni.model_executor.models.moss_tts.moss_tts_local_cuda_graph import (
+    MossTTSLocalCUDAGraphManager,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -38,6 +39,12 @@ def test_parse_local_cudagraph_batch_sizes_dedupes_and_ignores_blanks():
 def test_parse_local_cudagraph_batch_sizes_rejects_non_positive_values():
     with pytest.raises(ValueError, match="positive integers"):
         _parse_local_cudagraph_batch_sizes("1,0")
+
+
+def test_local_cudagraph_default_batch_sizes_match_merge_safe_plan():
+    assert _parse_local_cudagraph_batch_sizes(
+        _LOCAL_CUDAGRAPH_DEFAULT_BATCH_SIZES
+    ) == (1, 2, 4, 8, 16, 32)
 
 
 class _TinyLocalTransformer(nn.Module):
@@ -299,3 +306,9 @@ def test_request_state_keeps_pending_audio_row_on_input_device():
 
     assert state.pending_audio_row.device == row.device
     assert state.pending_audio_row.tolist() == [1, 2, 3, 4]
+
+
+def test_outer_capture_local_forward_guard_stays_disabled():
+    model = object.__new__(MossTTSARStageModel)
+
+    assert model._should_run_local_forward_during_outer_capture() is False

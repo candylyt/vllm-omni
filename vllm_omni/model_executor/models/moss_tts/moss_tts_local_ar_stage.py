@@ -48,8 +48,12 @@ def _parse_local_cudagraph_batch_sizes(value: str) -> tuple[int, ...]:
 
 
 _LOCAL_CUDAGRAPH_ENABLED = os.environ.get("MOSS_TTS_LOCAL_CUDAGRAPH", "0") == "1"
+_LOCAL_CUDAGRAPH_DEFAULT_BATCH_SIZES = "1,2,4,8,16,32"
 _LOCAL_CUDAGRAPH_BATCH_SIZES = _parse_local_cudagraph_batch_sizes(
-    os.environ.get("MOSS_TTS_LOCAL_CUDAGRAPH_BATCH_SIZES", "1,2,4")
+    os.environ.get(
+        "MOSS_TTS_LOCAL_CUDAGRAPH_BATCH_SIZES",
+        _LOCAL_CUDAGRAPH_DEFAULT_BATCH_SIZES,
+    )
 )
 _LOCAL_CUDAGRAPH_WARMUPS = int(
     os.environ.get("MOSS_TTS_LOCAL_CUDAGRAPH_WARMUPS", "3")
@@ -524,6 +528,9 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
             audio_pad_code=self.audio_pad_code,
         )
 
+    def _should_run_local_forward_during_outer_capture(self) -> bool:
+        return False
+
     def _advance_state_with_text_token(
         self,
         state: MossTTSLocalRequestState,
@@ -900,7 +907,11 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
             # Step 4. Local transformer
             multimodal_outputs: dict[str, Any] = {}
 
-            if decode_positions and decode_states and not torch.cuda.is_current_stream_capturing():
+            run_local_forward = (
+                not torch.cuda.is_current_stream_capturing()
+                or self._should_run_local_forward_during_outer_capture()
+            )
+            if decode_positions and decode_states and run_local_forward:
                 audio_mask = [s.is_audio for s in decode_states]
                 audio_positions = [
                     p for p, m in zip(decode_positions, audio_mask) if m
